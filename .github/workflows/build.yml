@@ -35,6 +35,10 @@ jobs:
         with:
           build-root-directory: source
 
+      - name: Apply spotless formatting
+        run: ./gradlew spotlessApply
+        working-directory: source
+
       - name: Build box extension
         run: ./gradlew :src:all:box:assembleRelease --stacktrace
         working-directory: source
