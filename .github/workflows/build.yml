@@ -1,0 +1,74 @@
+name: Build box extension
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+        with:
+          path: patch
+
+      - name: Clone Yuzono extensions source
+        run: git clone --depth 1 https://github.com/yuzono/anime-extensions.git source
+
+      - name: Apply box extension
+        run: |
+          cp -r patch/src/all/box source/src/all/box
+          cp patch/settings.gradle.kts source/settings.gradle.kts
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          build-root-directory: source
+
+      - name: Build box extension
+        run: ./gradlew :src:all:box:assembleRelease --stacktrace
+        working-directory: source
+
+      - name: Prepare repo artifacts
+        run: |
+          mkdir -p patch/repo/apk
+          APK_NAME="aniyomi-all.box-v14.1.apk"
+          cp "source/src/all/box/build/outputs/apk/release/${APK_NAME}" "patch/repo/apk/${APK_NAME}"
+          python3 << 'PY'
+          import json, os
+          index = [{
+              "name": "Aniyomi: box",
+              "pkg": "eu.kanade.tachiyomi.animeextension.all.box",
+              "apk": "aniyomi-all.box-v14.1.apk",
+              "lang": "all",
+              "code": 1,
+              "version": "14.1",
+              "nsfw": 0,
+              "sources": [{
+                  "name": "box",
+                  "lang": "all",
+                  "id": "9134775860771942682",
+                  "baseUrl": "",
+                  "versionId": 1
+              }]
+          }]
+          with open("patch/repo/index.min.json", "w", encoding="utf-8") as f:
+              json.dump(index, f, separators=(",", ":"))
+          PY
+
+      - name: Deploy to repo branch
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: repo
+          folder: patch/repo
+          clean: true
