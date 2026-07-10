@@ -11,7 +11,6 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
-
 import keiyoushi.utils.getPreferencesLazy
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -19,10 +18,11 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.Request
 import okhttp3.Response
-
 import java.net.URLEncoder
 
-class Box : AnimeHttpSource(), ConfigurableAnimeSource {
+class Box :
+    AnimeHttpSource(),
+    ConfigurableAnimeSource {
 
     override val name = "box"
     override val lang = "all"
@@ -46,15 +46,13 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     // ============================== Popular ===============================
 
-    override fun popularAnimeRequest(page: Int): Request =
-        GET("$invidiousHost/api/v1/popular?$FIELDS", headers)
+    override fun popularAnimeRequest(page: Int): Request = GET("$invidiousHost/api/v1/popular?$FIELDS", headers)
 
     override fun popularAnimeParse(response: Response): AnimesPage = parseSearchResults(response)
 
     // =============================== Latest ===============================
 
-    override fun latestUpdatesRequest(page: Int): Request =
-        GET("$invidiousHost/api/v1/trending?$FIELDS", headers)
+    override fun latestUpdatesRequest(page: Int): Request = GET("$invidiousHost/api/v1/trending?$FIELDS", headers)
 
     override fun latestUpdatesParse(response: Response): AnimesPage = parseSearchResults(response)
 
@@ -95,8 +93,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         )
     }
 
-    override fun episodeListParse(response: Response): List<SEpisode> =
-        throw UnsupportedOperationException()
+    override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
 
     // ============================ Video Links =============================
 
