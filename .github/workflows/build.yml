@@ -34,6 +34,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
         with:
           build-root-directory: source
+          cache-disabled: true
 
       - name: Apply spotless formatting
         run: ./gradlew spotlessApply
@@ -76,8 +77,14 @@ jobs:
           PY
 
       - name: Deploy to repo branch
-        uses: JamesIves/github-pages-deploy-action@v4
-        with:
-          branch: repo
-          folder: patch/repo
-          clean: true
+        run: |
+          mkdir -p /tmp/repo-deploy
+          cp -r patch/repo/. /tmp/repo-deploy/
+          cd /tmp/repo-deploy
+          git init
+          git checkout -b repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Update repo"
+          git push -f https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git repo
