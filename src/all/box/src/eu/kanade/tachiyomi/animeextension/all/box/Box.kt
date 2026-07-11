@@ -11,6 +11,7 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.delegate
 import keiyoushi.utils.getEditTextPreference
 import keiyoushi.utils.getListPreference
 import keiyoushi.utils.getPreferencesLazy
@@ -30,12 +31,11 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     override val name = "box"
     override val lang = "all"
     override val id: Long = 9134775860771942682L
-    override val baseUrl: String
-        get() = preferences.getString(PREF_INSTANCE_KEY, DEFAULT_INSTANCE)
-            ?.trim()
-            ?.trimEnd('/')
-            ?: DEFAULT_INSTANCE
     override val supportsLatest = true
+
+    private val preferences by getPreferencesLazy()
+
+    override var baseUrl: String by preferences.delegate(PREF_INSTANCE_KEY, DEFAULT_INSTANCE)
 
     override val client: OkHttpClient by lazy {
         network.cloudflareClient.newBuilder()
@@ -43,20 +43,14 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             .build()
     }
 
-    private val preferences by getPreferencesLazy()
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
     }
 
-    private val invidiousHost: String
-        get() = preferences.getString(PREF_INSTANCE_KEY, DEFAULT_INSTANCE)!!
-            .trim()
-            .trimEnd('/')
-
     override fun headersBuilder() = super.headersBuilder()
         .add("Accept", "application/json")
-        .add("Referer", "$invidiousHost/")
+        .add("Referer", "$baseUrl/")
         .add("User-Agent", USER_AGENT)
 
     private val watchHeaders: Headers
@@ -67,14 +61,14 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     // ============================== Popular ===============================
 
     override fun popularAnimeRequest(page: Int): Request =
-        GET("$invidiousHost/api/v1/popular?$FIELDS", headers)
+        GET("$baseUrl/api/v1/popular?$FIELDS", headers)
 
     override fun popularAnimeParse(response: Response): AnimesPage = parseSearchResults(response)
 
     // =============================== Latest ===============================
 
     override fun latestUpdatesRequest(page: Int): Request =
-        GET("$invidiousHost/api/v1/trending?$FIELDS", headers)
+        GET("$baseUrl/api/v1/trending?$FIELDS", headers)
 
     override fun latestUpdatesParse(response: Response): AnimesPage = parseSearchResults(response)
 
@@ -83,7 +77,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         val encoded = URLEncoder.encode(query.trim(), "UTF-8")
         return GET(
-            "$invidiousHost/api/v1/search?q=$encoded&type=video&page=$page&$FIELDS",
+            "$baseUrl/api/v1/search?q=$encoded&type=video&page=$page&$FIELDS",
             headers,
         )
     }
@@ -94,7 +88,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun animeDetailsRequest(anime: SAnime): Request {
         val id = extractVideoId(anime.url) ?: anime.url
-        return GET("$invidiousHost/watch?v=$id", watchHeaders)
+        return GET("$baseUrl/watch?v=$id", watchHeaders)
     }
 
     override fun animeDetailsParse(response: Response): SAnime {
@@ -149,7 +143,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun videoListRequest(episode: SEpisode): Request {
         val id = extractVideoId(episode.url) ?: episode.url
-        return GET("$invidiousHost/watch?v=$id", watchHeaders)
+        return GET("$baseUrl/watch?v=$id", watchHeaders)
     }
 
     override fun videoListParse(response: Response): List<Video> {
@@ -302,18 +296,15 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         private const val PREF_INSTANCE_KEY = "invidious_instance"
         private const val PREF_QUALITY_KEY = "preferred_quality"
 
-        private val PREF_QUALITY_ENTRIES = arrayOf("DASH", "1080p", "720p", "480p", "360p")
-        private val PREF_QUALITY_VALUES = arrayOf("DASH", "1080", "720", "480", "360")
+        private val PREF_QUALITY_ENTRIES = arrayOf("DASH", "720p", "360p", "240p", "144p")
+        private val PREF_QUALITY_VALUES = arrayOf("DASH", "720", "360", "240", "144")
         private const val PREF_QUALITY_DEFAULT = "DASH"
 
         private val ITAG_LABELS = linkedMapOf(
-            "37" to "1080p",
-            "85" to "1080p",
             "22" to "720p",
-            "84" to "720p",
-            "83" to "480p",
             "18" to "360p",
-            "82" to "360p",
+            "36" to "240p",
+            "17" to "144p",
         )
 
         private val CHECK_REGEX = Regex("""check=([A-Za-z0-9_-]+)""")
