@@ -156,15 +156,27 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val doc = response.asJsoup()
         val host = response.host
         val videoId = extractVideoId(response.request.url.toString()) ?: return emptyList()
-        val check = extractCheck(doc) ?: return emptyList()
+        val check = extractCheck(doc)
         val videos = mutableListOf<Video>()
 
-        // Probe known combined (video+audio) YouTube itags. Not every itag is
-        // available for every video, so we keep only the ones that resolve to
-        // a real googlevideo URL.
-        ITAG_LABELS.forEach { (itag, label) ->
-            val url = probeItag(host, videoId, check, itag) ?: return@forEach
-            videos += Video(url, label, url, headers)
+        // DASH manifest: proxy it through a local HTTP server so Aniyomi/MPV
+        // sees a .mpd URL and the proxy can add the Anubis cookie to every
+        // segment request.
+        val dashSrc = doc.selectFirst("video#player source[type*=dash]")?.attr("src")
+        if (!dashSrc.isNullOrBlank()) {
+            val absoluteDash = if (dashSrc.startsWith("http")) dashSrc else "$host$dashSrc"
+            dashProxy?.stop()
+            dashProxy = DashProxyServer(client).apply { start() }
+            val proxyUrl = "${dashProxy!!.url}?url=${URLEncoder.encode(absoluteDash, "UTF-8")}"
+            videos += Video(proxyUrl, "DASH (adaptive)", proxyUrl, headers)
+        }
+
+        // Probe known combined (video+audio) YouTube itags as fallback.
+        if (!check.isNullOrBlank()) {
+            ITAG_LABELS.forEach { (itag, label) ->
+                val url = probeItag(host, videoId, check, itag) ?: return@forEach
+                videos += Video(url, label, url, headers)
+            }
         }
 
         // Fallback to the progressive stream listed in the player page.
@@ -290,9 +302,9 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         private const val PREF_INSTANCE_KEY = "invidious_instance"
         private const val PREF_QUALITY_KEY = "preferred_quality"
 
-        private val PREF_QUALITY_ENTRIES = arrayOf("1080p", "720p", "480p", "360p")
-        private val PREF_QUALITY_VALUES = arrayOf("1080", "720", "480", "360")
-        private const val PREF_QUALITY_DEFAULT = "720"
+        private val PREF_QUALITY_ENTRIES = arrayOf("DASH", "1080p", "720p", "480p", "360p")
+        private val PREF_QUALITY_VALUES = arrayOf("DASH", "1080", "720", "480", "360")
+        private const val PREF_QUALITY_DEFAULT = "DASH"
 
         private val ITAG_LABELS = linkedMapOf(
             "37" to "1080p",
@@ -305,6 +317,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         )
 
         private val CHECK_REGEX = Regex("""check=([A-Za-z0-9_-]+)""")
+
+        private var dashProxy: DashProxyServer? = null
 
         private const val FIELDS = "fields=videoId,title,author,lengthSeconds,viewCount,publishedText"
         private const val DETAIL_FIELDS =
@@ -387,5 +401,5 @@ data class BoxWatchData(
     val id: String? = null,
     val title: String? = null,
     @SerialName("length_seconds")
-    val lengthSeconds: Int? = null,
+    val lengthSeconds: Double? = null,
 )
