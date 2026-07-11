@@ -5,7 +5,6 @@ import fi.iki.elonen.NanoHTTPD
 import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
 import java.io.ByteArrayInputStream
 import java.net.URLEncoder
 import java.nio.charset.Charset
@@ -18,52 +17,50 @@ import java.nio.charset.Charset
  * rewrites every `<BaseURL>` to point back at this proxy, and forwards segment
  * requests using the OkHttp client (so the Anubis auth cookie is preserved).
  */
-class DashProxyServer(private val client: OkHttpClient) {
+class DashProxyServer(
+    private val client: OkHttpClient,
+) : NanoHTTPD(0) {
 
-    private var server: NanoHTTPD? = null
+    private var manifestUrl: String = ""
 
-    val url: String
-        get() = "http://127.0.0.1:${server?.listeningPort ?: 0}/manifest.mpd"
+    val proxyUrl: String
+        get() = "http://127.0.0.1:$listeningPort/manifest.mpd"
 
-    fun start() {
-        stop()
-        server = object : NanoHTTPD(0) {
-            override fun serve(session: IHTTPSession): Response {
-                return try {
-                    when (session.uri) {
-                        "/manifest.mpd" -> serveManifest(session)
-                        "/segment" -> serveSegment(session)
-                        else -> newFixedLengthResponse(
-                            Response.Status.NOT_FOUND,
-                            MIME_PLAINTEXT,
-                            "Not found",
-                        )
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Proxy error: ${e.message}", e)
-                    newFixedLengthResponse(
-                        Response.Status.INTERNAL_ERROR,
-                        MIME_PLAINTEXT,
-                        e.message ?: "Error",
-                    )
-                }
-            }
-        }.apply {
+    fun serveManifest(manifestUrl: String): String {
+        if (!isAlive) {
             start(SOCKET_TIMEOUT, false)
             Log.d(TAG, "DASH proxy started on port $listeningPort")
         }
+        this.manifestUrl = manifestUrl
+        return "$proxyUrl?url=${URLEncoder.encode(manifestUrl, "UTF-8")}"
     }
 
-    fun stop() {
-        server?.stop()
-        server = null
+    override fun serve(session: IHTTPSession): Response {
+        return try {
+            when (session.uri) {
+                "/manifest.mpd" -> serveManifest(session)
+                "/segment" -> serveSegment(session)
+                else -> newFixedLengthResponse(
+                    Response.Status.NOT_FOUND,
+                    MIME_PLAINTEXT,
+                    "Not found",
+                )
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Proxy error: ${e.message}", e)
+            newFixedLengthResponse(
+                Response.Status.INTERNAL_ERROR,
+                MIME_PLAINTEXT,
+                e.message ?: "Error",
+            )
+        }
     }
 
     private fun serveManifest(session: IHTTPSession): Response {
-        val manifestUrl = session.parameters["url"]?.firstOrNull()
+        val url = session.parameters["url"]?.firstOrNull()
             ?: return badRequest("Missing url")
-        val manifest = fetchManifest(manifestUrl)
-        val rewritten = rewriteManifest(manifest, manifestUrl)
+        val manifest = fetchManifest(url)
+        val rewritten = rewriteManifest(manifest)
         val bytes = rewritten.toByteArray(Charset.defaultCharset())
         return newFixedLengthResponse(
             Response.Status.OK,
@@ -74,17 +71,23 @@ class DashProxyServer(private val client: OkHttpClient) {
     }
 
     private fun serveSegment(session: IHTTPSession): Response {
-        val segmentUrl = session.parameters["url"]?.firstOrNull()
+        val url = session.parameters["url"]?.firstOrNull()
             ?: return badRequest("Missing url")
         val request = Request.Builder()
-            .url(segmentUrl)
+            .url(url)
             .headers(extractHeaders(session))
             .build()
         val response = client.newCall(request).execute()
         val body = response.body
         val bytes = body?.bytes() ?: ByteArray(0)
+        val status = when (response.code) {
+            200 -> Response.Status.OK
+            206 -> Response.Status.PARTIAL_CONTENT
+            404 -> Response.Status.NOT_FOUND
+            else -> Response.Status.OK
+        }
         return newFixedLengthResponse(
-            Response.Status.lookup(response.code) ?: Response.Status.OK,
+            status,
             body?.contentType()?.toString() ?: "video/mp4",
             ByteArrayInputStream(bytes),
             bytes.size.toLong(),
@@ -100,14 +103,18 @@ class DashProxyServer(private val client: OkHttpClient) {
         return client.newCall(request).execute().use { it.body.string() }
     }
 
-    private fun rewriteManifest(manifest: String, manifestUrl: String): String {
-        val port = server?.listeningPort ?: return manifest
+    private fun rewriteManifest(manifest: String): String {
+        val port = listeningPort
         val base = manifestUrl.substringBeforeLast("/")
         return manifest.replace(BASE_URL_REGEX) { match ->
             val raw = match.groupValues[1].replace("&amp;", "&")
-            val absolute = if (raw.startsWith("http")) raw else "$base$raw"
-            val proxyUrl = "http://127.0.0.1:$port/segment?url=${URLEncoder.encode(absolute, "UTF-8")}"
-            "<BaseURL>${proxyUrl.replace("&", "&amp;")}</BaseURL>"
+            val absolute = when {
+                raw.startsWith("http://") || raw.startsWith("https://") -> raw
+                raw.startsWith("/") -> "$base$raw"
+                else -> "$base/$raw"
+            }
+            val proxy = "http://127.0.0.1:$port/segment?url=${URLEncoder.encode(absolute, "UTF-8")}"
+            "<BaseURL>${proxy.replace("&", "&amp;")}</BaseURL>"
         }
     }
 

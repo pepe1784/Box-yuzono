@@ -160,29 +160,27 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         if (!dashSrc.isNullOrBlank()) {
             val absoluteDash = if (dashSrc.startsWith("http")) dashSrc else "$host$dashSrc"
             dashProxy?.stop()
-            dashProxy = DashProxyServer(client).apply { start() }
-            val proxyUrl = "${dashProxy!!.url}?url=${URLEncoder.encode(absoluteDash, "UTF-8")}"
-            videos += Video(proxyUrl, "DASH (adaptive)", proxyUrl, headers)
+            dashProxy = DashProxyServer(client)
+            val proxyUrl = dashProxy!!.serveManifest(absoluteDash)
+            videos += Video(proxyUrl, "DASH", proxyUrl, headers)
         }
 
-        // Probe known combined (video+audio) YouTube itags as fallback.
-        if (!check.isNullOrBlank()) {
+        // Progressive streams exposed by the player page (HD720, medium, small).
+        doc.select("video#player source").forEach { source ->
+            if (source.hasAttr("hidequalityoption")) return@forEach
+            if (source.attr("type").contains("dash", ignoreCase = true)) return@forEach
+            val src = source.attr("src").takeIf { it.isNotBlank() } ?: return@forEach
+            val absolute = if (src.startsWith("http")) src else "$host$src"
+            val label = source.attr("label").ifBlank { "Video" }
+            val finalUrl = resolveVideoUrl(absolute)
+            videos += Video(finalUrl, label, finalUrl, headers)
+        }
+
+        // Last resort: probe known combined (video+audio) YouTube itags.
+        if (videos.isEmpty() && !check.isNullOrBlank()) {
             ITAG_LABELS.forEach { (itag, label) ->
                 val url = probeItag(host, videoId, check, itag) ?: return@forEach
                 videos += Video(url, label, url, headers)
-            }
-        }
-
-        // Fallback to the progressive stream listed in the player page.
-        if (videos.isEmpty()) {
-            doc.select("video#player source").forEach { source ->
-                if (source.hasAttr("hidequalityoption")) return@forEach
-                if (source.attr("type").contains("dash", ignoreCase = true)) return@forEach
-                val src = source.attr("src").takeIf { it.isNotBlank() } ?: return@forEach
-                val absolute = if (src.startsWith("http")) src else "$host$src"
-                val label = source.attr("label").ifBlank { "Video" }
-                val finalUrl = resolveVideoUrl(absolute)
-                videos += Video(finalUrl, label, finalUrl, headers)
             }
         }
 
@@ -296,15 +294,15 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         private const val PREF_INSTANCE_KEY = "invidious_instance"
         private const val PREF_QUALITY_KEY = "preferred_quality"
 
-        private val PREF_QUALITY_ENTRIES = arrayOf("DASH", "720p", "360p", "240p", "144p")
-        private val PREF_QUALITY_VALUES = arrayOf("DASH", "720", "360", "240", "144")
+        private val PREF_QUALITY_ENTRIES = arrayOf("DASH", "HD720", "medium", "small")
+        private val PREF_QUALITY_VALUES = arrayOf("DASH", "HD720", "medium", "small")
         private const val PREF_QUALITY_DEFAULT = "DASH"
 
         private val ITAG_LABELS = linkedMapOf(
-            "22" to "720p",
-            "18" to "360p",
-            "36" to "240p",
-            "17" to "144p",
+            "22" to "HD720",
+            "18" to "medium",
+            "36" to "small",
+            "17" to "small",
         )
 
         private val CHECK_REGEX = Regex("""check=([A-Za-z0-9_-]+)""")

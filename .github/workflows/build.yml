@@ -62,22 +62,26 @@ jobs:
           echo "Found APK: $APK_NAME"
           cp "$APK_PATH" "patch/repo/apk/$APK_NAME"
           python3 - "$APK_NAME" << 'PY'
-          import json, sys
+          import json, re, sys
           apk_name = sys.argv[1]
+          with open("source/src/all/box/build.gradle", encoding="utf-8") as f:
+              text = f.read()
+          code = int(re.search(r"extVersionCode\s*=\s*(\d+)", text).group(1))
+          version = f"14.{code}"
           index = [{
               "name": "Aniyomi: box",
               "pkg": "eu.kanade.tachiyomi.animeextension.all.box",
               "apk": apk_name,
               "lang": "all",
-              "code": 13,
-              "version": "14.13",
+              "code": code,
+              "version": version,
               "nsfw": 0,
               "sources": [{
                   "name": "box",
                   "lang": "all",
                   "id": "9134775860771942682",
                   "baseUrl": "",
-                  "versionId": 13
+                  "versionId": code
               }]
           }]
           with open("patch/repo/index.min.json", "w", encoding="utf-8") as f:
