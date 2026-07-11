@@ -136,27 +136,28 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     // ============================== Preferences ==============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        // Make sure the preference screen stores values in the same SharedPreferences
+        // file that getPreferencesLazy() reads from.
+        screen.preferenceManager.sharedPreferencesName = "source_$id"
+
         val instancePref = EditTextPreference(screen.context).apply {
+            key = PREF_INSTANCE_KEY
             title = "Invidious instance"
+            summary = "Base URL of the Invidious instance (e.g. https://iv.melmac.space)"
             setDefaultValue(DEFAULT_INSTANCE)
-            text = preferences.getString(PREF_INSTANCE_KEY, DEFAULT_INSTANCE)
-                ?.trim()
-                ?.trimEnd('/')
-            summary = "Current: $text"
             setOnPreferenceChangeListener { _, newValue ->
                 val value = (newValue as String).trim().trimEnd('/')
                 preferences.edit().putString(PREF_INSTANCE_KEY, value).apply()
-                summary = "Current: $value"
                 true
             }
         }
 
         val qualityPref = ListPreference(screen.context).apply {
+            key = PREF_QUALITY_KEY
             title = "Preferred quality"
             entries = PREF_QUALITY_ENTRIES
             entryValues = PREF_QUALITY_VALUES
             setDefaultValue(PREF_QUALITY_DEFAULT)
-            value = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)
             summary = "%s"
             setOnPreferenceChangeListener { _, newValue ->
                 preferences.edit().putString(PREF_QUALITY_KEY, newValue as String).apply()
