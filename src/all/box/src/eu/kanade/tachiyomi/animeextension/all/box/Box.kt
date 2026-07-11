@@ -2,8 +2,6 @@ package eu.kanade.tachiyomi.animeextension.all.box
 
 import android.text.InputType
 import androidx.preference.PreferenceScreen
-import keiyoushi.utils.getEditTextPreference
-import keiyoushi.utils.getListPreference
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -12,16 +10,18 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
-
+import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.getEditTextPreference
+import keiyoushi.utils.getListPreference
 import keiyoushi.utils.getPreferencesLazy
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-
 import java.net.URLEncoder
 
 class Box : AnimeHttpSource(), ConfigurableAnimeSource {
@@ -38,7 +38,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override val client: OkHttpClient by lazy {
         network.cloudflareClient.newBuilder()
-            .addInterceptor(AnubisInterceptor(network.cloudflareClient))
+            .addInterceptor(AnubisInterceptor())
             .build()
     }
 
@@ -57,6 +57,11 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         .add("Accept", "application/json")
         .add("Referer", "$invidiousHost/")
         .add("User-Agent", USER_AGENT)
+
+    private val watchHeaders: Headers
+        get() = headersBuilder()
+            .set("Accept", "text/html")
+            .build()
 
     // ============================== Popular ===============================
 
@@ -88,12 +93,39 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun animeDetailsRequest(anime: SAnime): Request {
         val id = extractVideoId(anime.url) ?: anime.url
-        return GET("$invidiousHost/api/v1/videos/$id?$DETAIL_FIELDS", headers)
+        return GET("$invidiousHost/watch?v=$id", watchHeaders)
     }
 
     override fun animeDetailsParse(response: Response): SAnime {
-        val video = json.decodeFromString<BoxVideo>(response.body.string())
-        return video.toSAnime(response.host)
+        val doc = response.asJsoup()
+        val host = response.host
+        val watchData = doc.selectFirst("script#video_data")?.data()?.let {
+            json.decodeFromString<BoxWatchData>(it)
+        }
+
+        val title = doc.selectFirst("meta[property=og:title]")?.attr("content")
+            ?: watchData?.title ?: "Unknown"
+        val description = doc.selectFirst("meta[property=og:description]")?.attr("content")
+        val author = doc.selectFirst("a[href^=/channel/]")?.text()
+            ?: doc.selectFirst("meta[name=author]")?.attr("content")
+        val thumbnail = doc.selectFirst("meta[property=og:image]")?.attr("content")
+            ?.let { fixThumbnail(it, host) }
+
+        return SAnime.create().apply {
+            this.title = title
+            url = response.request.url.toString()
+            this.thumbnail_url = thumbnail
+            this.author = author
+            this.description = buildString {
+                description?.let {
+                    appendLine(it)
+                    appendLine()
+                }
+                author?.let { appendLine("Author: $it") }
+                watchData?.lengthSeconds?.let { appendLine("Duration: ${it}s") }
+            }.trim()
+            status = SAnime.COMPLETED
+        }
     }
 
     // ============================== Episodes ==============================
@@ -114,27 +146,46 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     // ============================ Video Links =============================
 
-    override fun videoListRequest(episode: SEpisode): Request =
-        GET("$invidiousHost/api/v1/videos/${episode.url}?$DETAIL_FIELDS", headers)
+    override fun videoListRequest(episode: SEpisode): Request {
+        val id = extractVideoId(episode.url) ?: episode.url
+        return GET("$invidiousHost/watch?v=$id", watchHeaders)
+    }
 
     override fun videoListParse(response: Response): List<Video> {
-        val video = json.decodeFromString<BoxVideo>(response.body.string())
+        val doc = response.asJsoup()
         val host = response.host
+        val videoId = extractVideoId(response.request.url.toString())
+        val sources = doc.select("video#player source")
         val videos = mutableListOf<Video>()
 
-        // DASH manifest served by Invidious. When the instance proxies video,
-        // the device only talks to Invidious, never to YouTube directly.
-        val dashUrl = "$host/api/manifest/dash/id/${video.videoId}"
-        videos += Video(dashUrl, "DASH (adaptive)", dashUrl, headers)
+        for (source in sources) {
+            if (source.hasAttr("hidequalityoption")) continue
+            val src = source.attr("src").takeIf { it.isNotBlank() } ?: continue
+            val absolute = if (src.startsWith("http")) src else "$host$src"
+            val label = source.attr("label").ifBlank {
+                if (source.attr("type").contains("dash", ignoreCase = true)) "DASH" else "Video"
+            }
 
-        // With local=true, Invidious proxies these progressive streams too.
-        video.formatStreams?.forEach { stream ->
-            val url = stream.url ?: return@forEach
-            val quality = stream.qualityLabel ?: "${stream.height}p"
-            videos += Video(url, quality, url, headers)
+            val finalUrl = when {
+                source.attr("type").contains("dash", ignoreCase = true) -> absolute
+                else -> resolveVideoUrl(absolute)
+            }
+
+            videos += Video(finalUrl, label, finalUrl, headers)
+        }
+
+        if (videos.isEmpty() && !videoId.isNullOrBlank()) {
+            val dashUrl = "$host/api/manifest/dash/id/$videoId"
+            videos += Video(dashUrl, "DASH", dashUrl, headers)
         }
 
         return videos
+    }
+
+    private fun resolveVideoUrl(url: String): String {
+        return client.newCall(GET(url, watchHeaders)).execute().use {
+            it.request.url.toString()
+        }
     }
 
     override fun List<Video>.sort(): List<Video> {
@@ -202,13 +253,23 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return null
     }
 
+    private fun fixThumbnail(url: String, host: String): String {
+        return when {
+            url.startsWith("http://inv.") -> url.replace(Regex("""^http://inv\.[^/]+(:3000)?"""), host)
+            url.startsWith("https://inv.") -> url.replace(Regex("""^https://inv\.[^/]+(:3000)?"""), host)
+            url.startsWith("/") -> "$host$url"
+            else -> url
+        }
+    }
+
     private val Response.host: String
-        get() = request.url.run { "$scheme://${host}" }
+        get() = request.url.run { "$scheme://$host" }
 
     companion object {
         private const val DEFAULT_INSTANCE = "https://inv.zoomerville.com"
 
-private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+        private const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private const val PREF_INSTANCE_KEY = "invidious_instance"
         private const val PREF_QUALITY_KEY = "preferred_quality"
 
@@ -290,4 +351,12 @@ data class BoxFormatStream(
     @SerialName("qualityLabel")
     val qualityLabel: String? = null,
     val height: Int? = null,
+)
+
+@Serializable
+data class BoxWatchData(
+    val id: String? = null,
+    val title: String? = null,
+    @SerialName("length_seconds")
+    val lengthSeconds: Int? = null,
 )

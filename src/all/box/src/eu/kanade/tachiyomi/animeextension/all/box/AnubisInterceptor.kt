@@ -1,147 +1,189 @@
 package eu.kanade.tachiyomi.animeextension.all.box
 
-import android.annotation.SuppressLint
-import android.app.Application
-import android.os.Handler
-import android.os.Looper
-import android.webkit.CookieManager
-import android.webkit.JavascriptInterface
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import okhttp3.Cookie
-import okhttp3.HttpUrl
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.Response
-import okhttp3.ResponseBody.Companion.toResponseBody
-import uy.kohesive.injekt.injectLazy
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
+import java.security.MessageDigest
 
 /**
- * Some Invidious instances (e.g. behind Anubis) return an HTML bot challenge for API
- * requests made by OkHttp. This interceptor loads the API URL in a WebView so the
- * browser can solve the JS challenge, then returns the resulting JSON directly.
+ * Interceptor that solves the Anubis proof-of-work challenge used by some
+ * Invidious instances. It detects the challenge HTML, computes the SHA-256
+ * Hashcash nonce locally, calls the pass-challenge endpoint and then retries
+ * the original request with the resulting authentication cookie.
  */
-class AnubisInterceptor(private val client: OkHttpClient) : Interceptor {
+class AnubisInterceptor : Interceptor {
 
-    private val context: Application by injectLazy()
-    private val handler by lazy { Handler(Looper.getMainLooper()) }
+    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        val response = chain.proceed(request)
 
-        // If the response looks like JSON, leave it alone.
-        if (!needsChallenge(response)) {
-            return response
+        // Avoid intercepting the pass-challenge request itself.
+        if (request.header(PASS_HEADER) != null) {
+            return chain.proceed(request.newBuilder().removeHeader(PASS_HEADER).build())
         }
 
-        val protocol = response.protocol
+        val response = chain.proceed(request)
+        val challenge = response.extractChallenge() ?: return response
+
         response.close()
 
-        // Load the same URL in a WebView, let Anubis solve itself, and grab the body.
-        val (cookies, body) = resolveWithWebView(request.url)
+        val start = System.currentTimeMillis()
+        val (hash, nonce) = solvePow(challenge.randomData, challenge.difficulty)
+        val elapsed = System.currentTimeMillis() - start
 
-        if (!body.isNullOrBlank() && looksLikeJson(body)) {
-            return Response.Builder()
-                .request(request)
-                .protocol(protocol)
-                .code(200)
-                .message("OK")
-                .header("Content-Type", "application/json")
-                .body(body.toResponseBody("application/json".toMediaTypeOrNull()))
-                .build()
+        val basePrefix = challenge.basePrefix.orEmpty().trim('"').trim()
+        val passPath = if (basePrefix.isEmpty()) {
+            "/.within.website/x/cmd/anubis/api/pass-challenge"
+        } else {
+            "$basePrefix/.within.website/x/cmd/anubis/api/pass-challenge"
         }
 
-        // Fallback: retry with any cookies we managed to collect.
-        if (cookies.isNotEmpty()) {
-            client.cookieJar.saveFromResponse(request.url, cookies)
-        }
+        val passUrl = request.url.newBuilder()
+            .encodedPath(passPath)
+            .encodedQuery(null)
+            .addQueryParameter("id", challenge.id)
+            .addQueryParameter("response", hash)
+            .addQueryParameter("nonce", nonce.toString())
+            .addQueryParameter("redir", request.url.toString())
+            .addQueryParameter("elapsedTime", elapsed.toString())
+            .build()
+
+        val passRequest = Request.Builder()
+            .url(passUrl)
+            .header("User-Agent", request.header("User-Agent") ?: USER_AGENT)
+            .header("Accept", "text/html")
+            .header(PASS_HEADER, "1")
+            .build()
+
+        // The pass-challenge response sets the auth cookie in OkHttp's cookie jar.
+        chain.proceed(passRequest).close()
+
+        // Retry the original request. The cookie jar now has the auth cookie.
         return chain.proceed(request)
     }
 
-    private fun needsChallenge(response: Response): Boolean {
-        if (response.code == 403) return true
+    private fun Response.extractChallenge(): ChallengeData? {
+        if (!isSuccessful) return null
+        val contentType = header("Content-Type") ?: return null
+        if (!contentType.contains("text/html", ignoreCase = true)) return null
+        val body = peekBody(CHALLENGE_PEEK_BYTES).string()
+        if (!body.contains(ANUBIS_CHALLENGE_MARKER)) return null
+        return parseChallenge(body)
+    }
 
-        val contentType = response.header("Content-Type") ?: return false
-        if (!contentType.contains("text/html", ignoreCase = true)) return false
-
+    private fun parseChallenge(html: String): ChallengeData? {
         return try {
-            val peek = response.peekBody(64).string().trimStart()
-            peek.startsWith("<") || peek.startsWith("<!doctype", ignoreCase = true)
+            val challengeJson = CHALLENGE_REGEX.find(html)?.groupValues?.getOrNull(1)
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: return null
+
+            val page = json.decodeFromString<AnubisChallengePage>(challengeJson)
+            val version = VERSION_REGEX.find(html)?.groupValues?.getOrNull(1)
+                ?.trim('"')?.trim()
+            val basePrefix = BASE_PREFIX_REGEX.find(html)?.groupValues?.getOrNull(1)
+                ?.trim('"')?.trim()
+
+            ChallengeData(
+                id = page.challenge?.id ?: return null,
+                randomData = page.challenge.randomData ?: return null,
+                difficulty = page.rules?.difficulty ?: 2,
+                algorithm = page.rules?.algorithm ?: "fast",
+                version = version,
+                basePrefix = basePrefix,
+            )
         } catch (_: Exception) {
-            false
+            null
         }
     }
 
-    private fun looksLikeJson(body: String): Boolean {
-        val trimmed = body.trimStart()
-        return trimmed.startsWith("{") || trimmed.startsWith("[")
-    }
+    private fun solvePow(randomData: String, difficulty: Int): Pair<String, Long> {
+        val requiredZeroBytes = difficulty / 2
+        val isOdd = difficulty % 2 != 0
+        val md = MessageDigest.getInstance("SHA-256")
+        var nonce = 0L
+        val dataBytes = randomData.toByteArray(Charsets.UTF_8)
 
-    @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
-    private fun resolveWithWebView(url: HttpUrl): Pair<List<Cookie>, String?> {
-        val latch = CountDownLatch(1)
-        var webView: WebView? = null
-        val jsBridge = JsBridge(latch)
-        val targetUrl = url.toString()
+        while (true) {
+            md.reset()
+            md.update(dataBytes)
+            md.update(nonce.toString().toByteArray(Charsets.UTF_8))
+            val hash = md.digest()
 
-        handler.post {
-            val webview = WebView(context)
-            webView = webview
-            with(webview.settings) {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                databaseEnabled = true
-                useWideViewPort = false
-                loadWithOverviewMode = false
-                userAgentString = USER_AGENT
-            }
-
-            webview.addJavascriptInterface(jsBridge, "AndroidBridge")
-            webview.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    // Give Anubis / JS challenge time to solve itself, then grab body text.
-                    view?.postDelayed({
-                        view.evaluateJavascript("AndroidBridge.pass(document.body.innerText);", null)
-                    }, CHALLENGE_DELAY_MS)
+            var valid = true
+            for (i in 0 until requiredZeroBytes) {
+                if (hash[i] != 0.toByte()) {
+                    valid = false
+                    break
                 }
             }
 
-            webview.loadUrl(targetUrl)
-        }
+            if (valid && isOdd) {
+                if ((hash[requiredZeroBytes].toInt() shr 4) != 0) {
+                    valid = false
+                }
+            }
 
-        latch.await(TIMEOUT_SEC, TimeUnit.SECONDS)
-
-        handler.post {
-            webView?.stopLoading()
-            webView?.destroy()
-            webView = null
-        }
-
-        val cookieString = CookieManager.getInstance().getCookie(targetUrl)
-            ?: CookieManager.getInstance().getCookie("${url.scheme}://${url.host}")
-        val cookies = cookieString?.split(";")?.mapNotNull { Cookie.parse(url, it) } ?: emptyList()
-
-        return cookies to jsBridge.result
-    }
-
-    private class JsBridge(private val latch: CountDownLatch) {
-        var result: String? = null
-
-        @JavascriptInterface
-        fun pass(result: String) {
-            this.result = result
-            latch.countDown()
+            if (valid) {
+                return hash.toHex() to nonce
+            }
+            nonce++
         }
     }
+
+    private fun ByteArray.toHex(): String {
+        return joinToString("") { "%02x".format(it) }
+    }
+
+    @Serializable
+    private data class AnubisChallengePage(
+        val rules: AnubisRules? = null,
+        val challenge: AnubisChallenge? = null,
+    )
+
+    @Serializable
+    private data class AnubisRules(
+        val algorithm: String? = null,
+        val difficulty: Int? = null,
+    )
+
+    @Serializable
+    private data class AnubisChallenge(
+        val id: String? = null,
+        val randomData: String? = null,
+    )
+
+    private data class ChallengeData(
+        val id: String,
+        val randomData: String,
+        val difficulty: Int,
+        val algorithm: String,
+        val version: String?,
+        val basePrefix: String?,
+    )
 
     companion object {
-        private const val TIMEOUT_SEC = 25L
-        private const val CHALLENGE_DELAY_MS = 12_000L
+        private const val PASS_HEADER = "X-Box-Anubis-Pass"
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+        private const val ANUBIS_CHALLENGE_MARKER = "id=\"anubis_challenge\""
+        private const val CHALLENGE_PEEK_BYTES = 64 * 1024L
+
+        private val CHALLENGE_REGEX = Regex(
+            """<script id="anubis_challenge" type="application/json">(.*?)</script>""",
+            RegexOption.DOT_MATCHES_ALL,
+        )
+        private val VERSION_REGEX = Regex(
+            """<script id="anubis_version" type="application/json">(.*?)</script>""",
+            RegexOption.DOT_MATCHES_ALL,
+        )
+        private val BASE_PREFIX_REGEX = Regex(
+            """<script id="anubis_base_prefix" type="application/json">(.*?)</script>""",
+            RegexOption.DOT_MATCHES_ALL,
+        )
     }
 }
