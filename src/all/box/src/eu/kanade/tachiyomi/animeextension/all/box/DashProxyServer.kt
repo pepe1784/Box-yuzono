@@ -6,6 +6,7 @@ import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.ByteArrayInputStream
+import java.io.InputStream
 import java.net.URLEncoder
 import java.nio.charset.Charset
 
@@ -79,19 +80,25 @@ class DashProxyServer(
             .build()
         val response = client.newCall(request).execute()
         val body = response.body
-        val bytes = body?.bytes() ?: ByteArray(0)
+            ?: return newFixedLengthResponse(
+                Response.Status.NO_CONTENT,
+                MIME_PLAINTEXT,
+                "",
+            )
         val status = when (response.code) {
             200 -> Response.Status.OK
             206 -> Response.Status.PARTIAL_CONTENT
             404 -> Response.Status.NOT_FOUND
             else -> Response.Status.OK
         }
-        return newFixedLengthResponse(
-            status,
-            body?.contentType()?.toString() ?: "video/mp4",
-            ByteArrayInputStream(bytes),
-            bytes.size.toLong(),
-        )
+        val contentType = body.contentType()?.toString() ?: "video/mp4"
+        val stream = body.byteStream().withCloseAction(response::close)
+        val contentLength = body.contentLength()
+        return if (contentLength >= 0) {
+            newFixedLengthResponse(status, contentType, stream, contentLength)
+        } else {
+            newChunkedResponse(status, contentType, stream)
+        }
     }
 
     private fun fetchManifest(url: String): String {
@@ -128,12 +135,14 @@ class DashProxyServer(
 
     private fun extractHeaders(session: IHTTPSession): Headers {
         val builder = Headers.Builder()
+        val skip = setOf(
+            "host", "connection", "keep-alive", "proxy-connection",
+            "content-length", "transfer-encoding", "accept-encoding",
+            "upgrade-insecure-requests",
+        )
         session.headers.forEach { (key, value) ->
-            when (key.lowercase()) {
-                "user-agent", "referer", "origin", "accept", "accept-language",
-                "accept-encoding", "range", "connection", "cache-control", "pragma",
-                -> builder.add(key, value)
-            }
+            if (key.lowercase() in skip) return@forEach
+            builder.add(key, value)
         }
         return builder.build()
     }
@@ -152,5 +161,22 @@ class DashProxyServer(
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private val BASE_URL_REGEX = Regex("""<BaseURL>([^<]+)</BaseURL>""")
+    }
+}
+
+/**
+ * Returns an [InputStream] that invokes [action] after the stream is closed.
+ * Used to close the OkHttp [Response] once NanoHTTPD finishes serving it.
+ */
+private fun InputStream.withCloseAction(action: () -> Unit): InputStream {
+    val base = this
+    return object : InputStream() {
+        override fun read(): Int = base.read()
+        override fun read(b: ByteArray, off: Int, len: Int): Int = base.read(b, off, len)
+        override fun available(): Int = base.available()
+        override fun close() {
+            base.close()
+            action()
+        }
     }
 }
