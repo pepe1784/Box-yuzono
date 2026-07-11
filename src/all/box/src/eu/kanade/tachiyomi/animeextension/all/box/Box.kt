@@ -178,16 +178,10 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         if (!dashSrc.isNullOrBlank()) {
             val absoluteDash = if (dashSrc.startsWith("http")) dashSrc else "$host$dashSrc"
             try {
-                // Reuse the existing proxy when reopening the same video so
-                // cached player URLs keep working and we avoid port churn.
-                val proxyUrl = if (dashProxy != null && dashProxyVideoId == videoId) {
-                    dashProxy!!.serveManifest(absoluteDash)
-                } else {
-                    dashProxy?.stop()
-                    dashProxy = DashProxyServer(proxyClient)
-                    dashProxyVideoId = videoId
-                    dashProxy!!.serveManifest(absoluteDash)
-                }
+                dashProxy?.stop()
+                dashProxy = DashProxyServer(proxyClient)
+                val proxyUrl = dashProxy!!.serveManifest(absoluteDash)
+                dashProxyVideoId = videoId
                 Log.d(TAG, "Adding DASH proxy: $proxyUrl")
                 videos += Video(proxyUrl, "DASH", proxyUrl, headers)
                 seenUrls += proxyUrl
