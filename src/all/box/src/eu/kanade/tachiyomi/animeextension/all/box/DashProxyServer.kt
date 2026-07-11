@@ -64,12 +64,16 @@ class DashProxyServer(
         val filtered = filterManifest(manifest)
         val rewritten = rewriteManifest(filtered)
         val bytes = rewritten.toByteArray(Charset.defaultCharset())
-        return newFixedLengthResponse(
+        val resp = newFixedLengthResponse(
             Response.Status.OK,
             "application/dash+xml",
             ByteArrayInputStream(bytes),
             bytes.size.toLong(),
         )
+        resp.addHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+        resp.addHeader("Pragma", "no-cache")
+        resp.addHeader("Expires", "0")
+        return resp
     }
 
     private fun serveSegment(session: IHTTPSession): Response {
