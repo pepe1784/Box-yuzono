@@ -188,7 +188,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         get() = request.url.run { "$scheme://${host}" }
 
     companion object {
-        private const val DEFAULT_INSTANCE = "https://invidious.privacydev.net"
+        private const val DEFAULT_INSTANCE = "https://iv.melmac.space"
         private const val PREF_INSTANCE_KEY = "invidious_instance"
         private const val PREF_QUALITY_KEY = "preferred_quality"
 
