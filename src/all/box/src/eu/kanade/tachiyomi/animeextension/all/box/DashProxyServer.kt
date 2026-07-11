@@ -143,35 +143,31 @@ class DashProxyServer(
     }
 
     /**
-     * Keep only 720p and 1080p video Representations. If none are available,
-     * fall back to the highest quality up to 1080p, or the absolute highest
-     * if nothing else exists. Audio Representations (no height) are kept.
+     * Keep only the best video Representation up to 1080p. This dramatically
+     * reduces the work MPV has to do on startup, especially for long videos
+     * where each Representation is a single large file. Audio Representations
+     * (no height) are always kept.
      */
     private fun filterManifest(manifest: String): String {
         val matches = REPRESENTATION_REGEX.findAll(manifest).toList()
         if (matches.isEmpty()) return manifest
 
         val heights = matches.mapNotNull { it.groupValues[2].toIntOrNull() }
-        val preferred = heights.filter { it in 720..1080 }
-        val keepHeights = if (preferred.isNotEmpty()) {
-            preferred.toSet()
-        } else {
-            val upTo1080 = heights.filter { it <= 1080 }
-            if (upTo1080.isNotEmpty()) {
-                setOf(upTo1080.maxOrNull()!!)
-            } else {
-                setOf(heights.maxOrNull() ?: return manifest)
-            }
+        // Prefer 1080p, then 720p, then the highest available up to 1080p.
+        val targetHeight = when {
+            heights.contains(1080) -> 1080
+            heights.contains(720) -> 720
+            else -> heights.filter { it <= 1080 }.maxOrNull() ?: heights.maxOrNull() ?: return manifest
         }
 
         var result = manifest
         matches.forEach { match ->
             val height = match.groupValues[2].toIntOrNull()
-            if (height != null && height !in keepHeights) {
+            if (height != null && height != targetHeight) {
                 result = result.replace(match.value, "")
             }
         }
-        Log.d(TAG, "Filtered DASH manifest: kept heights $keepHeights")
+        Log.d(TAG, "Filtered DASH manifest: kept ${targetHeight}p")
         return result
     }
 
