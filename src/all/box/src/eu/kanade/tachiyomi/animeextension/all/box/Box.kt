@@ -27,7 +27,11 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     override val name = "box"
     override val lang = "all"
     override val id: Long = 9134775860771942682L
-    override val baseUrl = DEFAULT_INSTANCE
+    override val baseUrl: String
+        get() = preferences.getString(PREF_INSTANCE_KEY, DEFAULT_INSTANCE)
+            ?.trim()
+            ?.trimEnd('/')
+            ?: DEFAULT_INSTANCE
     override val supportsLatest = true
 
     private val preferences by getPreferencesLazy()
@@ -190,7 +194,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         get() = request.url.run { "$scheme://${host}" }
 
     companion object {
-        private const val DEFAULT_INSTANCE = "https://iv.melmac.space"
+        private const val DEFAULT_INSTANCE = "https://inv.zoomerville.com"
         private const val PREF_INSTANCE_KEY = "invidious_instance"
         private const val PREF_QUALITY_KEY = "preferred_quality"
 

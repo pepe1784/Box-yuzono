@@ -69,15 +69,15 @@ jobs:
               "pkg": "eu.kanade.tachiyomi.animeextension.all.box",
               "apk": apk_name,
               "lang": "all",
-              "code": 4,
-              "version": "14.4",
+              "code": 5,
+              "version": "14.5",
               "nsfw": 0,
               "sources": [{
                   "name": "box",
                   "lang": "all",
                   "id": "9134775860771942682",
                   "baseUrl": "",
-                  "versionId": 4
+                  "versionId": 5
               }]
           }]
           with open("patch/repo/index.min.json", "w", encoding="utf-8") as f:
