@@ -219,7 +219,7 @@ class DashProxyServer(
 
     companion object {
         private const val TAG = "DashProxyServer"
-        private const val SOCKET_TIMEOUT = 30_000
+        private const val SOCKET_TIMEOUT = 120_000
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private val BASE_URL_REGEX = Regex("""<BaseURL>([^<]+)</BaseURL>""")
@@ -242,6 +242,7 @@ private fun InputStream.withCloseAction(action: () -> Unit): InputStream {
         override fun available(): Int = base.available()
         override fun close() {
             base.close()
+            Log.d("DashProxyServer", "Segment stream closed")
             action()
         }
     }

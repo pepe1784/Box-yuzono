@@ -29,6 +29,7 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 
 class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
@@ -45,6 +46,15 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         network.cloudflareClient.newBuilder()
             .cookieJar(MemoryCookieJar())
             .addInterceptor(AnubisInterceptor())
+            .build()
+    }
+
+    // Longer timeouts for the DASH proxy so large segments do not stall.
+    private val proxyClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(2, TimeUnit.MINUTES)
+            .writeTimeout(2, TimeUnit.MINUTES)
             .build()
     }
 
@@ -169,7 +179,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             val absoluteDash = if (dashSrc.startsWith("http")) dashSrc else "$host$dashSrc"
             try {
                 dashProxy?.stop()
-                dashProxy = DashProxyServer(client)
+                dashProxy = DashProxyServer(proxyClient)
                 val proxyUrl = dashProxy!!.serveManifest(absoluteDash)
                 Log.d(TAG, "Adding DASH proxy: $proxyUrl")
                 videos += Video(proxyUrl, "DASH", proxyUrl, headers)
