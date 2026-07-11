@@ -1,8 +1,8 @@
 package eu.kanade.tachiyomi.animeextension.all.box
 
-import androidx.preference.EditTextPreference
-import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import keiyoushi.utils.getEditTextPreference
+import keiyoushi.utils.getListPreference
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -136,34 +136,28 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     // ============================== Preferences ==============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        // Make sure the preference screen stores values in the same SharedPreferences
-        // file that getPreferencesLazy() reads from.
-        screen.preferenceManager.sharedPreferencesName = "source_$id"
+        val instancePref = screen.getEditTextPreference(
+            key = PREF_INSTANCE_KEY,
+            default = DEFAULT_INSTANCE,
+            title = "Invidious instance",
+            summary = "Base URL of the Invidious instance",
+            getSummary = { "Current: ${it.trim().trimEnd('/')}" },
+            onComplete = { value ->
+                preferences.edit().putString(PREF_INSTANCE_KEY, value.trim().trimEnd('/')).apply()
+            },
+        )
 
-        val instancePref = EditTextPreference(screen.context).apply {
-            key = PREF_INSTANCE_KEY
-            title = "Invidious instance"
-            summary = "Base URL of the Invidious instance (e.g. https://iv.melmac.space)"
-            setDefaultValue(DEFAULT_INSTANCE)
-            setOnPreferenceChangeListener { _, newValue ->
-                val value = (newValue as String).trim().trimEnd('/')
-                preferences.edit().putString(PREF_INSTANCE_KEY, value).apply()
-                true
-            }
-        }
-
-        val qualityPref = ListPreference(screen.context).apply {
-            key = PREF_QUALITY_KEY
-            title = "Preferred quality"
-            entries = PREF_QUALITY_ENTRIES
-            entryValues = PREF_QUALITY_VALUES
-            setDefaultValue(PREF_QUALITY_DEFAULT)
-            summary = "%s"
-            setOnPreferenceChangeListener { _, newValue ->
-                preferences.edit().putString(PREF_QUALITY_KEY, newValue as String).apply()
-                true
-            }
-        }
+        val qualityPref = screen.getListPreference(
+            key = PREF_QUALITY_KEY,
+            default = PREF_QUALITY_DEFAULT,
+            title = "Preferred quality",
+            summary = "%s",
+            entries = PREF_QUALITY_ENTRIES.toList(),
+            entryValues = PREF_QUALITY_VALUES.toList(),
+            onComplete = { value ->
+                preferences.edit().putString(PREF_QUALITY_KEY, value).apply()
+            },
+        )
 
         screen.addPreference(instancePref)
         screen.addPreference(qualityPref)
