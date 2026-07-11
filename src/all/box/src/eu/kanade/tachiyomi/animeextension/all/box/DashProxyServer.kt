@@ -48,11 +48,11 @@ class DashProxyServer(
                 )
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Proxy error: ${e.message}", e)
+            Log.e(TAG, "Proxy error serving ${session.uri}: ${e.message}", e)
             newFixedLengthResponse(
                 Response.Status.INTERNAL_ERROR,
                 MIME_PLAINTEXT,
-                e.message ?: "Error",
+                "Proxy error: ${e.message}",
             )
         }
     }
@@ -74,6 +74,7 @@ class DashProxyServer(
     private fun serveSegment(session: IHTTPSession): Response {
         val url = session.parameters["url"]?.firstOrNull()
             ?: return badRequest("Missing url")
+        Log.d(TAG, "Segment request: $url")
         val request = Request.Builder()
             .url(url)
             .headers(extractHeaders(session))
@@ -92,8 +93,9 @@ class DashProxyServer(
             else -> Response.Status.OK
         }
         val contentType = body.contentType()?.toString() ?: "video/mp4"
-        val stream = body.byteStream().withCloseAction(response::close)
         val contentLength = body.contentLength()
+        Log.d(TAG, "Segment response: status=${response.code}, type=$contentType, len=$contentLength")
+        val stream = body.byteStream().withCloseAction(response::close)
         return if (contentLength >= 0) {
             newFixedLengthResponse(status, contentType, stream, contentLength)
         } else {
@@ -140,9 +142,18 @@ class DashProxyServer(
             "content-length", "transfer-encoding", "accept-encoding",
             "upgrade-insecure-requests",
         )
+        var hasUserAgent = false
         session.headers.forEach { (key, value) ->
             if (key.lowercase() in skip) return@forEach
-            builder.add(key, value)
+            if (key.lowercase() == "user-agent") hasUserAgent = true
+            try {
+                builder.add(key, value)
+            } catch (e: IllegalArgumentException) {
+                Log.w(TAG, "Skipping invalid header: $key")
+            }
+        }
+        if (!hasUserAgent) {
+            builder.add("User-Agent", USER_AGENT)
         }
         return builder.build()
     }
