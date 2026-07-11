@@ -31,21 +31,23 @@ class AnubisInterceptor(private val client: OkHttpClient) : Interceptor {
         val request = chain.request()
         val response = chain.proceed(request)
 
-        // If the body is JSON, leave it alone.
-        if (!isHtmlResponse(response)) {
+        // If the response looks like JSON, leave it alone.
+        if (!needsChallenge(response)) {
             return response
         }
 
         response.close()
 
-        // Resolve the challenge once per host and store cookies in OkHttp's jar.
+        // Resolve the challenge on the exact URL and store cookies in OkHttp's jar.
         resolveWithWebView(request.url)
 
         // Retry with cookies (CookieJar will attach them automatically).
         return chain.proceed(request)
     }
 
-    private fun isHtmlResponse(response: Response): Boolean {
+    private fun needsChallenge(response: Response): Boolean {
+        if (response.code == 403) return true
+
         val contentType = response.header("Content-Type") ?: return false
         if (!contentType.contains("text/html", ignoreCase = true)) return false
 
@@ -61,7 +63,7 @@ class AnubisInterceptor(private val client: OkHttpClient) : Interceptor {
     private fun resolveWithWebView(url: HttpUrl) {
         val latch = CountDownLatch(1)
         var webView: WebView? = null
-        val rootUrl = "${url.scheme}://${url.host}"
+        val targetUrl = url.toString()
 
         handler.post {
             val webview = WebView(context)
@@ -82,7 +84,7 @@ class AnubisInterceptor(private val client: OkHttpClient) : Interceptor {
                 }
             }
 
-            webview.loadUrl(rootUrl)
+            webview.loadUrl(targetUrl)
         }
 
         latch.await(TIMEOUT_SEC, TimeUnit.SECONDS)
@@ -93,7 +95,9 @@ class AnubisInterceptor(private val client: OkHttpClient) : Interceptor {
             webView = null
         }
 
-        val cookieString = CookieManager.getInstance().getCookie(rootUrl) ?: return
+        val cookieString = CookieManager.getInstance().getCookie(targetUrl)
+            ?: CookieManager.getInstance().getCookie("${url.scheme}://${url.host}")
+            ?: return
         val cookies = cookieString.split(";").mapNotNull { Cookie.parse(url, it) }
         if (cookies.isNotEmpty()) {
             client.cookieJar.saveFromResponse(url, cookies)

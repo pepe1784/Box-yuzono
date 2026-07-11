@@ -55,10 +55,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Accept", "application/json")
-        .add(
-            "User-Agent",
-            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
-        )
+        .add("Referer", "$invidiousHost/")
+        .add("User-Agent", USER_AGENT)
 
     // ============================== Popular ===============================
 
