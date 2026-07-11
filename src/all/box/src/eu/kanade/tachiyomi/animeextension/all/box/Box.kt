@@ -43,6 +43,10 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Accept", "application/json")
+        .add(
+            "User-Agent",
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+        )
 
     // ============================== Popular ===============================
 
@@ -133,23 +137,26 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val instancePref = EditTextPreference(screen.context).apply {
-            key = PREF_INSTANCE_KEY
             title = "Invidious instance"
-            summary = "Base URL of the Invidious instance (e.g. https://invidious.privacydev.net)"
             setDefaultValue(DEFAULT_INSTANCE)
+            text = preferences.getString(PREF_INSTANCE_KEY, DEFAULT_INSTANCE)
+                ?.trim()
+                ?.trimEnd('/')
+            summary = "Current: $text"
             setOnPreferenceChangeListener { _, newValue ->
                 val value = (newValue as String).trim().trimEnd('/')
                 preferences.edit().putString(PREF_INSTANCE_KEY, value).apply()
+                summary = "Current: $value"
                 true
             }
         }
 
         val qualityPref = ListPreference(screen.context).apply {
-            key = PREF_QUALITY_KEY
             title = "Preferred quality"
             entries = PREF_QUALITY_ENTRIES
             entryValues = PREF_QUALITY_VALUES
             setDefaultValue(PREF_QUALITY_DEFAULT)
+            value = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)
             summary = "%s"
             setOnPreferenceChangeListener { _, newValue ->
                 preferences.edit().putString(PREF_QUALITY_KEY, newValue as String).apply()
