@@ -93,8 +93,13 @@ class DashProxyServer(
             else -> Response.Status.OK
         }
         val contentType = body.contentType()?.toString() ?: "video/mp4"
-        val contentLength = body.contentLength()
-        Log.d(TAG, "Segment response: status=${response.code}, type=$contentType, len=$contentLength")
+        // OkHttp transparently decompresses gzip unless we add Accept-Encoding
+        // manually. If the server compressed the response, Content-Length refers
+        // to the compressed size while the stream is already decompressed, so we
+        // must serve it chunked without Content-Length.
+        val isCompressed = !response.header("Content-Encoding").isNullOrBlank()
+        val contentLength = if (isCompressed) -1 else body.contentLength()
+        Log.d(TAG, "Segment response: status=${response.code}, type=$contentType, len=${body.contentLength()}, compressed=$isCompressed")
         val stream = body.byteStream().withCloseAction(response::close)
         val resp = if (contentLength >= 0) {
             newFixedLengthResponse(status, contentType, stream, contentLength)
