@@ -149,9 +149,12 @@ class DashProxyServer(
             "upgrade-insecure-requests",
         )
         var hasUserAgent = false
+        var hasAcceptEncoding = false
         session.headers.forEach { (key, value) ->
-            if (key.lowercase() in skip) return@forEach
-            if (key.lowercase() == "user-agent") hasUserAgent = true
+            val lower = key.lowercase()
+            if (lower in skip) return@forEach
+            if (lower == "user-agent") hasUserAgent = true
+            if (lower == "accept-encoding") hasAcceptEncoding = true
             try {
                 builder.add(key, value)
             } catch (e: IllegalArgumentException) {
@@ -160,6 +163,11 @@ class DashProxyServer(
         }
         if (!hasUserAgent) {
             builder.add("User-Agent", USER_AGENT)
+        }
+        // Ask the server not to compress the segment, otherwise Content-Length
+        // would mismatch the decompressed stream we forward to the player.
+        if (!hasAcceptEncoding) {
+            builder.add("Accept-Encoding", "identity")
         }
         return builder.build()
     }
