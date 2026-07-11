@@ -18,6 +18,7 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 
@@ -34,6 +35,12 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             ?.trimEnd('/')
             ?: DEFAULT_INSTANCE
     override val supportsLatest = true
+
+    override val client: OkHttpClient by lazy {
+        network.cloudflareClient.newBuilder()
+            .addInterceptor(AnubisInterceptor(network.cloudflareClient))
+            .build()
+    }
 
     private val preferences by getPreferencesLazy()
     private val json = Json {
@@ -202,6 +209,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     companion object {
         private const val DEFAULT_INSTANCE = "https://inv.zoomerville.com"
+
+private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private const val PREF_INSTANCE_KEY = "invidious_instance"
         private const val PREF_QUALITY_KEY = "preferred_quality"
 
