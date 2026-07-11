@@ -61,7 +61,8 @@ class DashProxyServer(
         val url = session.parameters["url"]?.firstOrNull()
             ?: return badRequest("Missing url")
         val manifest = fetchManifest(url)
-        val rewritten = rewriteManifest(manifest)
+        val filtered = filterManifest(manifest)
+        val rewritten = rewriteManifest(filtered)
         val bytes = rewritten.toByteArray(Charset.defaultCharset())
         return newFixedLengthResponse(
             Response.Status.OK,
@@ -141,6 +142,39 @@ class DashProxyServer(
         }
     }
 
+    /**
+     * Keep only 720p and 1080p video Representations. If none are available,
+     * fall back to the highest quality up to 1080p, or the absolute highest
+     * if nothing else exists. Audio Representations (no height) are kept.
+     */
+    private fun filterManifest(manifest: String): String {
+        val matches = REPRESENTATION_REGEX.findAll(manifest).toList()
+        if (matches.isEmpty()) return manifest
+
+        val heights = matches.mapNotNull { it.groupValues[2].toIntOrNull() }
+        val preferred = heights.filter { it in 720..1080 }
+        val keepHeights = if (preferred.isNotEmpty()) {
+            preferred.toSet()
+        } else {
+            val upTo1080 = heights.filter { it <= 1080 }
+            if (upTo1080.isNotEmpty()) {
+                setOf(upTo1080.maxOrNull()!!)
+            } else {
+                setOf(heights.maxOrNull() ?: return manifest)
+            }
+        }
+
+        var result = manifest
+        matches.forEach { match ->
+            val height = match.groupValues[2].toIntOrNull()
+            if (height != null && height !in keepHeights) {
+                result = result.replace(match.value, "")
+            }
+        }
+        Log.d(TAG, "Filtered DASH manifest: kept heights $keepHeights")
+        return result
+    }
+
     private val manifestHost: String
         get() = try {
             java.net.URL(manifestUrl).let { "${it.protocol}://${it.host}" }
@@ -193,6 +227,10 @@ class DashProxyServer(
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private val BASE_URL_REGEX = Regex("""<BaseURL>([^<]+)</BaseURL>""")
+        private val REPRESENTATION_REGEX = Regex(
+            """<Representation([^>]*height=\"(\\d+)\"[^>]*)>.*?</Representation>""",
+            RegexOption.DOT_MATCHES_ALL,
+        )
     }
 }
 
