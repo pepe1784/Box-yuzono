@@ -5,22 +5,24 @@ import android.app.Application
 import android.os.Handler
 import android.os.Looper
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import okhttp3.Cookie
 import okhttp3.HttpUrl
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import uy.kohesive.injekt.injectLazy
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
  * Some Invidious instances (e.g. behind Anubis) return an HTML bot challenge for API
- * requests made by OkHttp. This interceptor detects an HTML response, opens a WebView
- * on the instance root so the browser can solve the JS challenge, then retries the
- * request with the obtained cookies.
+ * requests made by OkHttp. This interceptor loads the API URL in a WebView so the
+ * browser can solve the JS challenge, then returns the resulting JSON directly.
  */
 class AnubisInterceptor(private val client: OkHttpClient) : Interceptor {
 
@@ -36,12 +38,27 @@ class AnubisInterceptor(private val client: OkHttpClient) : Interceptor {
             return response
         }
 
+        val protocol = response.protocol
         response.close()
 
-        // Resolve the challenge on the exact URL and store cookies in OkHttp's jar.
-        resolveWithWebView(request.url)
+        // Load the same URL in a WebView, let Anubis solve itself, and grab the body.
+        val (cookies, body) = resolveWithWebView(request.url)
 
-        // Retry with cookies (CookieJar will attach them automatically).
+        if (!body.isNullOrBlank() && looksLikeJson(body)) {
+            return Response.Builder()
+                .request(request)
+                .protocol(protocol)
+                .code(200)
+                .message("OK")
+                .header("Content-Type", "application/json")
+                .body(body.toResponseBody("application/json".toMediaTypeOrNull()))
+                .build()
+        }
+
+        // Fallback: retry with any cookies we managed to collect.
+        if (cookies.isNotEmpty()) {
+            client.cookieJar.saveFromResponse(request.url, cookies)
+        }
         return chain.proceed(request)
     }
 
@@ -59,10 +76,16 @@ class AnubisInterceptor(private val client: OkHttpClient) : Interceptor {
         }
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun resolveWithWebView(url: HttpUrl) {
+    private fun looksLikeJson(body: String): Boolean {
+        val trimmed = body.trimStart()
+        return trimmed.startsWith("{") || trimmed.startsWith("[")
+    }
+
+    @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
+    private fun resolveWithWebView(url: HttpUrl): Pair<List<Cookie>, String?> {
         val latch = CountDownLatch(1)
         var webView: WebView? = null
+        val jsBridge = JsBridge(latch)
         val targetUrl = url.toString()
 
         handler.post {
@@ -77,10 +100,13 @@ class AnubisInterceptor(private val client: OkHttpClient) : Interceptor {
                 userAgentString = USER_AGENT
             }
 
+            webview.addJavascriptInterface(jsBridge, "AndroidBridge")
             webview.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    // Give Anubis / JS challenge time to solve itself.
-                    view?.postDelayed({ latch.countDown() }, CHALLENGE_DELAY_MS)
+                    // Give Anubis / JS challenge time to solve itself, then grab body text.
+                    view?.postDelayed({
+                        view.evaluateJavascript("AndroidBridge.pass(document.body.innerText);", null)
+                    }, CHALLENGE_DELAY_MS)
                 }
             }
 
@@ -97,10 +123,18 @@ class AnubisInterceptor(private val client: OkHttpClient) : Interceptor {
 
         val cookieString = CookieManager.getInstance().getCookie(targetUrl)
             ?: CookieManager.getInstance().getCookie("${url.scheme}://${url.host}")
-            ?: return
-        val cookies = cookieString.split(";").mapNotNull { Cookie.parse(url, it) }
-        if (cookies.isNotEmpty()) {
-            client.cookieJar.saveFromResponse(url, cookies)
+        val cookies = cookieString?.split(";")?.mapNotNull { Cookie.parse(url, it) } ?: emptyList()
+
+        return cookies to jsBridge.result
+    }
+
+    private class JsBridge(private val latch: CountDownLatch) {
+        var result: String? = null
+
+        @JavascriptInterface
+        fun pass(result: String) {
+            this.result = result
+            latch.countDown()
         }
     }
 
