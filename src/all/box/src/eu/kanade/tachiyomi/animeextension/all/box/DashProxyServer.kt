@@ -96,11 +96,17 @@ class DashProxyServer(
         val contentLength = body.contentLength()
         Log.d(TAG, "Segment response: status=${response.code}, type=$contentType, len=$contentLength")
         val stream = body.byteStream().withCloseAction(response::close)
-        return if (contentLength >= 0) {
+        val resp = if (contentLength >= 0) {
             newFixedLengthResponse(status, contentType, stream, contentLength)
         } else {
             newChunkedResponse(status, contentType, stream)
         }
+        // Forward range-related headers so MPV can seek inside the segment.
+        response.header("Accept-Ranges")?.let { resp.addHeader("Accept-Ranges", it) }
+        response.header("Content-Range")?.let { resp.addHeader("Content-Range", it) }
+        response.header("ETag")?.let { resp.addHeader("ETag", it) }
+        response.header("Last-Modified")?.let { resp.addHeader("Last-Modified", it) }
+        return resp
     }
 
     private fun fetchManifest(url: String): String {
