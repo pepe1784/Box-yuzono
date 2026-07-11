@@ -106,17 +106,25 @@ class DashProxyServer(
     private fun rewriteManifest(manifest: String): String {
         val port = listeningPort
         val base = manifestUrl.substringBeforeLast("/")
+        val host = manifestHost
         return manifest.replace(BASE_URL_REGEX) { match ->
             val raw = match.groupValues[1].replace("&amp;", "&")
             val absolute = when {
                 raw.startsWith("http://") || raw.startsWith("https://") -> raw
-                raw.startsWith("/") -> "$base$raw"
+                raw.startsWith("/") -> "$host$raw"
                 else -> "$base/$raw"
             }
             val proxy = "http://127.0.0.1:$port/segment?url=${URLEncoder.encode(absolute, "UTF-8")}"
             "<BaseURL>${proxy.replace("&", "&amp;")}</BaseURL>"
         }
     }
+
+    private val manifestHost: String
+        get() = try {
+            java.net.URL(manifestUrl).let { "${it.protocol}://${it.host}" }
+        } catch (_: Exception) {
+            manifestUrl.substringBeforeLast("/")
+        }
 
     private fun extractHeaders(session: IHTTPSession): Headers {
         val builder = Headers.Builder()

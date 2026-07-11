@@ -20,7 +20,10 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.Cookie
+import okhttp3.CookieJar
 import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -40,6 +43,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override val client: OkHttpClient by lazy {
         network.cloudflareClient.newBuilder()
+            .cookieJar(MemoryCookieJar())
             .addInterceptor(AnubisInterceptor())
             .build()
     }
@@ -329,6 +333,22 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             "fields=videoId,title,description,author,lengthSeconds,viewCount,publishedText,formatStreams,recommendedVideos&local=true"
 
         private const val TAG = "Box"
+    }
+}
+
+/**
+ * In-memory cookie jar so the Anubis auth cookie is shared between the
+ * extension's requests and the local DASH proxy's segment requests.
+ */
+private class MemoryCookieJar : CookieJar {
+    private val store = mutableMapOf<String, MutableList<Cookie>>()
+
+    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+        store.getOrPut(url.host) { mutableListOf() }.addAll(cookies)
+    }
+
+    override fun loadForRequest(url: HttpUrl): List<Cookie> {
+        return store[url.host]?.filter { it.expiresAt >= System.currentTimeMillis() } ?: emptyList()
     }
 }
 
