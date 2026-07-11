@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.animeextension.all.box
 
+import android.text.InputType
 import androidx.preference.PreferenceScreen
 import keiyoushi.utils.getEditTextPreference
 import keiyoushi.utils.getListPreference
@@ -146,6 +147,12 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             title = "Invidious instance",
             summary = "Base URL of the Invidious instance",
             getSummary = { "Current: ${it.trim().trimEnd('/')}" },
+            inputType = InputType.TYPE_TEXT_VARIATION_URI,
+            validate = { value ->
+                val trimmed = value.trim().trimEnd('/')
+                trimmed.startsWith("http://") || trimmed.startsWith("https://")
+            },
+            validationMessage = { "URL must start with http:// or https://" },
             onComplete = { value ->
                 preferences.edit().putString(PREF_INSTANCE_KEY, value.trim().trimEnd('/')).apply()
             },
