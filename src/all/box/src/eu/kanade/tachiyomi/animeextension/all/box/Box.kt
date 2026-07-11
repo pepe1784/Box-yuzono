@@ -22,6 +22,7 @@ import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.nodes.Document
 import java.net.URLEncoder
 
 class Box : AnimeHttpSource(), ConfigurableAnimeSource {
@@ -154,38 +155,54 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     override fun videoListParse(response: Response): List<Video> {
         val doc = response.asJsoup()
         val host = response.host
-        val videoId = extractVideoId(response.request.url.toString())
-        val sources = doc.select("video#player source")
+        val videoId = extractVideoId(response.request.url.toString()) ?: return emptyList()
+        val check = extractCheck(doc) ?: return emptyList()
         val videos = mutableListOf<Video>()
 
-        for (source in sources) {
-            if (source.hasAttr("hidequalityoption")) continue
-            val src = source.attr("src").takeIf { it.isNotBlank() } ?: continue
-            val absolute = if (src.startsWith("http")) src else "$host$src"
-            val label = source.attr("label").ifBlank {
-                if (source.attr("type").contains("dash", ignoreCase = true)) "DASH" else "Video"
-            }
-
-            val finalUrl = when {
-                source.attr("type").contains("dash", ignoreCase = true) -> absolute
-                else -> resolveVideoUrl(absolute)
-            }
-
-            videos += Video(finalUrl, label, finalUrl, headers)
+        // Probe known combined (video+audio) YouTube itags. Not every itag is
+        // available for every video, so we keep only the ones that resolve to
+        // a real googlevideo URL.
+        ITAG_LABELS.forEach { (itag, label) ->
+            val url = probeItag(host, videoId, check, itag) ?: return@forEach
+            videos += Video(url, label, url, headers)
         }
 
-        if (videos.isEmpty() && !videoId.isNullOrBlank()) {
-            val dashUrl = "$host/api/manifest/dash/id/$videoId"
-            videos += Video(dashUrl, "DASH", dashUrl, headers)
+        // Fallback to the progressive stream listed in the player page.
+        if (videos.isEmpty()) {
+            doc.select("video#player source").forEach { source ->
+                if (source.hasAttr("hidequalityoption")) return@forEach
+                if (source.attr("type").contains("dash", ignoreCase = true)) return@forEach
+                val src = source.attr("src").takeIf { it.isNotBlank() } ?: return@forEach
+                val absolute = if (src.startsWith("http")) src else "$host$src"
+                val label = source.attr("label").ifBlank { "Video" }
+                val finalUrl = resolveVideoUrl(absolute)
+                videos += Video(finalUrl, label, finalUrl, headers)
+            }
         }
 
         return videos
+    }
+
+    private fun probeItag(host: String, videoId: String, check: String, itag: String): String? {
+        val url = "$host/latest_version?id=$videoId&itag=$itag&check=$check"
+        return try {
+            resolveVideoUrl(url).takeIf {
+                it.contains("googlevideo") || it.contains("videoplayback")
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun resolveVideoUrl(url: String): String {
         return client.newCall(GET(url, watchHeaders)).execute().use {
             it.request.url.toString()
         }
+    }
+
+    private fun extractCheck(doc: Document): String? {
+        val src = doc.selectFirst("video#player source")?.attr("src") ?: return null
+        return CHECK_REGEX.find(src)?.groupValues?.getOrNull(1)
     }
 
     override fun List<Video>.sort(): List<Video> {
@@ -273,9 +290,21 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         private const val PREF_INSTANCE_KEY = "invidious_instance"
         private const val PREF_QUALITY_KEY = "preferred_quality"
 
-        private val PREF_QUALITY_ENTRIES = arrayOf("1080p", "720p", "480p", "360p", "DASH")
-        private val PREF_QUALITY_VALUES = arrayOf("1080", "720", "480", "360", "DASH")
+        private val PREF_QUALITY_ENTRIES = arrayOf("1080p", "720p", "480p", "360p")
+        private val PREF_QUALITY_VALUES = arrayOf("1080", "720", "480", "360")
         private const val PREF_QUALITY_DEFAULT = "720"
+
+        private val ITAG_LABELS = linkedMapOf(
+            "37" to "1080p",
+            "85" to "1080p",
+            "22" to "720p",
+            "84" to "720p",
+            "83" to "480p",
+            "18" to "360p",
+            "82" to "360p",
+        )
+
+        private val CHECK_REGEX = Regex("""check=([A-Za-z0-9_-]+)""")
 
         private const val FIELDS = "fields=videoId,title,author,lengthSeconds,viewCount,publishedText"
         private const val DETAIL_FIELDS =
