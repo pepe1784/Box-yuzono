@@ -34,6 +34,9 @@ class DashProxyServer(
         }
     }
 
+    // Total segment size per URL, parsed from upstream Content-Range.
+    private val segmentSizes = mutableMapOf<String, Long>()
+
     val proxyUrl: String
         get() = "http://127.0.0.1:$listeningPort/manifest.mpd"
 
@@ -104,9 +107,17 @@ class DashProxyServer(
         range: Pair<Long, Long?>,
     ): Response {
         val (reqStart, reqEnd) = range
-        val blockStart = (reqStart / BLOCK_SIZE) * BLOCK_SIZE
-        val cacheKey = "$url|$blockStart"
+        val contentType = guessContentType(url)
 
+        // If the requested range spans more than one block, fetch exactly what
+        // was asked to avoid complicated multi-block reads.
+        val blockStart = (reqStart / BLOCK_SIZE) * BLOCK_SIZE
+        val blockEnd = if (reqEnd != null) (reqEnd / BLOCK_SIZE) * BLOCK_SIZE else blockStart
+        if (blockEnd != blockStart) {
+            return fetchExactRange(session, url, reqStart, reqEnd, contentType)
+        }
+
+        val cacheKey = "$url|$blockStart"
         val block = blockCache.get(cacheKey) ?: fetchBlock(url, blockStart, session).also {
             blockCache[cacheKey] = it
         }
@@ -118,9 +129,8 @@ class DashProxyServer(
             block.size
         }
         val data = block.copyOfRange(startInBlock, endInBlock)
-        val totalSize = block.size.toLong() // approximate for this block
+        val totalSize = segmentSizes[url] ?: block.size.toLong()
 
-        val contentType = guessContentType(url)
         val resp = newFixedLengthResponse(
             Response.Status.PARTIAL_CONTENT,
             contentType,
@@ -133,6 +143,41 @@ class DashProxyServer(
             "bytes $reqStart-${reqStart + data.size - 1}/$totalSize",
         )
         return resp
+    }
+
+    private fun fetchExactRange(
+        session: IHTTPSession,
+        url: String,
+        start: Long,
+        end: Long?,
+        contentType: String,
+    ): Response {
+        val range = if (end != null) "bytes=$start-$end" else "bytes=$start-"
+        val request = Request.Builder()
+            .url(url)
+            .headers(extractHeaders(session))
+            .header("Range", range)
+            .build()
+        Log.d(TAG, "Fetching exact range: $url range=$range")
+        return client.newCall(request).execute().use { response ->
+            val body = response.body ?: return@use newFixedLengthResponse(
+                Response.Status.NO_CONTENT,
+                MIME_PLAINTEXT,
+                "",
+            )
+            val bytes = body.bytes()
+            val total = response.header("Content-Range")?.let { parseContentRangeTotal(it) } ?: (start + bytes.size)
+            segmentSizes[url] = total
+            val resp = newFixedLengthResponse(
+                Response.Status.PARTIAL_CONTENT,
+                contentType,
+                ByteArrayInputStream(bytes),
+                bytes.size.toLong(),
+            )
+            resp.addHeader("Accept-Ranges", "bytes")
+            resp.addHeader("Content-Range", "bytes $start-${start + bytes.size - 1}/$total")
+            resp
+        }
     }
 
     private fun serveSegmentFull(session: IHTTPSession, url: String): Response {
@@ -180,8 +225,16 @@ class DashProxyServer(
             .build()
         Log.d(TAG, "Fetching block: $url range=$range")
         return client.newCall(request).execute().use { response ->
+            response.header("Content-Range")?.let { parseContentRangeTotal(it) }?.let {
+                segmentSizes[url] = it
+            }
             response.body?.bytes() ?: ByteArray(0)
         }
+    }
+
+    private fun parseContentRangeTotal(header: String): Long? {
+        val m = Regex("""bytes \\d+-\\d+/(\\d+)""").find(header) ?: return null
+        return m.groupValues[1].toLongOrNull()
     }
 
     private fun guessContentType(url: String): String {
