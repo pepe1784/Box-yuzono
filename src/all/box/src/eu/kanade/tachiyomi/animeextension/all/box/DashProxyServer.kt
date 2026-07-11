@@ -107,7 +107,9 @@ class DashProxyServer(
             newChunkedResponse(status, contentType, stream)
         }
         // Forward range-related headers so MPV can seek inside the segment.
-        response.header("Accept-Ranges")?.let { resp.addHeader("Accept-Ranges", it) }
+        // Always advertise Accept-Ranges; this lets MPV request the sidx at
+        // the end of large files without downloading the whole file first.
+        resp.addHeader("Accept-Ranges", response.header("Accept-Ranges") ?: "bytes")
         response.header("Content-Range")?.let { resp.addHeader("Content-Range", it) }
         response.header("ETag")?.let { resp.addHeader("ETag", it) }
         response.header("Last-Modified")?.let { resp.addHeader("Last-Modified", it) }
