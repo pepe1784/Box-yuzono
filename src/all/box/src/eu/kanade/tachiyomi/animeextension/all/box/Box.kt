@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.all.box
 
 import android.text.InputType
+import android.util.Log
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -152,17 +153,36 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val videoId = extractVideoId(response.request.url.toString()) ?: return emptyList()
         val check = extractCheck(doc)
         val videos = mutableListOf<Video>()
+        val seenUrls = mutableSetOf<String>()
 
         // DASH manifest: proxy it through a local HTTP server so Aniyomi/MPV
         // sees a .mpd URL and the proxy can add the Anubis cookie to every
         // segment request.
         val dashSrc = doc.selectFirst("video#player source[type*=dash]")?.attr("src")
+        Log.d(TAG, "dashSrc=$dashSrc check=$check")
         if (!dashSrc.isNullOrBlank()) {
             val absoluteDash = if (dashSrc.startsWith("http")) dashSrc else "$host$dashSrc"
-            dashProxy?.stop()
-            dashProxy = DashProxyServer(client)
-            val proxyUrl = dashProxy!!.serveManifest(absoluteDash)
-            videos += Video(proxyUrl, "DASH", proxyUrl, headers)
+            try {
+                dashProxy?.stop()
+                dashProxy = DashProxyServer(client)
+                val proxyUrl = dashProxy!!.serveManifest(absoluteDash)
+                Log.d(TAG, "Adding DASH proxy: $proxyUrl")
+                videos += Video(proxyUrl, "DASH", proxyUrl, headers)
+                seenUrls += proxyUrl
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start DASH proxy", e)
+            }
+        }
+
+        // Probe known combined (video+audio) YouTube itags to expose HD720,
+        // medium and small even when Invidious only lists one progressive source.
+        if (!check.isNullOrBlank()) {
+            ITAG_LABELS.forEach { (itag, label) ->
+                val url = probeItag(host, videoId, check, itag) ?: return@forEach
+                if (!seenUrls.add(url)) return@forEach
+                Log.d(TAG, "Adding itag $itag -> $label")
+                videos += Video(url, label, url, headers)
+            }
         }
 
         // Progressive streams exposed by the player page (HD720, medium, small).
@@ -173,15 +193,9 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             val absolute = if (src.startsWith("http")) src else "$host$src"
             val label = source.attr("label").ifBlank { "Video" }
             val finalUrl = resolveVideoUrl(absolute)
+            if (!seenUrls.add(finalUrl)) return@forEach
+            Log.d(TAG, "Adding progressive source: $label")
             videos += Video(finalUrl, label, finalUrl, headers)
-        }
-
-        // Last resort: probe known combined (video+audio) YouTube itags.
-        if (videos.isEmpty() && !check.isNullOrBlank()) {
-            ITAG_LABELS.forEach { (itag, label) ->
-                val url = probeItag(host, videoId, check, itag) ?: return@forEach
-                videos += Video(url, label, url, headers)
-            }
         }
 
         return videos
@@ -205,8 +219,9 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     }
 
     private fun extractCheck(doc: Document): String? {
-        val src = doc.selectFirst("video#player source")?.attr("src") ?: return null
-        return CHECK_REGEX.find(src)?.groupValues?.getOrNull(1)
+        return doc.select("video#player source").mapNotNull { source ->
+            CHECK_REGEX.find(source.attr("src"))?.groupValues?.getOrNull(1)
+        }.firstOrNull()
     }
 
     override fun List<Video>.sort(): List<Video> {
@@ -312,6 +327,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         private const val FIELDS = "fields=videoId,title,author,lengthSeconds,viewCount,publishedText"
         private const val DETAIL_FIELDS =
             "fields=videoId,title,description,author,lengthSeconds,viewCount,publishedText,formatStreams,recommendedVideos&local=true"
+
+        private const val TAG = "Box"
     }
 }
 
