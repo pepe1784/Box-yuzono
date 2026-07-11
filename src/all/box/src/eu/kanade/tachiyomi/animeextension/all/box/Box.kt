@@ -161,7 +161,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
         // DASH manifest: proxy it through a local HTTP server so Aniyomi/MPV
         // sees a .mpd URL and the proxy can add the Anubis cookie to every
-        // segment request.
+        // segment request. Keep this lightweight: do not download the manifest
+        // here, the proxy will fetch it when MPV asks for it.
         val dashSrc = doc.selectFirst("video#player source[type*=dash]")?.attr("src")
         Log.d(TAG, "dashSrc=$dashSrc check=$check")
         if (!dashSrc.isNullOrBlank()) {
@@ -178,17 +179,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             }
         }
 
-        // Probe known combined (video+audio) YouTube itags to expose HD720,
-        // medium and small even when Invidious only lists one progressive source.
-        if (!check.isNullOrBlank()) {
-            ITAG_LABELS.forEach { (itag, label) ->
-                val url = probeItag(host, videoId, check, itag) ?: return@forEach
-                if (!seenUrls.add(url)) return@forEach
-                Log.d(TAG, "Adding itag $itag -> $label")
-                videos += Video(url, label, url, headers)
-            }
-        }
-
         // Progressive streams exposed by the player page (HD720, medium, small).
         doc.select("video#player source").forEach { source ->
             if (source.hasAttr("hidequalityoption")) return@forEach
@@ -200,6 +190,17 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             if (!seenUrls.add(finalUrl)) return@forEach
             Log.d(TAG, "Adding progressive source: $label")
             videos += Video(finalUrl, label, finalUrl, headers)
+        }
+
+        // Only probe itags as a fallback when the page exposes no progressive
+        // sources. This avoids blocking the quality list with multiple requests.
+        if (videos.none { it.quality != "DASH" } && !check.isNullOrBlank()) {
+            ITAG_LABELS.forEach { (itag, label) ->
+                val url = probeItag(host, videoId, check, itag) ?: return@forEach
+                if (!seenUrls.add(url)) return@forEach
+                Log.d(TAG, "Adding fallback itag $itag -> $label")
+                videos += Video(url, label, url, headers)
+            }
         }
 
         return videos
