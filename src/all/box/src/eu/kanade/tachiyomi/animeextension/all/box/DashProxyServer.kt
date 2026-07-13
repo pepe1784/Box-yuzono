@@ -218,10 +218,11 @@ class DashProxyServer(
 
     private fun fetchTotalSize(url: String): Long {
         return try {
+            // Some instances hang on "bytes=0-0"; ask for a small chunk instead.
             val request = Request.Builder()
                 .url(url)
                 .header("User-Agent", USER_AGENT)
-                .header("Range", "bytes=0-0")
+                .header("Range", "bytes=0-1023")
                 .build()
             client.newCall(request).execute().use { response ->
                 response.header("Content-Range")?.let { parseContentRangeTotal(it) }
