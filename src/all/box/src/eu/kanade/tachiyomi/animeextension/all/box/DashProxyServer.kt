@@ -17,12 +17,18 @@ import java.nio.charset.Charset
  * This server exposes the manifest at `http://127.0.0.1:<port>/manifest.mpd`,
  * rewrites every `<BaseURL>` to point back at this proxy, and forwards segment
  * requests using the OkHttp client (so the Anubis auth cookie is preserved).
+ *
+ * Segment requests are answered with the exact byte range MPV asks for, never
+ * loading more than [MAX_IN_MEMORY] bytes into RAM at once. This avoids OOM
+ * errors on long videos while still reporting the real total file size so MPV
+ * keeps requesting more data.
  */
 class DashProxyServer(
     private val client: OkHttpClient,
 ) : NanoHTTPD(0) {
 
     private var manifestUrl: String = ""
+    private val totalSizes = mutableMapOf<String, Long>()
 
     val proxyUrl: String
         get() = "http://127.0.0.1:$listeningPort/manifest.mpd"
@@ -82,15 +88,84 @@ class DashProxyServer(
         val range = parseRange(session.headers["range"])
         val contentType = guessContentType(url)
 
-        val requestBuilder = Request.Builder()
-            .url(url)
-            .headers(extractHeaders(session))
-        if (range != null) {
-            val (start, end) = range
-            requestBuilder.header("Range", if (end != null) "bytes=$start-$end" else "bytes=$start-")
+        // Make sure we know the real total size before answering; otherwise MPV
+        // may think the file ends after the first chunk.
+        val totalSize = totalSizes[url] ?: fetchTotalSize(url).also { totalSizes[url] = it }
+        if (totalSize <= 0) {
+            Log.w(TAG, "Could not determine total size for $url")
         }
 
-        val response = client.newCall(requestBuilder.build()).execute()
+        return if (range != null) {
+            serveSegmentRange(session, url, range, contentType, totalSize)
+        } else {
+            serveSegmentFull(session, url, contentType, totalSize)
+        }
+    }
+
+    private fun serveSegmentRange(
+        session: IHTTPSession,
+        url: String,
+        range: Pair<Long, Long?>,
+        contentType: String,
+        totalSize: Long,
+    ): Response {
+        val (reqStart, reqEnd) = range
+        val requestedLength = if (reqEnd != null) reqEnd - reqStart + 1 else totalSize - reqStart
+
+        // For small ranges load the bytes in memory; for large ranges stream.
+        return if (requestedLength in 1..MAX_IN_MEMORY) {
+            serveSmallRange(session, url, reqStart, reqEnd, contentType, totalSize)
+        } else {
+            serveStreamRange(session, url, reqStart, reqEnd, contentType, totalSize)
+        }
+    }
+
+    private fun serveSmallRange(
+        session: IHTTPSession,
+        url: String,
+        start: Long,
+        end: Long?,
+        contentType: String,
+        totalSize: Long,
+    ): Response {
+        val rangeHeader = if (end != null) "bytes=$start-$end" else "bytes=$start-"
+        val request = Request.Builder()
+            .url(url)
+            .headers(extractHeaders(session))
+            .header("Range", rangeHeader)
+            .build()
+        val response = client.newCall(request).execute()
+        val bytes = response.body?.bytes() ?: ByteArray(0)
+        response.close()
+
+        Log.d(TAG, "Small range: $url range=$rangeHeader got ${bytes.size} total=$totalSize")
+
+        val resp = newFixedLengthResponse(
+            Response.Status.PARTIAL_CONTENT,
+            contentType,
+            ByteArrayInputStream(bytes),
+            bytes.size.toLong(),
+        )
+        resp.addHeader("Accept-Ranges", "bytes")
+        resp.addHeader("Content-Range", "bytes $start-${start + bytes.size - 1}/${totalSize.coerceAtLeast(start + bytes.size)}")
+        return resp
+    }
+
+    private fun serveStreamRange(
+        session: IHTTPSession,
+        url: String,
+        start: Long,
+        end: Long?,
+        contentType: String,
+        totalSize: Long,
+    ): Response {
+        val rangeHeader = if (end != null) "bytes=$start-$end" else "bytes=$start-"
+        val request = Request.Builder()
+            .url(url)
+            .headers(extractHeaders(session))
+            .header("Range", rangeHeader)
+            .build()
+        val response = client.newCall(request).execute()
         val body = response.body
             ?: return newFixedLengthResponse(
                 Response.Status.NO_CONTENT,
@@ -98,32 +173,65 @@ class DashProxyServer(
                 "",
             )
 
-        val bytes = body.bytes()
-        val totalSize = response.header("Content-Range")?.let { parseContentRangeTotal(it) }
-            ?: (range?.first?.plus(bytes.size) ?: bytes.size).toLong()
-
-        val status = when {
-            response.code == 206 || range != null -> Response.Status.PARTIAL_CONTENT
-            response.code == 404 -> Response.Status.NOT_FOUND
-            else -> Response.Status.OK
+        val contentLength = body.contentLength()
+        val stream = body.byteStream().withCloseAction(response::close)
+        val resp = if (contentLength >= 0) {
+            newFixedLengthResponse(Response.Status.PARTIAL_CONTENT, contentType, stream, contentLength)
+        } else {
+            newChunkedResponse(Response.Status.PARTIAL_CONTENT, contentType, stream)
         }
-
-        Log.d(TAG, "Segment response: $url status=${response.code} len=${bytes.size} total=$totalSize")
-
-        val resp = newFixedLengthResponse(
-            status,
-            contentType,
-            ByteArrayInputStream(bytes),
-            bytes.size.toLong(),
-        )
         resp.addHeader("Accept-Ranges", "bytes")
-        if (range != null) {
-            val start = range.first
-            resp.addHeader("Content-Range", "bytes $start-${start + bytes.size - 1}/$totalSize")
-        }
-        response.header("ETag")?.let { resp.addHeader("ETag", it) }
-        response.header("Last-Modified")?.let { resp.addHeader("Last-Modified", it) }
+        val actualEnd = if (end != null) end else totalSize - 1
+        resp.addHeader("Content-Range", "bytes $start-$actualEnd/$totalSize")
         return resp
+    }
+
+    private fun serveSegmentFull(
+        session: IHTTPSession,
+        url: String,
+        contentType: String,
+        totalSize: Long,
+    ): Response {
+        Log.d(TAG, "Full segment request: $url")
+        val request = Request.Builder()
+            .url(url)
+            .headers(extractHeaders(session))
+            .build()
+        val response = client.newCall(request).execute()
+        val body = response.body
+            ?: return newFixedLengthResponse(
+                Response.Status.NO_CONTENT,
+                MIME_PLAINTEXT,
+                "",
+            )
+
+        val contentLength = body.contentLength()
+        val stream = body.byteStream().withCloseAction(response::close)
+        val resp = if (contentLength >= 0) {
+            newFixedLengthResponse(Response.Status.OK, contentType, stream, contentLength)
+        } else {
+            newChunkedResponse(Response.Status.OK, contentType, stream)
+        }
+        resp.addHeader("Accept-Ranges", "bytes")
+        return resp
+    }
+
+    private fun fetchTotalSize(url: String): Long {
+        return try {
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", USER_AGENT)
+                .header("Range", "bytes=0-0")
+                .build()
+            client.newCall(request).execute().use { response ->
+                response.header("Content-Range")?.let { parseContentRangeTotal(it) }
+                    ?: response.header("Content-Length")?.toLongOrNull()
+                    ?: 0L
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to fetch total size for $url", e)
+            0L
+        }
     }
 
     private fun guessContentType(url: String): String {
@@ -242,6 +350,7 @@ class DashProxyServer(
     companion object {
         private const val TAG = "DashProxyServer"
         private const val SOCKET_TIMEOUT = 120_000
+        private const val MAX_IN_MEMORY = 1L * 1024 * 1024
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private val BASE_URL_REGEX = Regex("""<BaseURL>([^<]+)</BaseURL>""")
@@ -250,5 +359,22 @@ class DashProxyServer(
             RegexOption.DOT_MATCHES_ALL,
         )
         private val RANGE_REGEX = Regex("""bytes=(\d+)-(\d*)""")
+    }
+}
+
+/**
+ * Returns an [InputStream] that invokes [action] after the stream is closed.
+ * Used to close the OkHttp [Response] once NanoHTTPD finishes serving it.
+ */
+private fun InputStream.withCloseAction(action: () -> Unit): InputStream {
+    val base = this
+    return object : InputStream() {
+        override fun read(): Int = base.read()
+        override fun read(b: ByteArray, off: Int, len: Int): Int = base.read(b, off, len)
+        override fun available(): Int = base.available()
+        override fun close() {
+            base.close()
+            action()
+        }
     }
 }
