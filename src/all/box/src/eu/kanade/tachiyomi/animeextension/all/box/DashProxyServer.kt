@@ -69,7 +69,12 @@ class DashProxyServer(
         val manifest = fetchManifest(url)
         val filtered = filterManifest(manifest)
         val rewritten = rewriteManifest(filtered)
-        val bytes = rewritten.toByteArray(Charset.defaultCharset())
+        // Some players handle on-demand manifests better than the main profile.
+        val finalManifest = rewritten.replace(
+            "urn:mpeg:dash:profile:isoff-main:2011",
+            "urn:mpeg:dash:profile:isoff-on-demand:2011",
+        )
+        val bytes = finalManifest.toByteArray(Charset.defaultCharset())
         val resp = newFixedLengthResponse(
             Response.Status.OK,
             "application/dash+xml",
@@ -181,8 +186,10 @@ class DashProxyServer(
             newChunkedResponse(Response.Status.PARTIAL_CONTENT, contentType, stream)
         }
         resp.addHeader("Accept-Ranges", "bytes")
-        val actualEnd = if (end != null) end else totalSize - 1
-        resp.addHeader("Content-Range", "bytes $start-$actualEnd/$totalSize")
+        if (totalSize > 0) {
+            val actualEnd = if (end != null) end else totalSize - 1
+            resp.addHeader("Content-Range", "bytes $start-$actualEnd/$totalSize")
+        }
         return resp
     }
 
@@ -282,31 +289,69 @@ class DashProxyServer(
     }
 
     /**
-     * Keep only the best video Representation up to 1080p. This dramatically
-     * reduces the work MPV has to do on startup, especially for long videos
-     * where each Representation is a single large file. Audio Representations
-     * (no height) are always kept.
+     * Keep only the best video Representation up to 1080p, preferring H.264
+     * (avc1) because it has the widest decoder support in Aniyomi/MPV.
+     * VP9 (vp9) is used as fallback, then AV1. Audio AdaptationSets are kept
+     * untouched. Empty AdaptationSets are removed.
      */
     private fun filterManifest(manifest: String): String {
-        val matches = REPRESENTATION_REGEX.findAll(manifest).toList()
-        if (matches.isEmpty()) return manifest
+        val adaptationSets = ADAPTATION_SET_REGEX.findAll(manifest).toList()
+        if (adaptationSets.isEmpty()) return manifest
 
-        val heights = matches.mapNotNull { it.groupValues[2].toIntOrNull() }
-        val targetHeight = when {
-            heights.contains(1080) -> 1080
-            heights.contains(720) -> 720
-            else -> heights.filter { it <= 1080 }.maxOrNull() ?: heights.maxOrNull() ?: return manifest
-        }
+        var audioBlock: String? = null
+        var bestVideo: Pair<String, String>? = null
+        var bestScore: Triple<Int, Int, Int> = Triple(-1, -1, -1)
 
-        var result = manifest
-        matches.forEach { match ->
-            val height = match.groupValues[2].toIntOrNull()
-            if (height != null && height != targetHeight) {
-                result = result.replace(match.value, "")
+        adaptationSets.forEach { asMatch ->
+            val asAttrs = parseAttributes(asMatch.groupValues[1])
+            val contentType = asAttrs["contentType"] ?: ""
+            val block = asMatch.groupValues[0]
+            val opening = asMatch.groupValues[1]
+
+            if (contentType == "audio") {
+                audioBlock = block
+            } else if (contentType == "video") {
+                REPRESENTATION_REGEX.findAll(block).forEach { repMatch ->
+                    val repAttrs = parseAttributes(repMatch.groupValues[1])
+                    val height = repAttrs["height"]?.toIntOrNull() ?: 0
+                    val codecs = repAttrs["codecs"] ?: ""
+                    val pref = when {
+                        codecs.startsWith("avc1") -> 2
+                        codecs.startsWith("vp9") -> 1
+                        else -> 0
+                    }
+                    val capped = if (height <= 1080) height else 0
+                    val score = Triple(pref, capped, height)
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestVideo = opening to repMatch.groupValues[0]
+                    }
+                }
             }
         }
-        Log.d(TAG, "Filtered DASH manifest: kept ${targetHeight}p")
-        return result
+
+        val mpdHead = MPD_OPEN_REGEX.find(manifest)?.groupValues?.get(0)
+            ?: manifest.substringBefore("<Period>")
+        val sb = StringBuilder()
+        sb.append(mpdHead)
+        sb.append("<Period>")
+        audioBlock?.let { sb.append(it) }
+        bestVideo?.let { (opening, rep) ->
+            sb.append("<AdaptationSet$opening>$rep</AdaptationSet>")
+        }
+        sb.append("</Period></MPD>")
+        val height = bestScore.third
+        Log.d(TAG, "Filtered DASH manifest: kept ${height}p (pref=${bestScore.first})")
+        return sb.toString()
+    }
+
+    private fun parseAttributes(tag: String): Map<String, String> {
+        val map = mutableMapOf<String, String>()
+        val regex = Regex("""(\w+)="([^"]*)"""")
+        regex.findAll(tag).forEach { match ->
+            map[match.groupValues[1]] = match.groupValues[2]
+        }
+        return map
     }
 
     private val manifestHost: String
@@ -355,10 +400,15 @@ class DashProxyServer(
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private val BASE_URL_REGEX = Regex("""<BaseURL>([^<]+)</BaseURL>""")
-        private val REPRESENTATION_REGEX = Regex(
-            """<Representation([^>]*height=\"(\d+)\"[^>]*)>.*?</Representation>""",
+        private val ADAPTATION_SET_REGEX = Regex(
+            """<AdaptationSet([^>]*)>(.*?)</AdaptationSet>""",
             RegexOption.DOT_MATCHES_ALL,
         )
+        private val REPRESENTATION_REGEX = Regex(
+            """<Representation([^>]*)>(.*?)</Representation>""",
+            RegexOption.DOT_MATCHES_ALL,
+        )
+        private val MPD_OPEN_REGEX = Regex("""<MPD[^>]*>""")
         private val RANGE_REGEX = Regex("""bytes=(\d+)-(\d*)""")
     }
 }
