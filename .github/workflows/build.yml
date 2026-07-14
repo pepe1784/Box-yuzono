@@ -31,6 +31,8 @@ jobs:
       - name: Apply box extension
         run: |
           cp -r patch/src/all/box source/src/all/box
+          mkdir -p source/lib
+          cp -r patch/lib/* source/lib/
           cp patch/settings.gradle.kts source/settings.gradle.kts
 
       - name: Set up JDK 17

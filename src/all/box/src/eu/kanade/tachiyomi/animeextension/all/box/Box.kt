@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.animeextension.all.box
 
 import android.text.InputType
 import android.util.Log
+import aniyomi.lib.playlistutils.PlaylistUtils
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -195,6 +196,29 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             }
         } else {
             videos += Video("", "DASH DEBUG: empty dashUrl", "", headers)
+        }
+
+        // HLS fallback: Invidious also exposes an HLS master playlist.
+        if (check.isNotBlank()) {
+            val hlsUrl = "$host/api/manifest/hls_playlist/id/$videoId?local=true&check=$check"
+            try {
+                val playlistUtils = PlaylistUtils(client, watchHeaders)
+                val hlsVideos = playlistUtils.extractFromHls(
+                    hlsUrl,
+                    masterHeaders = watchHeaders,
+                    videoHeaders = watchHeaders,
+                    videoNameGen = { quality -> "HLS $quality" },
+                )
+                hlsVideos.forEach { video ->
+                    val videoUrl = video.videoUrl ?: return@forEach
+                    if (seenUrls.add(videoUrl)) {
+                        Log.d(TAG, "Adding HLS source: ${video.quality}")
+                        videos += video
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to parse HLS playlist", e)
+            }
         }
 
         // Progressive streams exposed by the player page (HD720, medium, small).
