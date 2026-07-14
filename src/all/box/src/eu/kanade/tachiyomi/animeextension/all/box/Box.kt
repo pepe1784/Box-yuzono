@@ -168,7 +168,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val dashSrc = doc.selectFirst("video#player source[type*=dash]")?.attr("src") ?: ""
         val dashUrl = when {
             dashSrc.isNotBlank() -> buildDashManifestUrl(dashSrc, host)
-            check.isNotBlank() -> "$host/api/manifest/dash/id/$videoId?local=false&unique_res=1&check=$check"
+            check.isNotBlank() -> "$host/api/manifest/dash/id/$videoId?local=true&unique_res=1&check=$check"
             else -> ""
         }
         Log.d(TAG, "dashSrc=$dashSrc dashUrl=$dashUrl")
@@ -176,8 +176,14 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             try {
                 val dashVideos = parseDashManifest(dashUrl)
                 Log.d(TAG, "Parsed ${dashVideos.size} DASH videos")
+                if (dashVideos.isEmpty()) {
+                    videos += Video("", "DASH DEBUG: 0 videos parsed", "", headers)
+                }
                 dashVideos.forEach { video ->
-                    val videoUrl = video.videoUrl ?: return@forEach
+                    val videoUrl = video.videoUrl ?: run {
+                        videos += Video("", "DASH DEBUG: null videoUrl", "", headers)
+                        return@forEach
+                    }
                     if (seenUrls.add(videoUrl)) {
                         Log.d(TAG, "Adding DASH source: ${video.quality}")
                         videos += video
@@ -185,7 +191,10 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to parse DASH manifest", e)
+                videos += Video("", "DASH DEBUG: ${e.message}", "", headers)
             }
+        } else {
+            videos += Video("", "DASH DEBUG: empty dashUrl", "", headers)
         }
 
         // Progressive streams exposed by the player page (HD720, medium, small).
@@ -216,12 +225,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     }
 
     private fun buildDashManifestUrl(src: String, host: String): String {
-        val absolute = if (src.startsWith("http")) src else "$host$src"
-        // Invidious serves proxied URLs with local=true. Use local=false so the
-        // manifest exposes the direct googlevideo URLs, which is what extensions
-        // such as MyAnime's YouTubeExtractor do for Aniyomi/ExoPlayer.
-        return absolute.replace(Regex("""[?&]local=(true|false)"""), "")
-            .let { if (it.contains("?")) "$it&local=false" else "$it?local=false" }
+        return if (src.startsWith("http")) src else "$host$src"
     }
 
     private fun parseDashManifest(manifestUrl: String): List<Video> {
@@ -264,11 +268,13 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                     ?: asBaseUrl
                     ?: return@forEach
 
+                val resolvedUrl = resolveVideoUrl(baseUrl)
+
                 when {
-                    contentType.contains("audio") -> audioUrls += baseUrl
+                    contentType.contains("audio") -> audioUrls += resolvedUrl
                     contentType.contains("video") -> {
                         videoReps += DashRep(
-                            url = baseUrl,
+                            url = resolvedUrl,
                             height = repAttrs["height"]?.toIntOrNull() ?: 0,
                             width = repAttrs["width"]?.toIntOrNull() ?: 0,
                             codecs = repAttrs["codecs"] ?: "",
