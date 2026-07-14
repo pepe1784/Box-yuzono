@@ -222,7 +222,11 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                     videos += Video("", "DASH DEBUG: $labelPrefix firstBaseUrl=$firstBaseUrl", "", headers)
                     if (seenUrls.add(url)) {
                         val label = if (labelPrefix == "remote") "DASH" else "DASH ($labelPrefix)"
-                        videos += Video(url, label, url, headers = dashHeaders(videoId))
+                        // ExoPlayer/Aniyomi detects DASH by file extension. The manifest URL
+                        // has none, so append a fragment that looks like .mpd without
+                        // changing the actual HTTP request.
+                        val playbackUrl = "$url#.mpd"
+                        videos += Video(playbackUrl, label, playbackUrl, headers = dashHeaders(videoId))
                         Log.d(TAG, "Adding DASH source: $label")
                     }
                     true
