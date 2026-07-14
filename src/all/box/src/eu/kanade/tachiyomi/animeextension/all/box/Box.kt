@@ -376,7 +376,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     private fun parseAttributes(tag: String): Map<String, String> {
         val map = mutableMapOf<String, String>()
-        val regex = Regex("""(\\w+)=\"([^\"]*)\"""")
+        val regex = Regex("""(\w+)="([^"]*)"""")
         regex.findAll(tag).forEach { match ->
             map[match.groupValues[1]] = match.groupValues[2]
         }
