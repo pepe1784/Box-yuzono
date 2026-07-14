@@ -298,7 +298,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         Log.d(TAG, "DASH reps: audio=${audioUrls.size}, video=${videoReps.size}")
         if (videoReps.isEmpty()) {
             return debugInfo.mapIndexed { index, info ->
-                Video("", "DASH DEBUG $index: $info", "", headers)
+                Video("dash-debug-$index", "DASH DEBUG $index: $info", "dash-debug-$index", headers)
             }
         }
 
