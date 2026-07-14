@@ -219,18 +219,20 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                 val start = body.take(120).replace("\n", " ")
                 videos += Video("", "DASH DEBUG: $labelPrefix status=$status len=${body.length} start=$start", "", headers)
                 if (status == 200 && body.contains("<MPD", ignoreCase = true)) {
-                    val firstBaseUrl = extractFirstDashBaseUrl(body, url)
-                    videos += Video("", "DASH DEBUG: $labelPrefix firstBaseUrl=$firstBaseUrl", "", headers)
-                    if (seenUrls.add(url)) {
-                        val label = if (labelPrefix == "remote") "DASH" else "DASH ($labelPrefix)"
-                        // ExoPlayer/Aniyomi detects DASH by file extension. The manifest URL
-                        // has none, so append a fragment that looks like .mpd without
-                        // changing the actual HTTP request.
-                        val playbackUrl = "$url#.mpd"
-                        videos += Video(playbackUrl, label, playbackUrl, headers = dashHeaders(videoId))
-                        Log.d(TAG, "Adding DASH source: $label")
+                    val parsed = parseDashManifestBody(body, url)
+                    if (parsed.isNotEmpty()) {
+                        parsed.forEach { video ->
+                            val videoUrl = video.videoUrl ?: return@forEach
+                            if (seenUrls.add(videoUrl)) {
+                                Log.d(TAG, "Adding DASH source: ${video.quality}")
+                                videos += video
+                            }
+                        }
+                        true
+                    } else {
+                        videos += Video("", "DASH DEBUG: $labelPrefix parsed 0 videos", "", headers)
+                        false
                     }
-                    true
                 } else {
                     false
                 }
@@ -345,6 +347,97 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     private fun buildDashManifestUrl(src: String, host: String): String {
         return if (src.startsWith("http")) src else "$host$src"
     }
+
+    private fun parseDashManifestBody(manifest: String, manifestUrl: String): List<Video> {
+        Log.d(TAG, "parseDashManifestBody: len=${manifest.length}")
+
+        val audioUrls = mutableListOf<String>()
+        val videoReps = mutableListOf<DashRep>()
+
+        ADAPTATION_SET_REGEX.findAll(manifest).forEach { asMatch ->
+            val asAttrs = parseAttributes(asMatch.groupValues[1])
+            val contentType = asAttrs["contentType"]?.lowercase()
+                ?: asAttrs["mimeType"]?.lowercase()
+                ?: ""
+            val asBlock = asMatch.groupValues[2]
+
+            if (!asBlock.contains("<SegmentBase", ignoreCase = true)) return@forEach
+
+            val asBaseUrl = BASE_URL_REGEX.find(asBlock)?.groupValues?.get(1)
+                ?.replace("&amp;", "&")
+                ?.let { resolveManifestUrl(it, manifestUrl) }
+
+            REPRESENTATION_REGEX.findAll(asBlock).forEach { repMatch ->
+                val repAttrs = parseAttributes(repMatch.groupValues[1])
+                val repBlock = repMatch.groupValues[2]
+
+                if (!repBlock.contains("<SegmentBase", ignoreCase = true)) return@forEach
+
+                val baseUrl = BASE_URL_REGEX.find(repBlock)?.groupValues?.get(1)
+                    ?.replace("&amp;", "&")
+                    ?.let { resolveManifestUrl(it, manifestUrl) }
+                    ?: asBaseUrl
+                    ?: return@forEach
+
+                when {
+                    contentType.contains("audio") -> audioUrls += baseUrl
+                    contentType.contains("video") -> {
+                        videoReps += DashRep(
+                            url = baseUrl,
+                            height = repAttrs["height"]?.toIntOrNull() ?: 0,
+                            width = repAttrs["width"]?.toIntOrNull() ?: 0,
+                            codecs = repAttrs["codecs"] ?: "",
+                            bandwidth = repAttrs["bandwidth"]?.toLongOrNull() ?: 0,
+                        )
+                    }
+                }
+            }
+        }
+
+        Log.d(TAG, "DASH reps: audio=${audioUrls.size}, video=${videoReps.size}")
+        if (videoReps.isEmpty()) return emptyList()
+
+        // FFmpeg/mpv needs a file extension hint to detect the container.
+        fun String.withExt(codecs: String): String {
+            return when {
+                contains("#.mp4") || contains("#.webm") -> this
+                else -> {
+                    val ext = when {
+                        codecs.startsWith("avc1") -> "mp4"
+                        codecs.startsWith("mp4a") -> "mp4"
+                        codecs.startsWith("vp9") || codecs.startsWith("vp09") -> "webm"
+                        codecs.startsWith("av01") -> "webm"
+                        else -> "mp4"
+                    }
+                    "$this#.$ext"
+                }
+            }
+        }
+
+        val audioTracks = audioUrls.map { Track(it.withExt("mp4a"), "Audio") }
+
+        val h264 = videoReps.filter { it.codecs.startsWith("avc1") }
+        val candidates = if (h264.isNotEmpty()) h264 else videoReps
+        val capped = candidates.filter { it.height <= 1080 }
+        val ordered = (if (capped.isNotEmpty()) capped else candidates)
+            .sortedByDescending { it.height }
+
+        return ordered.map { rep ->
+            val label = "DASH ${rep.height}p"
+            val videoUrl = rep.url.withExt(rep.codecs)
+            // Empty headers: these are direct googlevideo URLs and do not need
+            // the Invidious Referer/Origin.
+            Video(videoUrl, label, videoUrl, headers = Headers.Builder().build(), audioTracks = audioTracks)
+        }
+    }
+
+    private data class DashRep(
+        val url: String,
+        val height: Int,
+        val width: Int,
+        val codecs: String,
+        val bandwidth: Long,
+    )
 
     private fun resolveManifestUrl(raw: String, manifestUrl: String): String {
         return when {
