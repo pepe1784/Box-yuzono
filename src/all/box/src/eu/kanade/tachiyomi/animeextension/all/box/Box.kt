@@ -172,7 +172,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             try {
                 val dashVideos = parseDashManifest(dashUrl)
                 dashVideos.forEach { video ->
-                    if (seenUrls.add(video.videoUrl)) {
+                    val videoUrl = video.videoUrl ?: return@forEach
+                    if (seenUrls.add(videoUrl)) {
                         Log.d(TAG, "Adding DASH source: ${video.quality}")
                         videos += video
                     }
