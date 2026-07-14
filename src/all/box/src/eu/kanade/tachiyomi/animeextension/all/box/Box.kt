@@ -166,11 +166,16 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         // as a Video with its matching audio track(s). Other Yuzono extensions
         // (e.g. VVVVID, AllAnime) do exactly this instead of proxying the MPD.
         val dashSrc = doc.selectFirst("video#player source[type*=dash]")?.attr("src") ?: ""
-        Log.d(TAG, "dashSrc=$dashSrc check=$check")
-        if (dashSrc.isNotBlank()) {
-            val dashUrl = buildDashManifestUrl(dashSrc, host)
+        val dashUrl = when {
+            dashSrc.isNotBlank() -> buildDashManifestUrl(dashSrc, host)
+            check.isNotBlank() -> "$host/api/manifest/dash/id/$videoId?local=false&unique_res=1&check=$check"
+            else -> ""
+        }
+        Log.d(TAG, "dashSrc=$dashSrc dashUrl=$dashUrl")
+        if (dashUrl.isNotBlank()) {
             try {
                 val dashVideos = parseDashManifest(dashUrl)
+                Log.d(TAG, "Parsed ${dashVideos.size} DASH videos")
                 dashVideos.forEach { video ->
                     val videoUrl = video.videoUrl ?: return@forEach
                     if (seenUrls.add(videoUrl)) {
@@ -220,12 +225,14 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     }
 
     private fun parseDashManifest(manifestUrl: String): List<Video> {
+        Log.d(TAG, "parseDashManifest: $manifestUrl")
         val request = Request.Builder()
             .url(manifestUrl)
             .headers(watchHeaders)
             .header("Accept", "application/dash+xml")
             .build()
         val manifest = client.newCall(request).execute().use { it.body?.string() ?: "" }
+        Log.d(TAG, "Manifest length: ${manifest.length}")
 
         val audioUrls = mutableListOf<String>()
         val videoReps = mutableListOf<DashRep>()
@@ -272,6 +279,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             }
         }
 
+        Log.d(TAG, "DASH reps: audio=${audioUrls.size}, video=${videoReps.size}")
         if (videoReps.isEmpty()) return emptyList()
 
         val audioTracks = audioUrls.map { Track(it, "Audio") }
