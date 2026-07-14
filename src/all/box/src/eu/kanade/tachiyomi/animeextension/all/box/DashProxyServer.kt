@@ -322,7 +322,12 @@ class DashProxyServer(
                     }
                     val capped = if (height <= 1080) height else 0
                     val score = Triple(pref, capped, height)
-                    if (score > bestScore) {
+                    val better = when {
+                        score.first != bestScore.first -> score.first > bestScore.first
+                        score.second != bestScore.second -> score.second > bestScore.second
+                        else -> score.third > bestScore.third
+                    }
+                    if (better) {
                         bestScore = score
                         bestVideo = opening to repMatch.groupValues[0]
                     }
