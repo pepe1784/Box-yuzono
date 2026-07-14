@@ -78,10 +78,15 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             .add("Sec-Fetch-Site", "same-origin")
             .build()
 
-    private val hlsHeaders: Headers
-        get() = headersBuilder()
-            .set("Accept", "application/vnd.apple.mpegurl,*/*")
-            .build()
+    private fun dashHeaders(videoId: String): Headers = headersBuilder()
+        .set("Accept", "application/dash+xml")
+        .set("Referer", "$baseUrl/watch?v=$videoId")
+        .build()
+
+    private fun hlsHeaders(videoId: String): Headers = headersBuilder()
+        .set("Accept", "application/vnd.apple.mpegurl,*/*")
+        .set("Referer", "$baseUrl/watch?v=$videoId")
+        .build()
 
     // ============================== Popular ===============================
 
@@ -179,36 +184,68 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val videos = mutableListOf<Video>()
         val seenUrls = mutableSetOf<String>()
 
+        // Debug: show every <source> element from the player page.
+        doc.select("video#player source").forEachIndexed { index, source ->
+            val type = source.attr("type")
+            val label = source.attr("label")
+            val src = source.attr("src").take(120)
+            videos += Video("", "SRC DEBUG $index: type=$type label=$label src=$src", "", headers)
+        }
+        videos += Video("", "CHECK DEBUG: check=${check.take(20)}...", "", headers)
+
         // DASH manifest: parse it directly and expose each video Representation
         // as a Video with its matching audio track(s). Other Yuzono extensions
         // (e.g. VVVVID, AllAnime) do exactly this instead of proxying the MPD.
         val dashSrc = doc.selectFirst("video#player source[type*=dash]")?.attr("src") ?: ""
-        val dashUrl = when {
+        val dashUrlLocal = when {
             dashSrc.isNotBlank() -> buildDashManifestUrl(dashSrc, host)
             check.isNotBlank() -> "$host/api/manifest/dash/id/$videoId?local=true&unique_res=1&check=$check"
             else -> ""
         }
-        Log.d(TAG, "dashSrc=$dashSrc dashUrl=$dashUrl")
-        if (dashUrl.isNotBlank()) {
-            try {
-                val dashVideos = parseDashManifest(dashUrl)
-                Log.d(TAG, "Parsed ${dashVideos.size} DASH videos")
-                if (dashVideos.isEmpty()) {
-                    videos += Video("", "DASH DEBUG: 0 videos parsed", "", headers)
-                }
-                dashVideos.forEach { video ->
-                    val videoUrl = video.videoUrl ?: run {
-                        videos += Video("", "DASH DEBUG: null videoUrl", "", headers)
-                        return@forEach
+        val dashUrlRemote = if (check.isNotBlank()) {
+            "$host/api/manifest/dash/id/$videoId?unique_res=1&check=$check"
+        } else {
+            ""
+        }
+        Log.d(TAG, "dashSrc=$dashSrc dashUrlLocal=$dashUrlLocal dashUrlRemote=$dashUrlRemote")
+
+        fun addDashVideosFrom(url: String, labelPrefix: String = "DASH"): Boolean {
+            if (url.isBlank()) return false
+            return try {
+                val resp = client.newCall(GET(url, dashHeaders(videoId))).execute()
+                val body = resp.use { it.body?.string() } ?: ""
+                val status = resp.code
+                val start = body.take(120).replace("\n", " ")
+                videos += Video("", "DASH DEBUG: $labelPrefix status=$status len=${body.length} start=$start", "", headers)
+                if (status == 200 && body.contains("<MPD", ignoreCase = true)) {
+                    val parsed = parseDashManifestBody(body, url)
+                    if (parsed.isNotEmpty()) {
+                        parsed.forEach { video ->
+                            val videoUrl = video.videoUrl ?: return@forEach
+                            if (seenUrls.add(videoUrl)) {
+                                Log.d(TAG, "Adding DASH source: ${video.quality}")
+                                videos += video
+                            }
+                        }
+                        true
+                    } else {
+                        videos += Video("", "DASH DEBUG: $labelPrefix parsed 0 videos", "", headers)
+                        false
                     }
-                    if (seenUrls.add(videoUrl)) {
-                        Log.d(TAG, "Adding DASH source: ${video.quality}")
-                        videos += video
-                    }
+                } else {
+                    false
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to parse DASH manifest", e)
-                videos += Video("", "DASH DEBUG: ${e.message}", "", headers)
+                Log.e(TAG, "Failed to fetch DASH manifest $labelPrefix", e)
+                videos += Video("", "DASH DEBUG: $labelPrefix ${e.javaClass.simpleName}: ${e.message}", "", headers)
+                false
+            }
+        }
+
+        if (dashUrlLocal.isNotBlank() || dashUrlRemote.isNotBlank()) {
+            val ok = addDashVideosFrom(dashUrlLocal, "local")
+            if (!ok && dashUrlRemote.isNotBlank()) {
+                addDashVideosFrom(dashUrlRemote, "remote")
             }
         } else {
             videos += Video("", "DASH DEBUG: empty dashUrl", "", headers)
@@ -216,64 +253,65 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
         // HLS fallback: Invidious also exposes an HLS master playlist.
         if (check.isNotBlank()) {
-            val hlsUrl = "$host/api/manifest/hls_playlist/id/$videoId?local=true&check=$check"
-            try {
-                // Probe the master playlist manually so we can surface its content
-                // as debug entries when ExoPlayer reports "unrecognized file format".
-                val playlistResponse = client.newCall(GET(hlsUrl, hlsHeaders))
-                    .execute()
-                val playlistBody = playlistResponse.use { it.body?.string() } ?: ""
-                val playlistStatus = playlistResponse.code
-                val playlistStart = playlistBody.take(200).replace("\n", " ")
-                videos += Video(
-                    "",
-                    "HLS DEBUG: status=$playlistStatus len=${playlistBody.length} start=$playlistStart",
-                    "",
-                    headers,
-                )
+            val hlsUrlLocal = "$host/api/manifest/hls_playlist/id/$videoId?local=true&check=$check"
+            val hlsUrlRemote = "$host/api/manifest/hls_playlist/id/$videoId?check=$check"
 
-                val isValidHls = playlistBody.trimStart().startsWith("#EXTM3U", ignoreCase = true)
-                if (isValidHls) {
-                    if ("#EXT-X-STREAM-INF" !in playlistBody) {
-                        // Single-variant media playlist: pass it directly to ExoPlayer.
-                        if (seenUrls.add(hlsUrl)) {
-                            videos += Video(hlsUrl, "HLS master", hlsUrl, headers = hlsHeaders)
-                        }
-                    } else {
-                        val playlistUtils = PlaylistUtils(client, hlsHeaders)
-                        val hlsVideos = playlistUtils.extractFromHls(
-                            hlsUrl,
-                            masterHeaders = hlsHeaders,
-                            videoHeaders = hlsHeaders,
-                            videoNameGen = { quality -> "HLS $quality" },
-                        )
-                        if (hlsVideos.isEmpty()) {
-                            videos += Video("", "HLS DEBUG: extractFromHls returned empty", "", headers)
-                            // Fallback to the master playlist itself.
-                            if (seenUrls.add(hlsUrl)) {
-                                videos += Video(hlsUrl, "HLS master", hlsUrl, headers = hlsHeaders)
-                            }
-                        }
-                        hlsVideos.forEach { video ->
-                            val videoUrl = video.videoUrl ?: return@forEach
-                            if (seenUrls.add(videoUrl)) {
-                                Log.d(TAG, "Adding HLS source: ${video.quality}")
-                                videos += video
-                            }
-                        }
-                    }
-                } else {
+            fun processHls(url: String, labelPrefix: String): Boolean {
+                return try {
+                    val playlistResponse = client.newCall(GET(url, hlsHeaders(videoId)))
+                        .execute()
+                    val playlistBody = playlistResponse.use { it.body?.string() } ?: ""
+                    val playlistStatus = playlistResponse.code
+                    val playlistStart = playlistBody.take(120).replace("\n", " ")
                     videos += Video(
                         "",
-                        "HLS DEBUG: not a valid playlist (first 200 chars above)",
+                        "HLS DEBUG: $labelPrefix status=$playlistStatus len=${playlistBody.length} start=$playlistStart",
                         "",
                         headers,
                     )
+
+                    val isValidHls = playlistBody.trimStart().startsWith("#EXTM3U", ignoreCase = true)
+                    if (!isValidHls) return false
+
+                    if ("#EXT-X-STREAM-INF" !in playlistBody) {
+                        // Single-variant media playlist: pass it directly to ExoPlayer.
+                        if (seenUrls.add(url)) {
+                            videos += Video(url, "HLS master ($labelPrefix)", url, headers = hlsHeaders(videoId))
+                        }
+                        return true
+                    }
+
+                    val playlistUtils = PlaylistUtils(client, hlsHeaders(videoId))
+                    val hlsVideos = playlistUtils.extractFromHls(
+                        url,
+                        masterHeaders = hlsHeaders(videoId),
+                        videoHeaders = hlsHeaders(videoId),
+                        videoNameGen = { quality -> "HLS $quality" },
+                    )
+                    if (hlsVideos.isEmpty()) {
+                        videos += Video("", "HLS DEBUG: $labelPrefix extractFromHls empty", "", headers)
+                        if (seenUrls.add(url)) {
+                            videos += Video(url, "HLS master ($labelPrefix)", url, headers = hlsHeaders(videoId))
+                        }
+                        return true
+                    }
+                    hlsVideos.forEach { video ->
+                        val videoUrl = video.videoUrl ?: return@forEach
+                        if (seenUrls.add(videoUrl)) {
+                            Log.d(TAG, "Adding HLS source: ${video.quality}")
+                            videos += video
+                        }
+                    }
+                    true
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to parse HLS playlist $labelPrefix", e)
+                    videos += Video("", "HLS DEBUG: $labelPrefix ${e.javaClass.simpleName}: ${e.message}", "", headers)
+                    false
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to parse HLS playlist", e)
-                videos += Video("", "HLS DEBUG: ${e.javaClass.simpleName}: ${e.message}", "", headers)
             }
+
+            val ok = processHls(hlsUrlLocal, "local")
+            if (!ok) processHls(hlsUrlRemote, "remote")
         }
 
         // Progressive streams exposed by the player page (HD720, medium, small).
@@ -307,39 +345,22 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return if (src.startsWith("http")) src else "$host$src"
     }
 
-    private fun parseDashManifest(manifestUrl: String): List<Video> {
-        Log.d(TAG, "parseDashManifest: $manifestUrl")
-        val request = Request.Builder()
-            .url(manifestUrl)
-            .headers(watchHeaders)
-            .header("Accept", "application/dash+xml")
-            .build()
-        val manifest = client.newCall(request).execute().use { it.body?.string() ?: "" }
-        Log.d(TAG, "Manifest length: ${manifest.length}")
-
-        val debugInfo = mutableListOf<String>()
-        debugInfo += "len=${manifest.length}"
-        debugInfo += "start=${manifest.take(200).replace("\n", " ")}"
+    private fun parseDashManifestBody(manifest: String, manifestUrl: String): List<Video> {
+        Log.d(TAG, "parseDashManifestBody: len=${manifest.length}")
 
         val audioUrls = mutableListOf<String>()
         val videoReps = mutableListOf<DashRep>()
 
-        val adaptationSets = ADAPTATION_SET_REGEX.findAll(manifest).toList()
-        debugInfo += "adaptationSets=${adaptationSets.size}"
-
-        adaptationSets.forEach { asMatch ->
+        ADAPTATION_SET_REGEX.findAll(manifest).forEach { asMatch ->
             val asAttrs = parseAttributes(asMatch.groupValues[1])
             val contentType = asAttrs["contentType"]?.lowercase()
                 ?: asAttrs["mimeType"]?.lowercase()
                 ?: ""
             val asBlock = asMatch.groupValues[2]
-            val hasSegmentBase = asBlock.contains("<SegmentBase", ignoreCase = true)
-            val repCount = REPRESENTATION_REGEX.findAll(asBlock).count()
-            debugInfo += "AS type=$contentType segBase=$hasSegmentBase reps=$repCount"
 
             // Skip streams without index/init ranges (OTF) since ExoPlayer can't
             // play them as separate DASH representations.
-            if (!hasSegmentBase) return@forEach
+            if (!asBlock.contains("<SegmentBase", ignoreCase = true)) return@forEach
 
             val asBaseUrl = BASE_URL_REGEX.find(asBlock)?.groupValues?.get(1)
                 ?.replace("&amp;", "&")
@@ -375,11 +396,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         }
 
         Log.d(TAG, "DASH reps: audio=${audioUrls.size}, video=${videoReps.size}")
-        if (videoReps.isEmpty()) {
-            return debugInfo.mapIndexed { index, info ->
-                Video("dash-debug-$index", "DASH DEBUG $index: $info", "dash-debug-$index", headers)
-            }
-        }
+        if (videoReps.isEmpty()) return emptyList()
 
         val audioTracks = audioUrls.map { Track(it, "Audio") }
 
