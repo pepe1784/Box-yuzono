@@ -216,7 +216,7 @@ class GoAwayInterceptor : Interceptor {
         private const val PASS_HEADER = "X-Box-GoAway-Pass"
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-        private const val GO_AWAY_MARKER = "Protected by go-away"
+        private const val GO_AWAY_MARKER = "js-pow-sha256"
         private const val CHALLENGE_PEEK_BYTES = 64 * 1024L
 
         private val SCRIPT_SRC_REGEX = Regex(
