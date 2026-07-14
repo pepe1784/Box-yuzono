@@ -8,6 +8,7 @@ import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
+import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
@@ -24,12 +25,12 @@ import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.Headers
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import java.net.URLEncoder
-import java.util.concurrent.TimeUnit
 
 class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
@@ -49,14 +50,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             .build()
     }
 
-    // Longer timeouts for the DASH proxy so large segments do not stall.
-    private val proxyClient: OkHttpClient by lazy {
-        client.newBuilder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(2, TimeUnit.MINUTES)
-            .writeTimeout(2, TimeUnit.MINUTES)
-            .build()
-    }
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -169,24 +162,23 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val videos = mutableListOf<Video>()
         val seenUrls = mutableSetOf<String>()
 
-        // DASH manifest: proxy it through a local HTTP server so Aniyomi/MPV
-        // sees a .mpd URL and the proxy can add the Anubis cookie to every
-        // segment request. Keep this lightweight: do not download the manifest
-        // here, the proxy will fetch it when MPV asks for it.
+        // DASH manifest: parse it directly and expose each video Representation
+        // as a Video with its matching audio track(s). Other Yuzono extensions
+        // (e.g. VVVVID, AllAnime) do exactly this instead of proxying the MPD.
         val dashSrc = doc.selectFirst("video#player source[type*=dash]")?.attr("src")
         Log.d(TAG, "dashSrc=$dashSrc check=$check")
         if (!dashSrc.isNullOrBlank()) {
-            val absoluteDash = if (dashSrc.startsWith("http")) dashSrc else "$host$dashSrc"
+            val dashUrl = buildDashManifestUrl(dashSrc, host)
             try {
-                dashProxy?.stop()
-                dashProxy = DashProxyServer(proxyClient)
-                val proxyUrl = dashProxy!!.serveManifest(absoluteDash)
-                dashProxyVideoId = videoId
-                Log.d(TAG, "Adding DASH proxy: $proxyUrl")
-                videos += Video(proxyUrl, "DASH", proxyUrl, headers)
-                seenUrls += proxyUrl
+                val dashVideos = parseDashManifest(dashUrl)
+                dashVideos.forEach { video ->
+                    if (seenUrls.add(video.videoUrl)) {
+                        Log.d(TAG, "Adding DASH source: ${video.quality}")
+                        videos += video
+                    }
+                }
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to start DASH proxy", e)
+                Log.e(TAG, "Failed to parse DASH manifest", e)
             }
         }
 
@@ -217,6 +209,119 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return videos
     }
 
+    private fun buildDashManifestUrl(src: String, host: String): String {
+        val absolute = if (src.startsWith("http")) src else "$host$src"
+        // Invidious serves proxied URLs with local=true. Use local=false so the
+        // manifest exposes the direct googlevideo URLs, which is what extensions
+        // such as MyAnime's YouTubeExtractor do for Aniyomi/ExoPlayer.
+        return absolute.replace(Regex("""[?&]local=(true|false)"""), "")
+            .let { if (it.contains("?")) "$it&local=false" else "$it?local=false" }
+    }
+
+    private fun parseDashManifest(manifestUrl: String): List<Video> {
+        val request = Request.Builder()
+            .url(manifestUrl)
+            .headers(watchHeaders)
+            .header("Accept", "application/dash+xml")
+            .build()
+        val manifest = client.newCall(request).execute().use { it.body.string() }
+
+        val audioUrls = mutableListOf<String>()
+        val videoReps = mutableListOf<DashRep>()
+
+        ADAPTATION_SET_REGEX.findAll(manifest).forEach { asMatch ->
+            val asAttrs = parseAttributes(asMatch.groupValues[1])
+            val contentType = asAttrs["contentType"]?.lowercase()
+                ?: asAttrs["mimeType"]?.lowercase()
+                ?: ""
+            val asBlock = asMatch.groupValues[2]
+
+            // Skip streams without index/init ranges (OTF) since ExoPlayer can't
+            // play them as separate DASH representations.
+            if (!asBlock.contains("<SegmentBase", ignoreCase = true)) return@forEach
+
+            val asBaseUrl = BASE_URL_REGEX.find(asBlock)?.groupValues?.get(1)
+                ?.replace("&amp;", "&")
+                ?.let { resolveManifestUrl(it, manifestUrl) }
+
+            REPRESENTATION_REGEX.findAll(asBlock).forEach { repMatch ->
+                val repAttrs = parseAttributes(repMatch.groupValues[1])
+                val repBlock = repMatch.groupValues[2]
+
+                if (!repBlock.contains("<SegmentBase", ignoreCase = true)) return@forEach
+
+                val baseUrl = BASE_URL_REGEX.find(repBlock)?.groupValues?.get(1)
+                    ?.replace("&amp;", "&")
+                    ?.let { resolveManifestUrl(it, manifestUrl) }
+                    ?: asBaseUrl
+                    ?: return@forEach
+
+                when {
+                    contentType.contains("audio") -> audioUrls += baseUrl
+                    contentType.contains("video") -> {
+                        videoReps += DashRep(
+                            url = baseUrl,
+                            height = repAttrs["height"]?.toIntOrNull() ?: 0,
+                            width = repAttrs["width"]?.toIntOrNull() ?: 0,
+                            codecs = repAttrs["codecs"] ?: "",
+                            bandwidth = repAttrs["bandwidth"]?.toLongOrNull() ?: 0,
+                        )
+                    }
+                }
+            }
+        }
+
+        if (videoReps.isEmpty()) return emptyList()
+
+        val audioTracks = audioUrls.map { Track(it, "Audio") }
+
+        // Prefer H.264, then highest resolution up to 1080p.
+        val h264 = videoReps.filter { it.codecs.startsWith("avc1") }
+        val candidates = if (h264.isNotEmpty()) h264 else videoReps
+        val capped = candidates.filter { it.height <= 1080 }
+        val ordered = (if (capped.isNotEmpty()) capped else candidates)
+            .sortedByDescending { it.height }
+
+        return ordered.map { rep ->
+            val label = "DASH ${rep.height}p"
+            // Do not attach the source headers (Referer/Origin from Invidious) to
+            // the DASH streams; other extensions pass the direct URLs without
+            // extra headers and let ExoPlayer handle googlevideo requests.
+            Video(rep.url, label, rep.url, audioTracks = audioTracks)
+        }
+    }
+
+    private data class DashRep(
+        val url: String,
+        val height: Int,
+        val width: Int,
+        val codecs: String,
+        val bandwidth: Long,
+    )
+
+    private fun resolveManifestUrl(raw: String, manifestUrl: String): String {
+        return when {
+            raw.startsWith("http://") || raw.startsWith("https://") -> raw
+            raw.startsWith("/") -> {
+                val url = manifestUrl.toHttpUrl()
+                "${url.scheme}://${url.host}$raw"
+            }
+            else -> {
+                val base = manifestUrl.substringBeforeLast("/")
+                "$base/$raw"
+            }
+        }
+    }
+
+    private fun parseAttributes(tag: String): Map<String, String> {
+        val map = mutableMapOf<String, String>()
+        val regex = Regex("""(\\w+)=\"([^\"]*)\"""")
+        regex.findAll(tag).forEach { match ->
+            map[match.groupValues[1]] = match.groupValues[2]
+        }
+        return map
+    }
+
     private fun probeItag(host: String, videoId: String, check: String, itag: String): String? {
         val url = "$host/latest_version?id=$videoId&itag=$itag&check=$check"
         return try {
@@ -243,7 +348,14 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     override fun List<Video>.sort(): List<Video> {
         val pref = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)
             ?: PREF_QUALITY_DEFAULT
-        return sortedByDescending { it.quality.contains(pref, ignoreCase = true) }
+        return sortedWith(
+            compareByDescending<Video> { it.quality.contains(pref, ignoreCase = true) }
+                .thenByDescending { extractHeight(it.quality) },
+        )
+    }
+
+    private fun extractHeight(quality: String): Int {
+        return Regex("""(\d+)p""").find(quality)?.groupValues?.get(1)?.toIntOrNull() ?: 0
     }
 
     // ============================== Preferences ==============================
@@ -338,8 +450,15 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
         private val CHECK_REGEX = Regex("""check=([A-Za-z0-9_-]+)""")
 
-        private var dashProxy: DashProxyServer? = null
-        private var dashProxyVideoId: String? = null
+        private val ADAPTATION_SET_REGEX = Regex(
+            """<AdaptationSet([^>]*)>(.*?)</AdaptationSet>""",
+            RegexOption.DOT_MATCHES_ALL,
+        )
+        private val REPRESENTATION_REGEX = Regex(
+            """<Representation([^>]*)>(.*?)</Representation>""",
+            RegexOption.DOT_MATCHES_ALL,
+        )
+        private val BASE_URL_REGEX = Regex("""<BaseURL>([^<]+)</BaseURL>""")
 
         private const val FIELDS = "fields=videoId,title,author,lengthSeconds,viewCount,publishedText"
         private const val DETAIL_FIELDS =
@@ -350,8 +469,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 }
 
 /**
- * In-memory cookie jar so the Anubis auth cookie is shared between the
- * extension's requests and the local DASH proxy's segment requests.
+ * In-memory cookie jar so the Anubis auth cookie is reused across the
+ * extension's requests to the Invidious instance.
  */
 private class MemoryCookieJar : CookieJar {
     private val store = mutableMapOf<String, MutableList<Cookie>>()

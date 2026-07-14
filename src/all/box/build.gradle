@@ -1,11 +1,10 @@
 ext {
     extName = 'box'
     extClass = '.Box'
-    extVersionCode = 34
+    extVersionCode = 35
 }
 
 apply plugin: "kei.plugins.extension.legacy"
 
 dependencies {
-    implementation("org.nanohttpd:nanohttpd:2.3.1")
 }
