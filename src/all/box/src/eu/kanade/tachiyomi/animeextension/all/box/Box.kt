@@ -32,6 +32,7 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 
 class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
@@ -48,6 +49,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         network.cloudflareClient.newBuilder()
             .cookieJar(MemoryCookieJar())
             .addInterceptor(AnubisInterceptor())
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
             .build()
     }
 
@@ -73,6 +76,11 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             .add("Sec-Fetch-Dest", "document")
             .add("Sec-Fetch-Mode", "navigate")
             .add("Sec-Fetch-Site", "same-origin")
+            .build()
+
+    private val hlsHeaders: Headers
+        get() = headersBuilder()
+            .set("Accept", "application/vnd.apple.mpegurl,*/*")
             .build()
 
     // ============================== Popular ===============================
@@ -210,22 +218,61 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         if (check.isNotBlank()) {
             val hlsUrl = "$host/api/manifest/hls_playlist/id/$videoId?local=true&check=$check"
             try {
-                val playlistUtils = PlaylistUtils(client, watchHeaders)
-                val hlsVideos = playlistUtils.extractFromHls(
-                    hlsUrl,
-                    masterHeaders = watchHeaders,
-                    videoHeaders = watchHeaders,
-                    videoNameGen = { quality -> "HLS $quality" },
+                // Probe the master playlist manually so we can surface its content
+                // as debug entries when ExoPlayer reports "unrecognized file format".
+                val playlistResponse = client.newCall(GET(hlsUrl, hlsHeaders))
+                    .execute()
+                val playlistBody = playlistResponse.use { it.body?.string() } ?: ""
+                val playlistStatus = playlistResponse.code
+                val playlistStart = playlistBody.take(200).replace("\n", " ")
+                videos += Video(
+                    "",
+                    "HLS DEBUG: status=$playlistStatus len=${playlistBody.length} start=$playlistStart",
+                    "",
+                    headers,
                 )
-                hlsVideos.forEach { video ->
-                    val videoUrl = video.videoUrl ?: return@forEach
-                    if (seenUrls.add(videoUrl)) {
-                        Log.d(TAG, "Adding HLS source: ${video.quality}")
-                        videos += video
+
+                val isValidHls = playlistBody.trimStart().startsWith("#EXTM3U", ignoreCase = true)
+                if (isValidHls) {
+                    if ("#EXT-X-STREAM-INF" !in playlistBody) {
+                        // Single-variant media playlist: pass it directly to ExoPlayer.
+                        if (seenUrls.add(hlsUrl)) {
+                            videos += Video(hlsUrl, "HLS master", hlsUrl, headers = hlsHeaders)
+                        }
+                    } else {
+                        val playlistUtils = PlaylistUtils(client, hlsHeaders)
+                        val hlsVideos = playlistUtils.extractFromHls(
+                            hlsUrl,
+                            masterHeaders = hlsHeaders,
+                            videoHeaders = hlsHeaders,
+                            videoNameGen = { quality -> "HLS $quality" },
+                        )
+                        if (hlsVideos.isEmpty()) {
+                            videos += Video("", "HLS DEBUG: extractFromHls returned empty", "", headers)
+                            // Fallback to the master playlist itself.
+                            if (seenUrls.add(hlsUrl)) {
+                                videos += Video(hlsUrl, "HLS master", hlsUrl, headers = hlsHeaders)
+                            }
+                        }
+                        hlsVideos.forEach { video ->
+                            val videoUrl = video.videoUrl ?: return@forEach
+                            if (seenUrls.add(videoUrl)) {
+                                Log.d(TAG, "Adding HLS source: ${video.quality}")
+                                videos += video
+                            }
+                        }
                     }
+                } else {
+                    videos += Video(
+                        "",
+                        "HLS DEBUG: not a valid playlist (first 200 chars above)",
+                        "",
+                        headers,
+                    )
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to parse HLS playlist", e)
+                videos += Video("", "HLS DEBUG: ${e.javaClass.simpleName}: ${e.message}", "", headers)
             }
         }
 
