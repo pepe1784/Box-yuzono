@@ -218,20 +218,14 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                 val start = body.take(120).replace("\n", " ")
                 videos += Video("", "DASH DEBUG: $labelPrefix status=$status len=${body.length} start=$start", "", headers)
                 if (status == 200 && body.contains("<MPD", ignoreCase = true)) {
-                    val parsed = parseDashManifestBody(body, url)
-                    if (parsed.isNotEmpty()) {
-                        parsed.forEach { video ->
-                            val videoUrl = video.videoUrl ?: return@forEach
-                            if (seenUrls.add(videoUrl)) {
-                                Log.d(TAG, "Adding DASH source: ${video.quality}")
-                                videos += video
-                            }
-                        }
-                        true
-                    } else {
-                        videos += Video("", "DASH DEBUG: $labelPrefix parsed 0 videos", "", headers)
-                        false
+                    val firstBaseUrl = extractFirstDashBaseUrl(body, url)
+                    videos += Video("", "DASH DEBUG: $labelPrefix firstBaseUrl=$firstBaseUrl", "", headers)
+                    if (seenUrls.add(url)) {
+                        val label = if (labelPrefix == "remote") "DASH" else "DASH ($labelPrefix)"
+                        videos += Video(url, label, url, headers = dashHeaders(videoId))
+                        Log.d(TAG, "Adding DASH source: $label")
                     }
+                    true
                 } else {
                     false
                 }
@@ -243,9 +237,11 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         }
 
         if (dashUrlLocal.isNotBlank() || dashUrlRemote.isNotBlank()) {
-            val ok = addDashVideosFrom(dashUrlLocal, "local")
-            if (!ok && dashUrlRemote.isNotBlank()) {
-                addDashVideosFrom(dashUrlRemote, "remote")
+            // Prefer the remote (googlevideo) manifest so ExoPlayer talks directly to
+            // YouTube for segments and does not need the Anubis cookie.
+            val ok = addDashVideosFrom(dashUrlRemote, "remote")
+            if (!ok && dashUrlLocal.isNotBlank()) {
+                addDashVideosFrom(dashUrlLocal, "local")
             }
         } else {
             videos += Video("", "DASH DEBUG: empty dashUrl", "", headers)
@@ -345,85 +341,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return if (src.startsWith("http")) src else "$host$src"
     }
 
-    private fun parseDashManifestBody(manifest: String, manifestUrl: String): List<Video> {
-        Log.d(TAG, "parseDashManifestBody: len=${manifest.length}")
-
-        val audioUrls = mutableListOf<String>()
-        val videoReps = mutableListOf<DashRep>()
-
-        ADAPTATION_SET_REGEX.findAll(manifest).forEach { asMatch ->
-            val asAttrs = parseAttributes(asMatch.groupValues[1])
-            val contentType = asAttrs["contentType"]?.lowercase()
-                ?: asAttrs["mimeType"]?.lowercase()
-                ?: ""
-            val asBlock = asMatch.groupValues[2]
-
-            // Skip streams without index/init ranges (OTF) since ExoPlayer can't
-            // play them as separate DASH representations.
-            if (!asBlock.contains("<SegmentBase", ignoreCase = true)) return@forEach
-
-            val asBaseUrl = BASE_URL_REGEX.find(asBlock)?.groupValues?.get(1)
-                ?.replace("&amp;", "&")
-                ?.let { resolveManifestUrl(it, manifestUrl) }
-
-            REPRESENTATION_REGEX.findAll(asBlock).forEach { repMatch ->
-                val repAttrs = parseAttributes(repMatch.groupValues[1])
-                val repBlock = repMatch.groupValues[2]
-
-                if (!repBlock.contains("<SegmentBase", ignoreCase = true)) return@forEach
-
-                val baseUrl = BASE_URL_REGEX.find(repBlock)?.groupValues?.get(1)
-                    ?.replace("&amp;", "&")
-                    ?.let { resolveManifestUrl(it, manifestUrl) }
-                    ?: asBaseUrl
-                    ?: return@forEach
-
-                val resolvedUrl = resolveVideoUrl(baseUrl)
-
-                when {
-                    contentType.contains("audio") -> audioUrls += resolvedUrl
-                    contentType.contains("video") -> {
-                        videoReps += DashRep(
-                            url = resolvedUrl,
-                            height = repAttrs["height"]?.toIntOrNull() ?: 0,
-                            width = repAttrs["width"]?.toIntOrNull() ?: 0,
-                            codecs = repAttrs["codecs"] ?: "",
-                            bandwidth = repAttrs["bandwidth"]?.toLongOrNull() ?: 0,
-                        )
-                    }
-                }
-            }
-        }
-
-        Log.d(TAG, "DASH reps: audio=${audioUrls.size}, video=${videoReps.size}")
-        if (videoReps.isEmpty()) return emptyList()
-
-        val audioTracks = audioUrls.map { Track(it, "Audio") }
-
-        // Prefer H.264, then highest resolution up to 1080p.
-        val h264 = videoReps.filter { it.codecs.startsWith("avc1") }
-        val candidates = if (h264.isNotEmpty()) h264 else videoReps
-        val capped = candidates.filter { it.height <= 1080 }
-        val ordered = (if (capped.isNotEmpty()) capped else candidates)
-            .sortedByDescending { it.height }
-
-        return ordered.map { rep ->
-            val label = "DASH ${rep.height}p"
-            // Do not attach the source headers (Referer/Origin from Invidious) to
-            // the DASH streams; other extensions pass the direct URLs without
-            // extra headers and let ExoPlayer handle googlevideo requests.
-            Video(rep.url, label, rep.url, audioTracks = audioTracks)
-        }
-    }
-
-    private data class DashRep(
-        val url: String,
-        val height: Int,
-        val width: Int,
-        val codecs: String,
-        val bandwidth: Long,
-    )
-
     private fun resolveManifestUrl(raw: String, manifestUrl: String): String {
         return when {
             raw.startsWith("http://") || raw.startsWith("https://") -> raw
@@ -436,6 +353,22 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                 "$base/$raw"
             }
         }
+    }
+
+    private fun extractFirstDashBaseUrl(manifest: String, manifestUrl: String): String {
+        ADAPTATION_SET_REGEX.findAll(manifest).forEach { asMatch ->
+            val asAttrs = parseAttributes(asMatch.groupValues[1])
+            val contentType = asAttrs["contentType"]?.lowercase()
+                ?: asAttrs["mimeType"]?.lowercase()
+                ?: ""
+            if (!contentType.contains("video")) return@forEach
+            val baseUrl = BASE_URL_REGEX.find(asMatch.groupValues[2])?.groupValues?.get(1)
+                ?.replace("&amp;", "&")
+                ?.let { resolveManifestUrl(it, manifestUrl) }
+                ?: return@forEach
+            return baseUrl.take(150)
+        }
+        return ""
     }
 
     private fun parseAttributes(tag: String): Map<String, String> {
