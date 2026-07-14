@@ -64,7 +64,15 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     private val watchHeaders: Headers
         get() = headersBuilder()
-            .set("Accept", "text/html")
+            .set(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            )
+            .add("Accept-Language", "en-US,en;q=0.5")
+            .add("Upgrade-Insecure-Requests", "1")
+            .add("Sec-Fetch-Dest", "document")
+            .add("Sec-Fetch-Mode", "navigate")
+            .add("Sec-Fetch-Site", "same-origin")
             .build()
 
     // ============================== Popular ===============================
