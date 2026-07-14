@@ -158,7 +158,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val doc = response.asJsoup()
         val host = response.host
         val videoId = extractVideoId(response.request.url.toString()) ?: return emptyList()
-        val check = extractCheck(doc)
+        val check = extractCheck(doc) ?: ""
         val videos = mutableListOf<Video>()
         val seenUrls = mutableSetOf<String>()
 
@@ -197,7 +197,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
         // Only probe itags as a fallback when the page exposes no progressive
         // sources. This avoids blocking the quality list with multiple requests.
-        if (videos.none { it.quality != "DASH" } && !check.isNullOrBlank()) {
+        if (videos.none { it.quality != "DASH" } && check.isNotBlank()) {
             ITAG_LABELS.forEach { (itag, label) ->
                 val url = probeItag(host, videoId, check, itag) ?: return@forEach
                 if (!seenUrls.add(url)) return@forEach
@@ -224,7 +224,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             .headers(watchHeaders)
             .header("Accept", "application/dash+xml")
             .build()
-        val manifest = client.newCall(request).execute().use { it.body.string() }
+        val manifest = client.newCall(request).execute().use { it.body?.string() ?: "" }
 
         val audioUrls = mutableListOf<String>()
         val videoReps = mutableListOf<DashRep>()
