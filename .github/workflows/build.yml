@@ -49,6 +49,10 @@ jobs:
         run: ./gradlew spotlessApply
         working-directory: source
 
+      - name: Debug Box.kt after spotless
+        run: |
+          cat -n source/src/all/box/src/eu/kanade/tachiyomi/animeextension/all/box/Box.kt | sed -n '160,200p'
+
       - name: Build box extension
         run: ./gradlew :src:all:box:assembleRelease --stacktrace
         working-directory: source
