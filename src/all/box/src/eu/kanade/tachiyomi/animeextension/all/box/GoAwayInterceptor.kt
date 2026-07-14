@@ -25,7 +25,7 @@ class GoAwayInterceptor : Interceptor {
         }
 
         val response = chain.proceed(request)
-        val challenge = response.extractChallenge(request) ?: return response
+        val challenge = response.extractChallenge(request, chain) ?: return response
 
         response.close()
 
@@ -85,7 +85,7 @@ class GoAwayInterceptor : Interceptor {
         return chain.proceed(request)
     }
 
-    private fun Response.extractChallenge(request: Request): GoAwayChallenge? {
+    private fun Response.extractChallenge(request: Request, chain: Interceptor.Chain): GoAwayChallenge? {
         if (code != 418 && code != 403) return null
         val contentType = header("Content-Type") ?: return null
         if (!contentType.contains("text/html", ignoreCase = true)) return null
@@ -95,10 +95,10 @@ class GoAwayInterceptor : Interceptor {
             ""
         }
         if (!body.contains(GO_AWAY_MARKER)) return null
-        return parseChallenge(body, request)
+        return parseChallenge(body, request, chain)
     }
 
-    private fun parseChallenge(html: String, request: Request): GoAwayChallenge {
+    private fun parseChallenge(html: String, request: Request, chain: Interceptor.Chain): GoAwayChallenge {
         val scriptSrc = SCRIPT_SRC_REGEX.find(html)?.groupValues?.getOrNull(1)
             ?: throw Exception("GoAway: could not find challenge script src")
 
@@ -116,7 +116,7 @@ class GoAwayInterceptor : Interceptor {
             .header(PASS_HEADER, "1")
             .build()
 
-        val scriptBody = chainUnsafe(scriptRequest).use {
+        val scriptBody = chainUnsafe(chain, scriptRequest).use {
             if (!it.isSuccessful) {
                 throw Exception("GoAway: challenge script returned ${it.code}")
             }
@@ -131,9 +131,9 @@ class GoAwayInterceptor : Interceptor {
         return GoAwayChallenge(id = id, path = path)
     }
 
-    private fun Interceptor.Chain.chainUnsafe(request: Request): Response {
+    private fun chainUnsafe(chain: Interceptor.Chain, request: Request): Response {
         // Use the same connection chain but without re-running this interceptor.
-        return proceed(request)
+        return chain.proceed(request)
     }
 
     private data class GoAwayChallenge(
