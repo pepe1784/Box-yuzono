@@ -68,7 +68,8 @@ class DashProxyServer(
             ?: return badRequest("Missing url")
         val manifest = fetchManifest(url)
         val filtered = filterManifest(manifest)
-        val rewritten = rewriteManifest(filtered)
+        val segmented = enhanceManifestWithSegmentList(filtered)
+        val rewritten = rewriteManifest(segmented)
         // Some players handle on-demand manifests better than the main profile.
         val finalManifest = rewritten.replace(
             "urn:mpeg:dash:profile:isoff-main:2011",
@@ -289,6 +290,148 @@ class DashProxyServer(
     }
 
     /**
+     * Replace single-segment SegmentBase with an explicit SegmentList.
+     *
+     * MPV/ffmpeg in Aniyomi often fails to seek in on-demand DASH manifests
+     * that only expose a SegmentBase/indexRange. By parsing the sidx box and
+     * emitting SegmentURL entries with explicit byte ranges, the player can
+     * request individual fragments instead of trying to download the whole
+     * file or seeking without index information.
+     */
+    private fun enhanceManifestWithSegmentList(manifest: String): String {
+        var result = manifest
+        REPRESENTATION_REGEX.findAll(manifest).forEach { repMatch ->
+            val repBlock = repMatch.groupValues[0]
+            val baseMatch = BASE_URL_REGEX.find(repBlock) ?: return@forEach
+            val segmentBaseMatch = SEGMENT_BASE_REGEX.find(repBlock) ?: return@forEach
+
+            val rawBase = baseMatch.groupValues[1].replace("&amp;", "&")
+            val absoluteBase = resolveAbsoluteBaseUrl(rawBase)
+            val indexRange = segmentBaseMatch.groupValues[1]
+            val initRange = segmentBaseMatch.groupValues[2]
+
+            val segmentListXml = buildSegmentList(absoluteBase, initRange, indexRange)
+            if (segmentListXml.isBlank()) return@forEach
+
+            val newRepBlock = repBlock.replace(segmentBaseMatch.value, segmentListXml)
+            result = result.replace(repBlock, newRepBlock)
+        }
+        return result
+    }
+
+    private fun resolveAbsoluteBaseUrl(raw: String): String {
+        return when {
+            raw.startsWith("http://") || raw.startsWith("https://") -> raw
+            raw.startsWith("/") -> "$manifestHost$raw"
+            else -> "${manifestUrl.substringBeforeLast("/")}/$raw"
+        }
+    }
+
+    private fun buildSegmentList(
+        baseUrl: String,
+        initRange: String,
+        indexRange: String,
+    ): String {
+        val idxStart = indexRange.substringBefore("-").toLongOrNull() ?: return ""
+        val idxEnd = indexRange.substringAfter("-").toLongOrNull() ?: return ""
+
+        return try {
+            val request = Request.Builder()
+                .url(baseUrl)
+                .header("User-Agent", USER_AGENT)
+                .header("Range", "bytes=$idxStart-$idxEnd")
+                .build()
+            val sidx = client.newCall(request).execute().use { response ->
+                parseSidx(response.body?.bytes() ?: return "")
+            } ?: return ""
+
+            val absoluteDataStart = idxStart + sidx.sidxStart + sidx.sidxSize + sidx.firstOffset
+            val sb = StringBuilder()
+            sb.append("<SegmentList timescale=\"${sidx.timescale}\">")
+            sb.append("<Initialization range=\"$initRange\"/>")
+            sb.append("<SegmentTimeline>")
+            sidx.references.forEach { (_, _, duration) ->
+                sb.append("<S d=\"$duration\"/>")
+            }
+            sb.append("</SegmentTimeline>")
+
+            var segStart = absoluteDataStart
+            sidx.references.forEach { (_, refSize, _) ->
+                val segEnd = segStart + refSize - 1
+                sb.append("<SegmentURL mediaRange=\"$segStart-$segEnd\"/>")
+                segStart += refSize
+            }
+            sb.append("</SegmentList>")
+            sb.toString()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to build SegmentList for $baseUrl", e)
+            ""
+        }
+    }
+
+    private fun parseSidx(bytes: ByteArray): SegmentIndex? {
+        var pos = 0
+        while (pos < bytes.size - 8) {
+            val size = bytes.readInt(pos)
+            if (size <= 0) break
+            val type = bytes.copyOfRange(pos + 4, pos + 8).toString(Charsets.US_ASCII)
+            if (type == "sidx") {
+                val version = bytes[pos + 8].toInt()
+                val timescale = bytes.readInt(pos + 12).toLong()
+                val earliestPresentationTime: Long
+                val firstOffset: Long
+                val refCountPos: Int
+                if (version == 0) {
+                    earliestPresentationTime = bytes.readInt(pos + 20).toLong()
+                    firstOffset = bytes.readInt(pos + 24).toLong()
+                    refCountPos = pos + 30
+                } else {
+                    earliestPresentationTime = bytes.readLong(pos + 20)
+                    firstOffset = bytes.readLong(pos + 28)
+                    refCountPos = pos + 38
+                }
+                val refCount = bytes.readShort(refCountPos)
+                val refs = mutableListOf<Triple<Int, Long, Long>>()
+                var refPos = refCountPos + 2
+                repeat(refCount) {
+                    val value = bytes.readInt(refPos).toLong()
+                    val refType = ((value shr 31) and 1).toInt()
+                    val refSize = value and 0x7FFFFFFF
+                    val duration = bytes.readInt(refPos + 4).toLong()
+                    refs.add(Triple(refType, refSize, duration))
+                    refPos += 12
+                }
+                return SegmentIndex(
+                    version = version,
+                    timescale = timescale,
+                    earliestPresentationTime = earliestPresentationTime,
+                    firstOffset = firstOffset,
+                    references = refs,
+                    sidxStart = pos.toLong(),
+                    sidxSize = size.toLong(),
+                )
+            }
+            pos += size
+        }
+        return null
+    }
+
+    private fun ByteArray.readInt(pos: Int): Int {
+        return (this[pos].toInt() and 0xFF shl 24) or
+            (this[pos + 1].toInt() and 0xFF shl 16) or
+            (this[pos + 2].toInt() and 0xFF shl 8) or
+            (this[pos + 3].toInt() and 0xFF)
+    }
+
+    private fun ByteArray.readLong(pos: Int): Long {
+        return (readInt(pos).toLong() shl 32) or (readInt(pos + 4).toLong() and 0xFFFFFFFFL)
+    }
+
+    private fun ByteArray.readShort(pos: Int): Int {
+        return ((this[pos].toInt() and 0xFF) shl 8) or (this[pos + 1].toInt() and 0xFF)
+    }
+
+    /**
      * Keep only the best video Representation up to 1080p, preferring H.264
      * (avc1) because it has the widest decoder support in Aniyomi/MPV.
      * VP9 (vp9) is used as fallback, then AV1. Audio AdaptationSets are kept
@@ -398,6 +541,16 @@ class DashProxyServer(
         )
     }
 
+    private data class SegmentIndex(
+        val version: Int,
+        val timescale: Long,
+        val earliestPresentationTime: Long,
+        val firstOffset: Long,
+        val references: List<Triple<Int, Long, Long>>,
+        val sidxStart: Long,
+        val sidxSize: Long,
+    )
+
     companion object {
         private const val TAG = "DashProxyServer"
         private const val SOCKET_TIMEOUT = 120_000
@@ -405,6 +558,10 @@ class DashProxyServer(
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private val BASE_URL_REGEX = Regex("""<BaseURL>([^<]+)</BaseURL>""")
+        private val SEGMENT_BASE_REGEX = Regex(
+            """<SegmentBase[^>]*indexRange=\"([^\"]+)\"[^>]*>\s*<Initialization range=\"([^\"]+)\"/>\s*</SegmentBase>""",
+            RegexOption.DOT_MATCHES_ALL,
+        )
         private val ADAPTATION_SET_REGEX = Regex(
             """<AdaptationSet([^>]*)>(.*?)</AdaptationSet>""",
             RegexOption.DOT_MATCHES_ALL,
