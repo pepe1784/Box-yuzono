@@ -185,15 +185,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val videos = mutableListOf<Video>()
         val seenUrls = mutableSetOf<String>()
 
-        // Debug: show every <source> element from the player page.
-        doc.select("video#player source").forEachIndexed { index, source ->
-            val type = source.attr("type")
-            val label = source.attr("label")
-            val src = source.attr("src").take(120)
-            videos += Video("", "SRC DEBUG $index: type=$type label=$label src=$src", "", headers)
-        }
-        videos += Video("", "CHECK DEBUG: check=${check.take(20)}...", "", headers)
-
         // DASH manifest: parse it directly and expose each video Representation
         // as a Video with its matching audio track(s). Other Yuzono extensions
         // (e.g. VVVVID, AllAnime) do exactly this instead of proxying the MPD.
@@ -215,10 +206,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             return try {
                 val resp = client.newCall(GET(url, dashHeaders(videoId))).execute()
                 val body = resp.use { it.body?.string() } ?: ""
-                val status = resp.code
-                val start = body.take(120).replace("\n", " ")
-                videos += Video("", "DASH DEBUG: $labelPrefix status=$status len=${body.length} start=$start", "", headers)
-                if (status == 200 && body.contains("<MPD", ignoreCase = true)) {
+                if (resp.code == 200 && body.contains("<MPD", ignoreCase = true)) {
                     val parsed = parseDashManifestBody(body, url)
                     if (parsed.isNotEmpty()) {
                         parsed.forEach { video ->
@@ -230,7 +218,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                         }
                         true
                     } else {
-                        videos += Video("", "DASH DEBUG: $labelPrefix parsed 0 videos", "", headers)
                         false
                     }
                 } else {
@@ -238,7 +225,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to fetch DASH manifest $labelPrefix", e)
-                videos += Video("", "DASH DEBUG: $labelPrefix ${e.javaClass.simpleName}: ${e.message}", "", headers)
                 false
             }
         }
@@ -264,14 +250,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                     val playlistResponse = client.newCall(GET(url, hlsHeaders(videoId)))
                         .execute()
                     val playlistBody = playlistResponse.use { it.body?.string() } ?: ""
-                    val playlistStatus = playlistResponse.code
-                    val playlistStart = playlistBody.take(120).replace("\n", " ")
-                    videos += Video(
-                        "",
-                        "HLS DEBUG: $labelPrefix status=$playlistStatus len=${playlistBody.length} start=$playlistStart",
-                        "",
-                        headers,
-                    )
 
                     val isValidHls = playlistBody.trimStart().startsWith("#EXTM3U", ignoreCase = true)
                     if (!isValidHls) return false
