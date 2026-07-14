@@ -238,19 +238,29 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val manifest = client.newCall(request).execute().use { it.body?.string() ?: "" }
         Log.d(TAG, "Manifest length: ${manifest.length}")
 
+        val debugInfo = mutableListOf<String>()
+        debugInfo += "len=${manifest.length}"
+        debugInfo += "start=${manifest.take(200).replace("\n", " ")}"
+
         val audioUrls = mutableListOf<String>()
         val videoReps = mutableListOf<DashRep>()
 
-        ADAPTATION_SET_REGEX.findAll(manifest).forEach { asMatch ->
+        val adaptationSets = ADAPTATION_SET_REGEX.findAll(manifest).toList()
+        debugInfo += "adaptationSets=${adaptationSets.size}"
+
+        adaptationSets.forEach { asMatch ->
             val asAttrs = parseAttributes(asMatch.groupValues[1])
             val contentType = asAttrs["contentType"]?.lowercase()
                 ?: asAttrs["mimeType"]?.lowercase()
                 ?: ""
             val asBlock = asMatch.groupValues[2]
+            val hasSegmentBase = asBlock.contains("<SegmentBase", ignoreCase = true)
+            val repCount = REPRESENTATION_REGEX.findAll(asBlock).count()
+            debugInfo += "AS type=$contentType segBase=$hasSegmentBase reps=$repCount"
 
             // Skip streams without index/init ranges (OTF) since ExoPlayer can't
             // play them as separate DASH representations.
-            if (!asBlock.contains("<SegmentBase", ignoreCase = true)) return@forEach
+            if (!hasSegmentBase) return@forEach
 
             val asBaseUrl = BASE_URL_REGEX.find(asBlock)?.groupValues?.get(1)
                 ?.replace("&amp;", "&")
@@ -286,7 +296,11 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         }
 
         Log.d(TAG, "DASH reps: audio=${audioUrls.size}, video=${videoReps.size}")
-        if (videoReps.isEmpty()) return emptyList()
+        if (videoReps.isEmpty()) {
+            return debugInfo.mapIndexed { index, info ->
+                Video("", "DASH DEBUG $index: $info", "", headers)
+            }
+        }
 
         val audioTracks = audioUrls.map { Track(it, "Audio") }
 
