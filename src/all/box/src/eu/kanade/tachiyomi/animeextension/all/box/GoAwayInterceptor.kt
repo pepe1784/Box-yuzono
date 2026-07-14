@@ -34,12 +34,23 @@ class GoAwayInterceptor : Interceptor {
             .url(challenge.makeChallengeUrl(request.url.scheme, request.url.host))
             .header("User-Agent", request.header("User-Agent") ?: USER_AGENT)
             .header("Accept", "application/json")
+            .header("Referer", request.url.toString())
             .header(PASS_HEADER, "1")
             .post(okhttp3.RequestBody.create(null, ByteArray(0)))
             .build()
 
-        val makeChallengeBody = chain.proceed(makeChallengeRequest).use { it.body?.string() ?: "" }
-        val powData = json.decodeFromString<GoAwayPowData>(makeChallengeBody)
+        val makeChallengeResponse = chain.proceed(makeChallengeRequest)
+        val makeChallengeBody = makeChallengeResponse.use {
+            if (!it.isSuccessful) {
+                throw Exception("GoAway make-challenge failed: ${it.code}")
+            }
+            it.body?.string() ?: throw Exception("GoAway make-challenge empty body")
+        }
+        val powData = try {
+            json.decodeFromString<GoAwayPowData>(makeChallengeBody)
+        } catch (e: Exception) {
+            throw Exception("GoAway make-challenge parse error: ${e.message} body=$makeChallengeBody")
+        }
 
         val start = System.currentTimeMillis()
         val token = solvePow(powData.challenge, powData.target)
@@ -59,11 +70,16 @@ class GoAwayInterceptor : Interceptor {
             .url(verifyUrl)
             .header("User-Agent", request.header("User-Agent") ?: USER_AGENT)
             .header("Accept", "text/html")
+            .header("Referer", request.url.toString())
             .header(PASS_HEADER, "1")
             .build()
 
-        // The verify response sets the auth cookie in OkHttp's cookie jar.
-        chain.proceed(verifyRequest).close()
+        val verifyResponse = chain.proceed(verifyRequest)
+        verifyResponse.use {
+            if (it.code !in 200..399) {
+                throw Exception("GoAway verify-challenge failed: ${it.code}")
+            }
+        }
 
         // Retry the original request. The cookie jar now has the go-away cookie.
         return chain.proceed(request)
@@ -73,42 +89,51 @@ class GoAwayInterceptor : Interceptor {
         if (code != 418 && code != 403) return null
         val contentType = header("Content-Type") ?: return null
         if (!contentType.contains("text/html", ignoreCase = true)) return null
-        val body = peekBody(CHALLENGE_PEEK_BYTES).string()
+        val body = try {
+            peekBody(CHALLENGE_PEEK_BYTES).string()
+        } catch (e: Exception) {
+            ""
+        }
         if (!body.contains(GO_AWAY_MARKER)) return null
         return parseChallenge(body, request)
     }
 
-    private fun parseChallenge(html: String, request: Request): GoAwayChallenge? {
-        return try {
-            val scriptSrc = SCRIPT_SRC_REGEX.find(html)?.groupValues?.getOrNull(1)
-                ?: return null
+    private fun parseChallenge(html: String, request: Request): GoAwayChallenge {
+        val scriptSrc = SCRIPT_SRC_REGEX.find(html)?.groupValues?.getOrNull(1)
+            ?: throw Exception("GoAway: could not find challenge script src")
 
-            val scriptUrl = when {
-                scriptSrc.startsWith("http://") || scriptSrc.startsWith("https://") -> scriptSrc
-                scriptSrc.startsWith("/") -> "${request.url.scheme}://${request.url.host}$scriptSrc"
-                else -> "${request.url.scheme}://${request.url.host}/$scriptSrc"
-            }
-
-            val scriptRequest = Request.Builder()
-                .url(scriptUrl)
-                .header("User-Agent", request.header("User-Agent") ?: USER_AGENT)
-                .header("Accept", "*/*")
-                .header(PASS_HEADER, "1")
-                .build()
-
-            val scriptBody = okhttp3.OkHttpClient().newCall(scriptRequest).execute().use {
-                it.body?.string() ?: ""
-            }
-
-            val id = GOAWAY_ID_REGEX.find(scriptBody)?.groupValues?.getOrNull(1)
-                ?: return null
-            val path = PATH_REGEX.find(scriptBody)?.groupValues?.getOrNull(1)
-                ?: return null
-
-            GoAwayChallenge(id = id, path = path)
-        } catch (_: Exception) {
-            null
+        val scriptUrl = when {
+            scriptSrc.startsWith("http://") || scriptSrc.startsWith("https://") -> scriptSrc
+            scriptSrc.startsWith("/") -> "${request.url.scheme}://${request.url.host}$scriptSrc"
+            else -> "${request.url.scheme}://${request.url.host}/$scriptSrc"
         }
+
+        val scriptRequest = Request.Builder()
+            .url(scriptUrl)
+            .header("User-Agent", request.header("User-Agent") ?: USER_AGENT)
+            .header("Accept", "*/*")
+            .header("Referer", request.url.toString())
+            .header(PASS_HEADER, "1")
+            .build()
+
+        val scriptBody = chainUnsafe(scriptRequest).use {
+            if (!it.isSuccessful) {
+                throw Exception("GoAway: challenge script returned ${it.code}")
+            }
+            it.body?.string() ?: throw Exception("GoAway: challenge script empty")
+        }
+
+        val id = GOAWAY_ID_REGEX.find(scriptBody)?.groupValues?.getOrNull(1)
+            ?: throw Exception("GoAway: __goaway_id not found in script")
+        val path = PATH_REGEX.find(scriptBody)?.groupValues?.getOrNull(1)
+            ?: throw Exception("GoAway: challenge Path not found in script")
+
+        return GoAwayChallenge(id = id, path = path)
+    }
+
+    private fun Interceptor.Chain.chainUnsafe(request: Request): Response {
+        // Use the same connection chain but without re-running this interceptor.
+        return proceed(request)
     }
 
     private data class GoAwayChallenge(
@@ -130,6 +155,9 @@ class GoAwayInterceptor : Interceptor {
     private fun solvePow(challengeHex: String, targetHex: String): String {
         val challenge = challengeHex.hexToBytes()
         val target = targetHex.hexToBytes()
+        if (challenge.isEmpty() || target.isEmpty()) {
+            throw Exception("GoAway: empty challenge or target")
+        }
         val md = MessageDigest.getInstance("SHA-256")
         val buf = ByteArray(challenge.size + 8)
         System.arraycopy(challenge, 0, buf, 0, challenge.size)
