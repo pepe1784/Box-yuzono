@@ -25,8 +25,11 @@ class GoAwayInterceptor : Interceptor {
         }
 
         val response = chain.proceed(request)
-        val challenge = response.extractChallenge(request, chain) ?: return response
+        if (response.code != 418 && response.code != 403) {
+            return response
+        }
 
+        val challenge = response.extractChallenge(request, chain)
         response.close()
 
         // Fetch challenge data (challenge hex + target hex).
@@ -85,16 +88,15 @@ class GoAwayInterceptor : Interceptor {
         return chain.proceed(request)
     }
 
-    private fun Response.extractChallenge(request: Request, chain: Interceptor.Chain): GoAwayChallenge? {
-        if (code != 418 && code != 403) return null
-        val contentType = header("Content-Type") ?: return null
-        if (!contentType.contains("text/html", ignoreCase = true)) return null
+    private fun Response.extractChallenge(request: Request, chain: Interceptor.Chain): GoAwayChallenge {
         val body = try {
             peekBody(CHALLENGE_PEEK_BYTES).string()
         } catch (e: Exception) {
-            ""
+            throw Exception("GoAway: cannot read challenge body: ${e.message}")
         }
-        if (!body.contains(GO_AWAY_MARKER)) return null
+        if (!body.contains(GO_AWAY_MARKER)) {
+            throw Exception("GoAway: marker not found in ${code} response (ct=${header("Content-Type")}, body=${body.take(200)})")
+        }
         return parseChallenge(body, request, chain)
     }
 
