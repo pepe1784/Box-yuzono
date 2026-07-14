@@ -165,9 +165,9 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         // DASH manifest: parse it directly and expose each video Representation
         // as a Video with its matching audio track(s). Other Yuzono extensions
         // (e.g. VVVVID, AllAnime) do exactly this instead of proxying the MPD.
-        val dashSrc = doc.selectFirst("video#player source[type*=dash]")?.attr("src")
+        val dashSrc = doc.selectFirst("video#player source[type*=dash]")?.attr("src") ?: ""
         Log.d(TAG, "dashSrc=$dashSrc check=$check")
-        if (!dashSrc.isNullOrBlank()) {
+        if (dashSrc.isNotBlank()) {
             val dashUrl = buildDashManifestUrl(dashSrc, host)
             try {
                 val dashVideos = parseDashManifest(dashUrl)
