@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.all.box
 
 import android.text.InputType
+import android.util.Base64
 import android.util.Log
 import aniyomi.lib.playlistutils.PlaylistUtils
 import androidx.preference.PreferenceScreen
