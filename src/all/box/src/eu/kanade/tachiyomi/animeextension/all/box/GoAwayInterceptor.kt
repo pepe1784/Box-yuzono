@@ -24,6 +24,16 @@ class GoAwayInterceptor : Interceptor {
             return chain.proceed(request.newBuilder().removeHeader(PASS_HEADER).build())
         }
 
+        // Limit how many times we try to solve go-away for the same original call.
+        // This prevents infinite loops when the instance keeps re-challenging.
+        val retryCount = request.header(RETRY_HEADER)?.toIntOrNull() ?: 0
+        if (retryCount >= MAX_RETRIES) {
+            throw Exception(
+                "GoAway: la instancia sigue requiriendo challenge tras $MAX_RETRIES intentos. " +
+                    "Probablemente detecta la app como bot. Prueba con otra instancia.",
+            )
+        }
+
         val response = chain.proceed(request)
         if (response.code != 418 && response.code != 403) {
             return response
@@ -32,12 +42,14 @@ class GoAwayInterceptor : Interceptor {
         val challenge = response.extractChallenge(request, chain)
         response.close()
 
+        val userAgent = request.header("User-Agent") ?: USER_AGENT
+        val referer = request.url.toString()
+
         // Fetch challenge data (challenge hex + target hex).
         val makeChallengeRequest = Request.Builder()
             .url(challenge.makeChallengeUrl(request.url.scheme, request.url.host))
-            .header("User-Agent", request.header("User-Agent") ?: USER_AGENT)
+            .headers(realisticHeaders(userAgent, referer))
             .header("Accept", "application/json")
-            .header("Referer", request.url.toString())
             .header(PASS_HEADER, "1")
             .post(okhttp3.RequestBody.create(null, ByteArray(0)))
             .build()
@@ -59,6 +71,9 @@ class GoAwayInterceptor : Interceptor {
         val token = solvePow(powData.challenge, powData.target)
         val elapsed = System.currentTimeMillis() - start
 
+        // Small jitter so the solve-to-verify timing looks less robotic.
+        Thread.sleep((500L..1500L).random())
+
         val verifyUrl = request.url.newBuilder()
             .encodedPath(challenge.path + "/verify-challenge")
             .encodedQuery(null)
@@ -71,9 +86,8 @@ class GoAwayInterceptor : Interceptor {
 
         val verifyRequest = Request.Builder()
             .url(verifyUrl)
-            .header("User-Agent", request.header("User-Agent") ?: USER_AGENT)
-            .header("Accept", "text/html")
-            .header("Referer", request.url.toString())
+            .headers(realisticHeaders(userAgent, referer))
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             .header(PASS_HEADER, "1")
             .build()
 
@@ -84,8 +98,11 @@ class GoAwayInterceptor : Interceptor {
             }
         }
 
-        // Retry the original request. The cookie jar now has the go-away cookie.
-        return chain.proceed(request)
+        // Retry the original request with a retry counter.
+        val retryRequest = request.newBuilder()
+            .header(RETRY_HEADER, (retryCount + 1).toString())
+            .build()
+        return chain.proceed(retryRequest)
     }
 
     private fun Response.extractChallenge(request: Request, chain: Interceptor.Chain): GoAwayChallenge {
@@ -136,6 +153,20 @@ class GoAwayInterceptor : Interceptor {
     private fun chainUnsafe(chain: Interceptor.Chain, request: Request): Response {
         // Use the same connection chain but without re-running this interceptor.
         return chain.proceed(request)
+    }
+
+    private fun realisticHeaders(userAgent: String, referer: String): Headers {
+        return Headers.Builder()
+            .add("User-Agent", userAgent)
+            .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+            .add("Accept-Language", "en-US,en;q=0.5")
+            .add("Accept-Encoding", "gzip, deflate, br")
+            .add("Referer", referer)
+            .add("Upgrade-Insecure-Requests", "1")
+            .add("Sec-Fetch-Dest", "document")
+            .add("Sec-Fetch-Mode", "navigate")
+            .add("Sec-Fetch-Site", "same-origin")
+            .build()
     }
 
     private data class GoAwayChallenge(
@@ -214,6 +245,8 @@ class GoAwayInterceptor : Interceptor {
 
     companion object {
         private const val PASS_HEADER = "X-Box-GoAway-Pass"
+        private const val RETRY_HEADER = "X-Box-GoAway-Retry"
+        private const val MAX_RETRIES = 2
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private const val GO_AWAY_MARKER = "js-pow-sha256"
