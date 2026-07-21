@@ -6,6 +6,7 @@ import android.util.Log
 import aniyomi.lib.playlistutils.PlaylistUtils
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -23,6 +24,10 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.Headers
@@ -108,10 +113,19 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         val encoded = URLEncoder.encode(query.trim(), "UTF-8")
-        return GET(
-            "$baseUrl/api/v1/search?q=$encoded&type=video&page=$page&$FIELDS",
-            headers,
-        )
+        val urlBuilder = "$baseUrl/api/v1/search".toHttpUrl().newBuilder()
+            .addQueryParameter("q", encoded)
+            .addQueryParameter("page", page.toString())
+
+        val typeFilter = filters.find { it is TypeFilter } as? TypeFilter
+        val sortFilter = filters.find { it is SortFilter } as? SortFilter
+        val dateFilter = filters.find { it is DateFilter } as? DateFilter
+
+        urlBuilder.addQueryParameter("type", typeFilter?.toValue() ?: "video")
+        sortFilter?.toValue()?.let { urlBuilder.addQueryParameter("sort", it) }
+        dateFilter?.toValue()?.let { urlBuilder.addQueryParameter("date", it) }
+
+        return GET(urlBuilder.build().toString(), headers)
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage = parseSearchResults(response)
@@ -119,11 +133,46 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     // =========================== Anime Details ============================
 
     override fun animeDetailsRequest(anime: SAnime): Request {
+        val channelId = anime.url.extractChannelId()
+        if (channelId != null) {
+            return GET("$baseUrl/api/v1/channels/$channelId", headers)
+        }
         val id = extractVideoId(anime.url) ?: anime.url
         return GET("$baseUrl/watch?v=$id", watchHeaders)
     }
 
     override fun animeDetailsParse(response: Response): SAnime {
+        val requestUrl = response.request.url
+        if (requestUrl.encodedPath.contains("/api/v1/channels/")) {
+            val channel = json.parseToJsonElement(response.body.string()).jsonObject
+            val author = channel["author"]?.jsonPrimitive?.content ?: "Channel"
+            val authorId = channel["authorId"]?.jsonPrimitive?.content
+                ?: requestUrl.pathSegments.lastOrNull { it.isNotBlank() }
+                ?: ""
+            val thumbnail = channel["authorThumbnails"]?.jsonArray
+                ?.lastOrNull()?.jsonObject?.get("url")?.jsonPrimitive?.content
+                ?: ""
+            return SAnime.create().apply {
+                title = "📺 $author"
+                url = "channel:$authorId"
+                thumbnail_url = thumbnail
+                this.author = author
+                description = buildString {
+                    channel["description"]?.jsonPrimitive?.content?.let {
+                        appendLine(it)
+                        appendLine()
+                    }
+                    channel["subCount"]?.jsonPrimitive?.content?.let {
+                        appendLine("Subscribers: $it")
+                    }
+                    channel["videoCount"]?.jsonPrimitive?.content?.let {
+                        appendLine("Videos: $it")
+                    }
+                }.trim()
+                status = SAnime.COMPLETED
+            }
+        }
+
         val doc = response.asJsoup()
         val host = response.host
         val watchData = doc.selectFirst("script#video_data")?.data()?.let {
@@ -158,6 +207,26 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     // ============================== Episodes ==============================
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        val channelId = anime.url.extractChannelId()
+        if (channelId != null) {
+            val url = "$baseUrl/api/v1/channels/$channelId/videos?sort_by=newest"
+            val response = client.newCall(GET(url, headers)).execute()
+            val body = response.use { it.body?.string() } ?: return emptyList()
+            val videos = json.parseToJsonElement(body)
+                .jsonObject["videos"]?.jsonArray ?: return emptyList()
+            return videos.mapIndexedNotNull { index, element ->
+                val video = element.jsonObject
+                val videoId = video["videoId"]?.jsonPrimitive?.content ?: return@mapIndexedNotNull null
+                val title = video["title"]?.jsonPrimitive?.content ?: videoId
+                val hasCaptions = video["hasCaptions"]?.jsonPrimitive?.booleanOrNull ?: false
+                SEpisode.create().apply {
+                    url = "video:$videoId"
+                    name = "$title${if (hasCaptions) " [CC]" else ""}"
+                    episode_number = (videos.size - index).toFloat()
+                }
+            }
+        }
+
         val id = extractVideoId(anime.url) ?: anime.url
         return listOf(
             SEpisode.create().apply {
@@ -533,23 +602,87 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     private fun parseSearchResults(response: Response): AnimesPage {
         val host = response.host
-        val items = json.decodeFromString<List<BoxSearchItem>>(response.body.string())
-        val videos = items.mapNotNull { item ->
-            if (item.videoId == null) return@mapNotNull null
-            item.toSAnime(host)
+        val body = response.body.string()
+        val items = json.parseToJsonElement(body).jsonArray
+        val entries = items.mapNotNull { element ->
+            val obj = element.jsonObject
+            when (obj["type"]?.jsonPrimitive?.content) {
+                "channel" -> obj.toChannelSAnime(host)
+                "video" -> obj.toVideoSAnime(host)
+                else -> null
+            }
         }
-        return AnimesPage(videos, videos.isNotEmpty())
+        return AnimesPage(entries, entries.isNotEmpty())
+    }
+
+    private fun JsonObject.toChannelSAnime(host: String): SAnime? {
+        val authorId = this["authorId"]?.jsonPrimitive?.content ?: return null
+        val author = this["author"]?.jsonPrimitive?.content ?: authorId
+        val thumbnail = this["authorThumbnails"]?.jsonArray
+            ?.lastOrNull()?.jsonObject?.get("url")?.jsonPrimitive?.content
+            ?: ""
+        return SAnime.create().apply {
+            title = "📺 $author"
+            url = "channel:$authorId"
+            thumbnail_url = thumbnail
+            this.author = author
+            description = buildString {
+                this@toChannelSAnime["description"]?.jsonPrimitive?.content?.let {
+                    appendLine(it)
+                    appendLine()
+                }
+                this@toChannelSAnime["subCount"]?.jsonPrimitive?.content?.let {
+                    appendLine("Subscribers: $it")
+                }
+                this@toChannelSAnime["videoCount"]?.jsonPrimitive?.content?.let {
+                    appendLine("Videos: $it")
+                }
+            }.trim()
+            status = SAnime.COMPLETED
+        }
+    }
+
+    private fun JsonObject.toVideoSAnime(host: String): SAnime? {
+        val videoId = this["videoId"]?.jsonPrimitive?.content ?: return null
+        val title = this["title"]?.jsonPrimitive?.content ?: videoId
+        val author = this["author"]?.jsonPrimitive?.content
+        val hasCaptions = this["hasCaptions"]?.jsonPrimitive?.booleanOrNull ?: false
+        return SAnime.create().apply {
+            this.title = title + if (hasCaptions) " [CC]" else ""
+            url = "$host/watch?v=$videoId"
+            thumbnail_url = "$host/vi/$videoId/mqdefault.jpg"
+            this.author = author
+            description = buildString {
+                this@toVideoSAnime["description"]?.jsonPrimitive?.content?.let {
+                    appendLine(it)
+                    appendLine()
+                }
+                author?.let { appendLine("Author: $it") }
+                this@toVideoSAnime["lengthSeconds"]?.jsonPrimitive?.content?.let {
+                    appendLine("Duration: ${it}s")
+                }
+                this@toVideoSAnime["viewCount"]?.jsonPrimitive?.content?.let {
+                    appendLine("Views: $it")
+                }
+            }.trim()
+            status = SAnime.COMPLETED
+        }
     }
 
     private fun extractVideoId(url: String): String? {
+        if (url.startsWith("video:")) return url.substringAfter("video:")
         val patterns = listOf(
-            Regex("""(?:v=|/v/|/embed/|youtu\.be/)([a-zA-Z0-9_-]{11})"""),
+            Regex("""(?:v=|/v/|/embed/|youtu\\.be/)([a-zA-Z0-9_-]{11})"""),
             Regex("""^([a-zA-Z0-9_-]{11})$"""),
         )
         patterns.forEach { regex ->
             regex.find(url)?.groupValues?.getOrNull(1)?.let { return it }
         }
         return null
+    }
+
+    private fun String.extractChannelId(): String? {
+        return if (startsWith("channel:")) substringAfter("channel:") else null
     }
 
     private fun fixThumbnail(url: String, host: String): String {
@@ -563,6 +696,12 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     private val Response.host: String
         get() = request.url.run { "$scheme://$host" }
+
+    override fun getFilterList() = AnimeFilterList(
+        TypeFilter(),
+        SortFilter(),
+        DateFilter(),
+    )
 
     companion object {
         private const val DEFAULT_INSTANCE = "https://inv.zoomerville.com"
@@ -696,3 +835,36 @@ data class BoxWatchData(
     @SerialName("length_seconds")
     val lengthSeconds: Double? = null,
 )
+
+private class TypeFilter : AnimeFilter.Select<String>(
+    "Tipo",
+    arrayOf("Video", "Channel"),
+) {
+    fun toValue() = if (state == 1) "channel" else "video"
+}
+
+private class SortFilter : AnimeFilter.Select<String>(
+    "Ordenar por",
+    arrayOf("Date (newest)", "Relevance", "Views"),
+) {
+    fun toValue() = when (state) {
+        1 -> "relevance"
+        2 -> "views"
+        else -> "date"
+    }
+}
+
+private class DateFilter : AnimeFilter.Select<String>(
+    "Fecha",
+    arrayOf("Any", "Hour", "Today", "Week", "Month", "Year"),
+) {
+    fun toValue() = when (state) {
+        1 -> "hour"
+        2 -> "today"
+        3 -> "week"
+        4 -> "month"
+        5 -> "year"
+        else -> null
+    }
+}
+
