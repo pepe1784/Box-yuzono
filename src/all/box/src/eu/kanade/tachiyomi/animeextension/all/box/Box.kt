@@ -99,7 +99,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     // ============================== Popular ===============================
 
     override fun popularAnimeRequest(page: Int): Request =
-        GET("$baseUrl/api/v1/popular?$FIELDS", headers)
+        GET("$baseUrl/api/v1/trending?$FIELDS", headers)
 
     override fun popularAnimeParse(response: Response): AnimesPage = parseSearchResults(response)
 
@@ -210,11 +210,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
         val channelId = anime.url.extractChannelId()
         if (channelId != null) {
-            val url = "$baseUrl/api/v1/channels/$channelId/videos?sort_by=newest"
-            val response = client.newCall(GET(url, headers)).execute()
-            val body = response.use { it.body?.string() } ?: return emptyList()
-            val videos = json.parseToJsonElement(body)
-                .jsonObject["videos"]?.jsonArray ?: return emptyList()
+            val videos = fetchChannelVideos(channelId)
             return videos.mapIndexedNotNull { videoIndex, element ->
                 val video = element.jsonObject
                 val videoId = video["videoId"]?.jsonPrimitive?.content ?: return@mapIndexedNotNull null
@@ -224,6 +220,9 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                     episode.url = "video:$videoId"
                     episode.name = "$episodeTitle${if (hasSubtitles) " [CC]" else ""}"
                     episode.episode_number = (videos.size - videoIndex).toFloat()
+                    video["published"]?.jsonPrimitive?.content?.toLongOrNull()?.let {
+                        episode.date_upload = it * 1000L
+                    }
                 }
             }
         }
@@ -236,6 +235,27 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                 episode.episode_number = 1F
             },
         )
+    }
+
+    private fun fetchChannelVideos(channelId: String): List<JsonElement> {
+        val allVideos = mutableListOf<JsonElement>()
+        var continuation: String? = null
+        var page = 0
+        do {
+            val urlBuilder = "$baseUrl/api/v1/channels/$channelId/videos"
+                .toHttpUrl()
+                .newBuilder()
+                .addQueryParameter("sort_by", "newest")
+            continuation?.let { urlBuilder.addQueryParameter("continuation", it) }
+            val response = client.newCall(GET(urlBuilder.build().toString(), headers)).execute()
+            val body = response.use { it.body?.string() } ?: break
+            val obj = json.parseToJsonElement(body).jsonObject
+            val videos = obj["videos"]?.jsonArray ?: break
+            allVideos.addAll(videos)
+            continuation = obj["continuation"]?.jsonPrimitive?.content
+            page++
+        } while (continuation != null && page < 10 && allVideos.size < 500)
+        return allVideos
     }
 
     override fun episodeListParse(response: Response): List<SEpisode> =
