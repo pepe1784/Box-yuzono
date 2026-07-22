@@ -215,25 +215,25 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             val body = response.use { it.body?.string() } ?: return emptyList()
             val videos = json.parseToJsonElement(body)
                 .jsonObject["videos"]?.jsonArray ?: return emptyList()
-            return videos.mapIndexedNotNull { index, element ->
+            return videos.mapIndexedNotNull { videoIndex, element ->
                 val video = element.jsonObject
                 val videoId = video["videoId"]?.jsonPrimitive?.content ?: return@mapIndexedNotNull null
-                val title = video["title"]?.jsonPrimitive?.content ?: videoId
-                val hasCaptions = video["hasCaptions"]?.jsonPrimitive?.booleanOrNull ?: false
-                SEpisode.create().apply {
-                    url = "video:$videoId"
-                    name = "$title${if (hasCaptions) " [CC]" else ""}"
-                    episode_number = (videos.size - index).toFloat()
+                val episodeTitle = video["title"]?.jsonPrimitive?.content ?: videoId
+                val hasSubtitles = video["hasCaptions"]?.jsonPrimitive?.booleanOrNull ?: false
+                SEpisode.create().also { episode ->
+                    episode.url = "video:$videoId"
+                    episode.name = "$episodeTitle${if (hasSubtitles) " [CC]" else ""}"
+                    episode.episode_number = (videos.size - videoIndex).toFloat()
                 }
             }
         }
 
         val id = extractVideoId(anime.url) ?: anime.url
         return listOf(
-            SEpisode.create().apply {
-                url = id
-                name = "Video"
-                episode_number = 1F
+            SEpisode.create().also { episode ->
+                episode.url = id
+                episode.name = "Video"
+                episode.episode_number = 1F
             },
         )
     }
