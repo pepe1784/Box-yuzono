@@ -400,13 +400,13 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             videos += Video(finalUrl, label, finalUrl, headers)
         }
 
-        // Only probe itags as a fallback when the page exposes no progressive
-        // sources. This avoids blocking the quality list with multiple requests.
-        if (videos.none { it.quality != "DASH" } && check.isNotBlank()) {
+        // Always probe progressive itags so downloads have a direct video URL.
+        // DASH/HLS are great for playback but cannot be saved as a single file.
+        if (check.isNotBlank()) {
             ITAG_LABELS.forEach { (itag, label) ->
                 val url = probeItag(host, videoId, check, itag) ?: return@forEach
                 if (!seenUrls.add(url)) return@forEach
-                Log.d(TAG, "Adding fallback itag $itag -> $label")
+                Log.d(TAG, "Adding progressive itag $itag -> $label")
                 videos += Video(url, label, url, headers)
             }
         }
@@ -733,13 +733,17 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         private const val PREF_INSTANCE_KEY = "invidious_instance"
         private const val PREF_QUALITY_KEY = "preferred_quality"
 
-        private val PREF_QUALITY_ENTRIES = arrayOf("DASH", "HD720", "medium", "small")
-        private val PREF_QUALITY_VALUES = arrayOf("DASH", "HD720", "medium", "small")
-        private const val PREF_QUALITY_DEFAULT = "DASH"
+        private val PREF_QUALITY_ENTRIES = arrayOf("DASH", "HD1080", "HD720", "medium", "small")
+        private val PREF_QUALITY_VALUES = arrayOf("DASH", "HD1080", "HD720", "medium", "small")
+        private const val PREF_QUALITY_DEFAULT = "HD720"
 
         private val ITAG_LABELS = linkedMapOf(
+            "37" to "HD1080",
+            "46" to "HD1080",
             "22" to "HD720",
+            "45" to "HD720",
             "18" to "medium",
+            "43" to "medium",
             "36" to "small",
             "17" to "small",
         )
