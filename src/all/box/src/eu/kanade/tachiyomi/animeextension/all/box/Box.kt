@@ -495,9 +495,23 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return ordered.map { rep ->
             val label = "DASH ${rep.height}p"
             val videoUrl = rep.url.withExt(rep.codecs)
+            val container = when {
+                rep.codecs.startsWith("avc1") -> "mp4"
+                rep.codecs.startsWith("mp4a") -> "mp4"
+                rep.codecs.startsWith("vp9") || rep.codecs.startsWith("vp09") -> "webm"
+                rep.codecs.startsWith("av01") -> "webm"
+                else -> "mp4"
+            }
             // Empty headers: these are direct googlevideo URLs and do not need
             // the Invidious Referer/Origin.
-            Video(videoUrl, label, videoUrl, headers = Headers.Builder().build(), audioTracks = audioTracks)
+            Video(
+                videoUrl,
+                label,
+                videoUrl,
+                headers = Headers.Builder().build(),
+                audioTracks = audioTracks,
+                ffmpegStreamArgs = listOf("f" to container),
+            )
         }
     }
 
