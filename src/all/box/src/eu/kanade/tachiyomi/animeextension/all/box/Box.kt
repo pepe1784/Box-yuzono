@@ -388,24 +388,30 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         }
 
         // Progressive streams exposed by the player page (HD720, medium, small).
+        // Leave the Invidious redirect URL so Aniyomi/ffmpeg follows it with source headers.
         doc.select("video#player source").forEach { source ->
             if (source.hasAttr("hidequalityoption")) return@forEach
             if (source.attr("type").contains("dash", ignoreCase = true)) return@forEach
             val src = source.attr("src").takeIf { it.isNotBlank() } ?: return@forEach
             val absolute = if (src.startsWith("http")) src else "$host$src"
             val label = source.attr("label").ifBlank { "Video" }
-            val finalUrl = resolveVideoUrl(absolute)
-            if (!seenUrls.add(finalUrl)) return@forEach
+            if (!seenUrls.add(absolute)) return@forEach
             Log.d(TAG, "Adding progressive source: $label")
-            videos += Video(finalUrl, label, finalUrl, headers)
+            videos += Video(absolute, label, absolute, headers)
         }
 
         // Always probe progressive itags so downloads have a direct video URL.
-        // DASH/HLS are great for playback but cannot be saved as a single file.
+        // Keep the Invidious /latest_version URL; let the downloader follow the redirect.
         if (check.isNotBlank()) {
             ITAG_LABELS.forEach { (itag, label) ->
-                val url = probeItag(host, videoId, check, itag) ?: return@forEach
+                val url = "$host/latest_version?id=$videoId&itag=$itag&check=$check"
                 if (!seenUrls.add(url)) return@forEach
+                val head = try {
+                    client.newCall(GET(url, watchHeaders)).execute().use { it.code }
+                } catch (_: Exception) {
+                    -1
+                }
+                if (head !in 200..399) return@forEach
                 Log.d(TAG, "Adding progressive itag $itag -> $label")
                 videos += Video(url, label, url, headers)
             }
@@ -477,9 +483,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
         return ordered.map { rep ->
             val label = "DASH ${rep.height}p"
-            // Empty headers: these are direct googlevideo URLs and do not need
-            // the Invidious Referer/Origin.
-            Video(rep.url, label, rep.url, headers = Headers.Builder().build(), audioTracks = audioTracks)
+            // Use source headers so Aniyomi/ffmpeg sends Referer/User-Agent when downloading.
+            Video(rep.url, label, rep.url, headers, audioTracks = audioTracks)
         }
     }
 
