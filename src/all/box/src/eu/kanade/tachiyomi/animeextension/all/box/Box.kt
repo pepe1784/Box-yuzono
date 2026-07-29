@@ -467,24 +467,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         Log.d(TAG, "DASH reps: audio=${audioUrls.size}, video=${videoReps.size}")
         if (videoReps.isEmpty()) return emptyList()
 
-        // FFmpeg/mpv needs a file extension hint to detect the container.
-        fun String.withExt(codecs: String): String {
-            return when {
-                contains("#.mp4") || contains("#.webm") -> this
-                else -> {
-                    val ext = when {
-                        codecs.startsWith("avc1") -> "mp4"
-                        codecs.startsWith("mp4a") -> "mp4"
-                        codecs.startsWith("vp9") || codecs.startsWith("vp09") -> "webm"
-                        codecs.startsWith("av01") -> "webm"
-                        else -> "mp4"
-                    }
-                    "$this#.$ext"
-                }
-            }
-        }
-
-        val audioTracks = audioUrls.map { Track(it.withExt("mp4a"), "Audio") }
+        val audioTracks = audioUrls.map { Track(it, "Audio") }
 
         val h264 = videoReps.filter { it.codecs.startsWith("avc1") }
         val candidates = if (h264.isNotEmpty()) h264 else videoReps
@@ -494,10 +477,9 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
         return ordered.map { rep ->
             val label = "DASH ${rep.height}p"
-            val videoUrl = rep.url.withExt(rep.codecs)
             // Empty headers: these are direct googlevideo URLs and do not need
             // the Invidious Referer/Origin.
-            Video(videoUrl, label, videoUrl, headers = Headers.Builder().build(), audioTracks = audioTracks)
+            Video(rep.url, label, rep.url, headers = Headers.Builder().build(), audioTracks = audioTracks)
         }
     }
 
