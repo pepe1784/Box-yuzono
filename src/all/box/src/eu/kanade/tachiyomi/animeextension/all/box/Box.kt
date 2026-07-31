@@ -56,6 +56,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     override val client: OkHttpClient by lazy {
         network.cloudflareClient.newBuilder()
             .cookieJar(MemoryCookieJar())
+            .addInterceptor(CaptchaProxyInterceptor())
             .addInterceptor(GoAwayInterceptor())
             .addInterceptor(AnubisInterceptor())
             .connectTimeout(30, TimeUnit.SECONDS)
@@ -612,6 +613,17 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     private fun parseSearchResults(response: Response): AnimesPage {
         val host = response.host
         val body = response.body.string()
+        return try {
+            parseSearchResultsJson(body, host)
+        } catch (e: Exception) {
+            Log.d(TAG, "API search/trending failed, falling back to HTML", e)
+            val fallbackUrl = buildFallbackSearchUrl(response.request.url)
+            val htmlResponse = client.newCall(GET(fallbackUrl, watchHeaders)).execute()
+            htmlResponse.use { parseSearchResultsHtml(it.asJsoup(), host) }
+        }
+    }
+
+    private fun parseSearchResultsJson(body: String, host: String): AnimesPage {
         val items = json.parseToJsonElement(body).jsonArray
         val entries = items.mapNotNull { element ->
             val obj = element.jsonObject
@@ -622,6 +634,50 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             }
         }
         return AnimesPage(entries, entries.isNotEmpty())
+    }
+
+    private fun parseSearchResultsHtml(doc: Document, host: String): AnimesPage {
+        val entries = doc.select("div.pure-u-1.pure-u-md-1-4").mapNotNull { card ->
+            val link = card.selectFirst("div.thumbnail > a[href^=/watch]")
+                ?: return@mapNotNull null
+            val href = link.attr("href")
+            val videoId = extractVideoId(href) ?: return@mapNotNull null
+            val title = card.selectFirst("div.video-card-row p")?.text()?.trim() ?: videoId
+            val thumbnail = link.selectFirst("img.thumbnail")?.attr("src")
+                ?.let { fixThumbnail(it, host) } ?: ""
+            val author = card.selectFirst("p.channel-name")?.text()?.trim()
+            SAnime.create().apply {
+                this.title = title
+                url = "$host/watch?v=$videoId"
+                thumbnail_url = thumbnail
+                this.author = author
+                description = author?.let { "Author: $it" } ?: ""
+                status = SAnime.COMPLETED
+            }
+        }
+        return AnimesPage(entries, entries.isNotEmpty())
+    }
+
+    private fun buildFallbackSearchUrl(url: HttpUrl): String {
+        val path = url.encodedPath
+        return when {
+            path.contains("/api/v1/trending") -> url.newBuilder()
+                .encodedPath("/feed/trending")
+                .encodedQuery(null)
+                .build()
+                .toString()
+            path.contains("/api/v1/search") -> {
+                val q = url.queryParameter("q") ?: ""
+                val page = url.queryParameter("page") ?: "1"
+                url.newBuilder()
+                    .encodedPath("/search")
+                    .setQueryParameter("q", q)
+                    .setQueryParameter("page", page)
+                    .build()
+                    .toString()
+            }
+            else -> url.toString()
+        }
     }
 
     private fun JsonObject.toChannelSAnime(host: String): SAnime? {
