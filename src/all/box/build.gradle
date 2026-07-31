@@ -1,22 +1,11 @@
 ext {
     extName = 'box'
     extClass = '.Box'
-    extVersionCode = 70
+    extVersionCode = 71
 }
 
 apply plugin: "kei.plugins.extension.legacy"
 
-android {
-    buildTypes {
-        release {
-            proguardFiles(file("proguard-rules.pro"))
-        }
-    }
-}
-
 dependencies {
     implementation(project(":lib:playlistutils"))
-    implementation("com.github.teamnewpipe:NewPipeExtractor:v0.26.4") {
-        exclude group: "org.mozilla", module: "rhino-engine"
-    }
 }
