@@ -29,7 +29,6 @@ class CaptchaProxyInterceptor : Interceptor {
     }
 
     private fun Response.isCaptchaChallenge(): Boolean {
-        if (code !in CAPTCHA_CODES) return false
         val contentType = header("Content-Type") ?: return false
         if (!contentType.contains("text/html", ignoreCase = true)) return false
         val body = try {
@@ -42,7 +41,6 @@ class CaptchaProxyInterceptor : Interceptor {
 
     companion object {
         private const val CAPTCHA_PEEK_BYTES = 64 * 1024L
-        private val CAPTCHA_CODES = 403..503
         private val CAPTCHA_MARKERS = listOf(
             "captchaproxy",
             "cap-widget",
