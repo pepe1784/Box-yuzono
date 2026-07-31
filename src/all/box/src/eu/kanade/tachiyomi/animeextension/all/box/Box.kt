@@ -20,6 +20,7 @@ import keiyoushi.utils.delegate
 import keiyoushi.utils.getEditTextPreference
 import keiyoushi.utils.getListPreference
 import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.getSwitchPreference
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -44,10 +45,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
-import org.schabi.newpipe.extractor.NewPipe
-import org.schabi.newpipe.extractor.localization.ContentCountry
-import org.schabi.newpipe.extractor.localization.Localization
-import org.schabi.newpipe.extractor.stream.StreamInfo
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
@@ -62,6 +59,9 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override var baseUrl: String by preferences.delegate(PREF_INSTANCE_KEY, DEFAULT_INSTANCE)
 
+    private val useHtmlCatalog: Boolean
+        get() = preferences.getBoolean(PREF_HTML_CATALOG_KEY, PREF_HTML_CATALOG_DEFAULT)
+
     override val client: OkHttpClient by lazy {
         network.cloudflareClient.newBuilder()
             .addInterceptor(CaptchaProxyInterceptor())
@@ -70,13 +70,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
-            .also {
-                NewPipe.init(
-                    OkHttpDownloader(it),
-                    Localization.DEFAULT,
-                    ContentCountry.DEFAULT,
-                )
-            }
     }
 
 
@@ -116,14 +109,22 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     // ============================== Popular ===============================
 
     override fun popularAnimeRequest(page: Int): Request =
-        GET("$baseUrl/api/v1/trending?$FIELDS", headers)
+        if (useHtmlCatalog) {
+            GET("$baseUrl/feed/trending", watchHeaders)
+        } else {
+            GET("$baseUrl/api/v1/trending?$FIELDS", headers)
+        }
 
     override fun popularAnimeParse(response: Response): AnimesPage = parseSearchResults(response)
 
     // =============================== Latest ===============================
 
     override fun latestUpdatesRequest(page: Int): Request =
-        GET("$baseUrl/api/v1/trending?$FIELDS", headers)
+        if (useHtmlCatalog) {
+            GET("$baseUrl/feed/trending", watchHeaders)
+        } else {
+            GET("$baseUrl/api/v1/trending?$FIELDS", headers)
+        }
 
     override fun latestUpdatesParse(response: Response): AnimesPage = parseSearchResults(response)
 
@@ -136,6 +137,14 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val directVideoId = extractVideoId(trimmed)
         if (directVideoId != null && page == 1) {
             return GET("$baseUrl/watch?v=$directVideoId", watchHeaders)
+        }
+
+        if (useHtmlCatalog) {
+            val encoded = URLEncoder.encode(trimmed, "UTF-8")
+            val urlBuilder = "$baseUrl/search".toHttpUrl().newBuilder()
+                .addQueryParameter("q", encoded)
+                .addQueryParameter("page", page.toString())
+            return GET(urlBuilder.build().toString(), watchHeaders)
         }
 
         val encoded = URLEncoder.encode(trimmed, "UTF-8")
@@ -454,69 +463,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             }
         }
 
-        // NewPipe extractor fallback: fetch streams directly from YouTube.
-        addNewPipeVideos(videoId, videos, seenUrls, headers)
-
         return videos
-    }
-
-    private fun addNewPipeVideos(
-        videoId: String,
-        videos: MutableList<Video>,
-        seenUrls: MutableSet<String>,
-        headers: Headers,
-    ) {
-        try {
-            val service = NewPipe.getService(0) // YouTube
-            val url = "https://www.youtube.com/watch?v=$videoId"
-            val info = StreamInfo.getInfo(service, url)
-
-            info.dashMpdUrl?.let {
-                if (seenUrls.add(it)) {
-                    Log.d(TAG, "Adding NewPipe DASH")
-                    videos += Video(it, "NewPipe DASH", it, headers)
-                }
-            }
-
-            info.hlsUrl?.let {
-                if (seenUrls.add(it)) {
-                    Log.d(TAG, "Adding NewPipe HLS")
-                    videos += Video(it, "NewPipe HLS", it, headers)
-                }
-            }
-
-            info.videoStreams.forEach { stream ->
-                val streamUrl = stream.url ?: return@forEach
-                if (streamUrl.isBlank()) return@forEach
-                val resolution = stream.resolution ?: "Video"
-                if (seenUrls.add(streamUrl)) {
-                    Log.d(TAG, "Adding NewPipe progressive: $resolution")
-                    videos += Video(streamUrl, "NewPipe $resolution", streamUrl, headers)
-                }
-            }
-
-            val audio = info.audioStreams.firstOrNull { !it.url.isNullOrBlank() }
-            if (audio != null) {
-                val audioUrl = audio.url ?: return
-                info.videoOnlyStreams.forEach { stream ->
-                    val videoUrl = stream.url ?: return@forEach
-                    if (videoUrl.isBlank()) return@forEach
-                    val resolution = stream.resolution ?: "Video"
-                    if (seenUrls.add(videoUrl)) {
-                        Log.d(TAG, "Adding NewPipe video-only: $resolution")
-                        videos += Video(
-                            videoUrl,
-                            "NewPipe $resolution",
-                            videoUrl,
-                            headers,
-                            audioTracks = listOf(Track(audioUrl, "Audio")),
-                        )
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "NewPipeExtractor failed for $videoId", e)
-        }
     }
 
     private fun buildDashManifestUrl(src: String, host: String): String {
@@ -702,22 +649,37 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             },
         )
 
+        val htmlCatalogPref = screen.getSwitchPreference(
+            key = PREF_HTML_CATALOG_KEY,
+            default = PREF_HTML_CATALOG_DEFAULT,
+            title = "Usar catálogo HTML",
+            summary = "Fuerza tendencias/búsqueda por HTML. Útil para instancias que bloquean la API (por ejemplo choco).",
+            onComplete = { value ->
+                preferences.edit().putBoolean(PREF_HTML_CATALOG_KEY, value).apply()
+            },
+        )
+
         screen.addPreference(instancePref)
         screen.addPreference(qualityPref)
+        screen.addPreference(htmlCatalogPref)
     }
 
     // ============================== Helpers ==============================
 
     private fun parseSearchResults(response: Response): AnimesPage {
         val host = response.host
-        val body = response.body.string()
-        return try {
-            parseSearchResultsJson(body, host)
-        } catch (e: Exception) {
-            Log.d(TAG, "API search/trending failed, falling back to HTML", e)
-            val fallbackUrl = buildFallbackSearchUrl(response.request.url)
-            val htmlResponse = client.newCall(GET(fallbackUrl, watchHeaders)).execute()
-            htmlResponse.use { parseSearchResultsHtml(it.asJsoup(), host) }
+        return if (useHtmlCatalog) {
+            parseSearchResultsHtml(response.asJsoup(), host)
+        } else {
+            val body = response.body.string()
+            try {
+                parseSearchResultsJson(body, host)
+            } catch (e: Exception) {
+                Log.d(TAG, "API search/trending failed, falling back to HTML", e)
+                val fallbackUrl = buildFallbackSearchUrl(response.request.url)
+                val htmlResponse = client.newCall(GET(fallbackUrl, watchHeaders)).execute()
+                htmlResponse.use { parseSearchResultsHtml(it.asJsoup(), host) }
+            }
         }
     }
 
@@ -873,6 +835,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private const val PREF_INSTANCE_KEY = "invidious_instance"
         private const val PREF_QUALITY_KEY = "preferred_quality"
+        private const val PREF_HTML_CATALOG_KEY = "use_html_catalog"
+        private const val PREF_HTML_CATALOG_DEFAULT = false
 
         private val PREF_QUALITY_ENTRIES = arrayOf("DASH", "HD1080", "HD720", "medium", "small")
         private val PREF_QUALITY_VALUES = arrayOf("DASH", "HD1080", "HD720", "medium", "small")
