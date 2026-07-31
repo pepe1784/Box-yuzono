@@ -123,7 +123,15 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     // =============================== Search ===============================
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val encoded = URLEncoder.encode(query.trim(), "UTF-8")
+        val trimmed = query.trim()
+
+        // Allow pasting a YouTube/Invidious URL directly into Aniyomi search.
+        val directVideoId = extractVideoId(trimmed)
+        if (directVideoId != null && page == 1) {
+            return GET("$baseUrl/watch?v=$directVideoId", watchHeaders)
+        }
+
+        val encoded = URLEncoder.encode(trimmed, "UTF-8")
         val urlBuilder = "$baseUrl/api/v1/search".toHttpUrl().newBuilder()
             .addQueryParameter("q", encoded)
             .addQueryParameter("page", page.toString())
@@ -139,7 +147,20 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return GET(urlBuilder.build().toString(), headers)
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage = parseSearchResults(response)
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val requestUrl = response.request.url
+        val isDirectWatch = requestUrl.encodedPath.contains("/watch") &&
+            extractVideoId(requestUrl.toString()) != null
+        if (isDirectWatch) {
+            return try {
+                val anime = animeDetailsParse(response)
+                AnimesPage(listOf(anime), false)
+            } catch (e: Exception) {
+                AnimesPage(emptyList(), false)
+            }
+        }
+        return parseSearchResults(response)
+    }
 
     // =========================== Anime Details ============================
 
