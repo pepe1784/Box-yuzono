@@ -38,13 +38,13 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
-import okhttp3.Headers
-import okhttp3.HttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import org.jsoup.nodes.Document
+import org.schabi.newpipe.extractor.NewPipe
+import org.schabi.newpipe.extractor.ServiceList
+import org.schabi.newpipe.extractor.localization.ContentCountry
+import org.schabi.newpipe.extractor.localization.Localization
+import org.schabi.newpipe.extractor.stream.StreamInfo
+import org.mozilla.javascript.Context
+import org.mozilla.javascript.ContextFactory
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
@@ -63,14 +63,48 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         get() = preferences.getBoolean(PREF_HTML_CATALOG_KEY, PREF_HTML_CATALOG_DEFAULT)
 
     override val client: OkHttpClient by lazy {
-        network.cloudflareClient.newBuilder()
+        network.client.newBuilder()
             .addInterceptor(CaptchaProxyInterceptor())
             .addInterceptor(GoAwayInterceptor())
             .addInterceptor(AnubisInterceptor())
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
+            .also { initNewPipe(it) }
     }
+
+    /**
+     * Initialize NewPipeExtractor with a Rhino context factory forced to pure
+     * interpreter mode. This avoids Rhino's ClassFileWriter / bytecode generator,
+     * which references Android-missing classes such as java.beans.* and causes
+     * runtime crashes on Aniyomi.
+     */
+    private fun initNewPipe(httpClient: OkHttpClient) {
+        try {
+            ContextFactory.initGlobal(RhinoContextFactory)
+            NewPipe.init(
+                OkHttpDownloader(httpClient),
+                Localization.DEFAULT,
+                ContentCountry.DEFAULT,
+            )
+        } catch (e: IllegalStateException) {
+            // Rhino factory already initialized; ignore.
+            Log.d(TAG, "Rhino context factory already initialized")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize NewPipe", e)
+        }
+    }
+
+    private object RhinoContextFactory : ContextFactory() {
+        override fun makeContext(): Context {
+            return super.makeContext().apply {
+                setOptimizationLevel(-1)
+            }
+        }
+    }
+
+    private val useNewPipe: Boolean
+        get() = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT) == "NewPipe"
 
 
     private val json = Json {
@@ -471,7 +505,72 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             }
         }
 
+        // NewPipeExtractor fallback: if Invidious gave nothing usable, or if the
+        // user explicitly chose NewPipe as preferred quality, call YouTube directly.
+        if (videos.none { it.videoUrl.isNotBlank() } || useNewPipe) {
+            addNewPipeVideos(videoId, videos, seenUrls, headers)
+        }
+
         return videos
+    }
+
+    private fun addNewPipeVideos(
+        videoId: String,
+        videos: MutableList<Video>,
+        seenUrls: MutableSet<String>,
+        headers: Headers,
+    ) {
+        try {
+            val service = ServiceList.YouTube
+            val url = "https://www.youtube.com/watch?v=$videoId"
+            val info = StreamInfo.getInfo(service, url)
+
+            info.dashMpdUrl?.let {
+                if (seenUrls.add(it)) {
+                    Log.d(TAG, "Adding NewPipe DASH")
+                    videos += Video(it, "NewPipe DASH", it, headers)
+                }
+            }
+
+            info.hlsUrl?.let {
+                if (seenUrls.add(it)) {
+                    Log.d(TAG, "Adding NewPipe HLS")
+                    videos += Video(it, "NewPipe HLS", it, headers)
+                }
+            }
+
+            info.videoStreams.forEach { stream ->
+                val streamUrl = stream.url ?: return@forEach
+                if (streamUrl.isBlank()) return@forEach
+                val resolution = stream.resolution ?: "Video"
+                if (seenUrls.add(streamUrl)) {
+                    Log.d(TAG, "Adding NewPipe progressive: $resolution")
+                    videos += Video(streamUrl, "NewPipe $resolution", streamUrl, headers)
+                }
+            }
+
+            val audio = info.audioStreams.firstOrNull { !it.url.isNullOrBlank() }
+            if (audio != null) {
+                val audioUrl = audio.url ?: return
+                info.videoOnlyStreams.forEach { stream ->
+                    val videoUrl = stream.url ?: return@forEach
+                    if (videoUrl.isBlank()) return@forEach
+                    val resolution = stream.resolution ?: "Video"
+                    if (seenUrls.add(videoUrl)) {
+                        Log.d(TAG, "Adding NewPipe video-only: $resolution")
+                        videos += Video(
+                            videoUrl,
+                            "NewPipe $resolution",
+                            videoUrl,
+                            headers,
+                            audioTracks = listOf(Track(audioUrl, "Audio")),
+                        )
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "NewPipeExtractor failed for $videoId", e)
+        }
     }
 
     private fun buildDashManifestUrl(src: String, host: String): String {
@@ -846,9 +945,9 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         private const val PREF_HTML_CATALOG_KEY = "use_html_catalog"
         private const val PREF_HTML_CATALOG_DEFAULT = false
 
-        private val PREF_QUALITY_ENTRIES = arrayOf("DASH", "HD1080", "HD720", "medium", "small")
-        private val PREF_QUALITY_VALUES = arrayOf("DASH", "HD1080", "HD720", "medium", "small")
-        private const val PREF_QUALITY_DEFAULT = "HD720"
+        private val PREF_QUALITY_ENTRIES = arrayOf("DASH", "NewPipe", "HD1080", "HD720", "medium", "small")
+        private val PREF_QUALITY_VALUES = arrayOf("DASH", "NewPipe", "HD1080", "HD720", "medium", "small")
+        private const val PREF_QUALITY_DEFAULT = "DASH"
 
         private val ITAG_LABELS = linkedMapOf(
             "37" to "HD1080",
