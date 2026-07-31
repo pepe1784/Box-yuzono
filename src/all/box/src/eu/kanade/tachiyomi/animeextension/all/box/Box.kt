@@ -56,8 +56,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     override val client: OkHttpClient by lazy {
         network.cloudflareClient.newBuilder()
             .cookieJar(MemoryCookieJar())
-            .addInterceptor(AnubisInterceptor())
             .addInterceptor(GoAwayInterceptor())
+            .addInterceptor(AnubisInterceptor())
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()

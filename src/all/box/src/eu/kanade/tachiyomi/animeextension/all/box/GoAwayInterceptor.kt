@@ -26,7 +26,6 @@ class GoAwayInterceptor : Interceptor {
         }
 
         // Limit how many times we try to solve go-away for the same original call.
-        // This prevents infinite loops when the instance keeps re-challenging.
         val retryCount = request.header(RETRY_HEADER)?.toIntOrNull() ?: 0
         if (retryCount >= MAX_RETRIES) {
             throw Exception(
@@ -40,7 +39,12 @@ class GoAwayInterceptor : Interceptor {
             return response
         }
 
-        val challenge = response.extractChallenge(request, chain)
+        val challenge = try {
+            response.extractChallenge(request, chain)
+        } catch (e: Exception) {
+            // Not a go-away challenge we can solve; let the caller/another interceptor handle it.
+            return response
+        }
         response.close()
 
         val userAgent = request.header("User-Agent") ?: USER_AGENT
