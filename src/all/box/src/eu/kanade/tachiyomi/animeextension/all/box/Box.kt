@@ -96,6 +96,14 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             .add("Sec-Fetch-Site", "same-origin")
             .build()
 
+    private val htmlHeaders: Headers
+        get() = Headers.Builder()
+            .add("User-Agent", USER_AGENT)
+            .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+            .add("Accept-Language", "en-US,en;q=0.5")
+            .add("Referer", "$baseUrl/")
+            .build()
+
     private fun dashHeaders(videoId: String): Headers = headersBuilder()
         .set("Accept", "application/dash+xml")
         .set("Referer", "$baseUrl/watch?v=$videoId")
@@ -110,7 +118,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun popularAnimeRequest(page: Int): Request =
         if (useHtmlCatalog) {
-            GET("$baseUrl/feed/trending", watchHeaders)
+            GET("$baseUrl/feed/trending", htmlHeaders)
         } else {
             GET("$baseUrl/api/v1/trending?$FIELDS", headers)
         }
@@ -121,7 +129,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun latestUpdatesRequest(page: Int): Request =
         if (useHtmlCatalog) {
-            GET("$baseUrl/feed/trending", watchHeaders)
+            GET("$baseUrl/feed/trending", htmlHeaders)
         } else {
             GET("$baseUrl/api/v1/trending?$FIELDS", headers)
         }
@@ -136,7 +144,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         // Allow pasting a YouTube/Invidious URL directly into Aniyomi search.
         val directVideoId = extractVideoId(trimmed)
         if (directVideoId != null && page == 1) {
-            return GET("$baseUrl/watch?v=$directVideoId", watchHeaders)
+            return GET("$baseUrl/watch?v=$directVideoId", htmlHeaders)
         }
 
         if (useHtmlCatalog) {
@@ -144,7 +152,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             val urlBuilder = "$baseUrl/search".toHttpUrl().newBuilder()
                 .addQueryParameter("q", encoded)
                 .addQueryParameter("page", page.toString())
-            return GET(urlBuilder.build().toString(), watchHeaders)
+            return GET(urlBuilder.build().toString(), htmlHeaders)
         }
 
         val encoded = URLEncoder.encode(trimmed, "UTF-8")
@@ -677,7 +685,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             } catch (e: Exception) {
                 Log.d(TAG, "API search/trending failed, falling back to HTML", e)
                 val fallbackUrl = buildFallbackSearchUrl(response.request.url)
-                val htmlResponse = client.newCall(GET(fallbackUrl, watchHeaders)).execute()
+                val htmlResponse = client.newCall(GET(fallbackUrl, htmlHeaders)).execute()
                 htmlResponse.use { parseSearchResultsHtml(it.asJsoup(), host) }
             }
         }
