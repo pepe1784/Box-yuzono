@@ -458,25 +458,30 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             }
 
             info.videoStreams.forEach { stream ->
-                if (stream.url.isNullOrBlank()) return@forEach
-                if (seenUrls.add(stream.url)) {
-                    Log.d(TAG, "Adding NewPipe progressive: ${stream.resolution}")
-                    videos += Video(stream.url, "NewPipe ${stream.resolution}", stream.url, headers)
+                val streamUrl = stream.url ?: return@forEach
+                if (streamUrl.isBlank()) return@forEach
+                val resolution = stream.resolution ?: "Video"
+                if (seenUrls.add(streamUrl)) {
+                    Log.d(TAG, "Adding NewPipe progressive: $resolution")
+                    videos += Video(streamUrl, "NewPipe $resolution", streamUrl, headers)
                 }
             }
 
             val audio = info.audioStreams.firstOrNull { !it.url.isNullOrBlank() }
             if (audio != null) {
+                val audioUrl = audio.url ?: return
                 info.videoOnlyStreams.forEach { stream ->
                     val videoUrl = stream.url ?: return@forEach
+                    if (videoUrl.isBlank()) return@forEach
+                    val resolution = stream.resolution ?: "Video"
                     if (seenUrls.add(videoUrl)) {
-                        Log.d(TAG, "Adding NewPipe video-only: ${stream.resolution}")
+                        Log.d(TAG, "Adding NewPipe video-only: $resolution")
                         videos += Video(
                             videoUrl,
-                            "NewPipe ${stream.resolution}",
+                            "NewPipe $resolution",
                             videoUrl,
                             headers,
-                            audioTracks = listOf(Track(audio.url, "Audio")),
+                            audioTracks = listOf(Track(audioUrl, "Audio")),
                         )
                     }
                 }
