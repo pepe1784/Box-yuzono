@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.animeextension.all.box
 
+import android.util.Log
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
@@ -8,6 +9,8 @@ import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
 import java.security.MessageDigest
+
+private class RetryTag(val count: Int)
 
 /**
  * Interceptor that solves the go-away challenge chain used by some Invidious
@@ -28,7 +31,7 @@ class GoAwayInterceptor : Interceptor {
         }
 
         // Limit how many times we retry the original request.
-        val retryCount = request.header(RETRY_HEADER)?.toIntOrNull() ?: 0
+        val retryCount = request.tag(RetryTag::class.java)?.count ?: 0
         if (retryCount >= MAX_RETRIES) {
             throw Exception(
                 "GoAway: la instancia sigue requiriendo challenge tras $MAX_RETRIES intentos. " +
@@ -36,33 +39,25 @@ class GoAwayInterceptor : Interceptor {
             )
         }
 
-        var response = chain.proceed(request)
+        val response = chain.proceed(request)
         if (!response.isGoAwayChallenge()) {
             return response
         }
 
-        repeat(MAX_CHALLENGE_STEPS) {
-            try {
-                solveGoAwayChallenge(response, request, chain)
-            } finally {
-                response.close()
-            }
+        Log.d(TAG, "go-away challenge detected for ${request.url} (retry=$retryCount)")
 
-            val next = chain.proceed(
-                request.newBuilder()
-                    .header(RETRY_HEADER, (retryCount + 1).toString())
-                    .build(),
-            )
-            if (!next.isGoAwayChallenge()) {
-                return next
-            }
-            response = next
-        }
+        // Solve whatever challenge page we received, then retry the original
+        // request. The retry skips this interceptor so we don't recurse
+        // infinitely; the cookie jar now has the go-away state cookie.
+        solveGoAwayChallenge(response, request, chain)
+        response.close()
+        Log.d(TAG, "go-away challenge solved, retrying ${request.url}")
 
-        throw Exception(
-            "GoAway: no se pudo completar la cadena de desafíos tras $MAX_CHALLENGE_STEPS pasos. " +
-                "La instancia sigue pidiendo verificación.",
-        )
+        val retryRequest = request.newBuilder()
+            .tag(RetryTag::class.java, RetryTag(retryCount + 1))
+            .header(PASS_HEADER, "1")
+            .build()
+        return chain.proceed(retryRequest)
     }
 
     private fun Response.isGoAwayChallenge(): Boolean {
@@ -85,12 +80,14 @@ class GoAwayInterceptor : Interceptor {
         // Some challenges (e.g. js-refresh) directly return a redirect URL.
         val jsRedirect = JS_REDIRECT_REGEX.find(body)?.groupValues?.getOrNull(1)
         if (jsRedirect != null && jsRedirect.contains("verify-challenge")) {
+            Log.d(TAG, "following js-refresh redirect")
             followVerifyUrl(unescapeUnicode(jsRedirect), request, chain, request.url.toString())
             return
         }
 
         val metaRedirect = META_REFRESH_REGEX.find(body)?.groupValues?.getOrNull(1)
         if (metaRedirect != null && metaRedirect.contains("verify-challenge")) {
+            Log.d(TAG, "following meta-refresh redirect")
             followVerifyUrl(metaRedirect, request, chain, request.url.toString())
             return
         }
@@ -99,6 +96,7 @@ class GoAwayInterceptor : Interceptor {
         if (headerRedirect != null && headerRedirect.contains("verify-challenge")) {
             val url = headerRedirect.substringAfter("url=", "").trim().trim('"', '\'')
             if (url.isNotBlank()) {
+                Log.d(TAG, "following Refresh header redirect")
                 followVerifyUrl(url, request, chain, request.url.toString())
                 return
             }
@@ -142,6 +140,8 @@ class GoAwayInterceptor : Interceptor {
             ?: rawPath.substringAfterLast("/").takeIf { it.isNotBlank() }
             ?: "js-pow-sha256"
 
+        Log.d(TAG, "solving script challenge=$challengeName path=$path id=$id")
+
         val userAgent = request.header("User-Agent") ?: USER_AGENT
 
         // Fetch challenge data (challenge hex + target hex).
@@ -153,6 +153,7 @@ class GoAwayInterceptor : Interceptor {
             .build()
 
         val makeChallengeResponse = chain.proceed(makeChallengeRequest)
+        Log.d(TAG, "make-challenge response ${makeChallengeResponse.code}")
         val makeChallengeBody = makeChallengeResponse.use {
             if (!it.isSuccessful) {
                 throw Exception("GoAway make-challenge failed: ${it.code}")
@@ -193,6 +194,7 @@ class GoAwayInterceptor : Interceptor {
             .build()
 
         val verifyResponse = chain.proceed(verifyRequest)
+        Log.d(TAG, "verify-challenge response ${verifyResponse.code}")
         verifyResponse.use {
             if (it.code >= 400 && !it.isGoAwayChallenge()) {
                 throw Exception("GoAway verify-challenge failed: ${it.code}")
@@ -340,10 +342,9 @@ class GoAwayInterceptor : Interceptor {
     )
 
     companion object {
+        private const val TAG = "BoxGoAway"
         private const val PASS_HEADER = "X-Box-GoAway-Pass"
-        private const val RETRY_HEADER = "X-Box-GoAway-Retry"
         private const val MAX_RETRIES = 5
-        private const val MAX_CHALLENGE_STEPS = 5
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private const val CHALLENGE_PEEK_BYTES = 64 * 1024L
