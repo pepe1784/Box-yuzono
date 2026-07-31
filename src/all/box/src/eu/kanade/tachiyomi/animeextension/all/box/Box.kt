@@ -30,8 +30,6 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import okhttp3.Cookie
-import okhttp3.CookieJar
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -55,7 +53,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override val client: OkHttpClient by lazy {
         network.cloudflareClient.newBuilder()
-            .cookieJar(MemoryCookieJar())
             .addInterceptor(CaptchaProxyInterceptor())
             .addInterceptor(GoAwayInterceptor())
             .addInterceptor(AnubisInterceptor())
@@ -808,22 +805,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             "fields=videoId,title,description,author,lengthSeconds,viewCount,publishedText,formatStreams,recommendedVideos&local=true"
 
         private const val TAG = "Box"
-    }
-}
-
-/**
- * In-memory cookie jar so the Anubis auth cookie is reused across the
- * extension's requests to the Invidious instance.
- */
-private class MemoryCookieJar : CookieJar {
-    private val store = mutableMapOf<String, MutableList<Cookie>>()
-
-    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-        store.getOrPut(url.host) { mutableListOf() }.addAll(cookies)
-    }
-
-    override fun loadForRequest(url: HttpUrl): List<Cookie> {
-        return store[url.host]?.filter { it.expiresAt >= System.currentTimeMillis() } ?: emptyList()
     }
 }
 
