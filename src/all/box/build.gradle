@@ -1,11 +1,12 @@
 ext {
     extName = 'box'
     extClass = '.Box'
-    extVersionCode = 66
+    extVersionCode = 67
 }
 
 apply plugin: "kei.plugins.extension.legacy"
 
 dependencies {
     implementation(project(":lib:playlistutils"))
+    implementation("com.github.teamnewpipe:NewPipeExtractor:v0.26.4")
 }

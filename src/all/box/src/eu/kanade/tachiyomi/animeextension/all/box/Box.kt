@@ -37,6 +37,10 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
+import org.schabi.newpipe.extractor.NewPipe
+import org.schabi.newpipe.extractor.localization.ContentCountry
+import org.schabi.newpipe.extractor.localization.Localization
+import org.schabi.newpipe.extractor.stream.StreamInfo
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
@@ -59,6 +63,13 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
+            .also {
+                NewPipe.init(
+                    OkHttpDownloader(it),
+                    Localization.DEFAULT,
+                    ContentCountry.DEFAULT,
+                )
+            }
     }
 
 
@@ -415,7 +426,64 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             }
         }
 
+        // NewPipe extractor fallback: fetch streams directly from YouTube.
+        addNewPipeVideos(videoId, videos, seenUrls, headers)
+
         return videos
+    }
+
+    private fun addNewPipeVideos(
+        videoId: String,
+        videos: MutableList<Video>,
+        seenUrls: MutableSet<String>,
+        headers: Headers,
+    ) {
+        try {
+            val service = NewPipe.getService(0) // YouTube
+            val url = "https://www.youtube.com/watch?v=$videoId"
+            val info = StreamInfo.getInfo(service, url)
+
+            info.dashMpdUrl?.let {
+                if (seenUrls.add(it)) {
+                    Log.d(TAG, "Adding NewPipe DASH")
+                    videos += Video(it, "NewPipe DASH", it, headers)
+                }
+            }
+
+            info.hlsUrl?.let {
+                if (seenUrls.add(it)) {
+                    Log.d(TAG, "Adding NewPipe HLS")
+                    videos += Video(it, "NewPipe HLS", it, headers)
+                }
+            }
+
+            info.videoStreams.forEach { stream ->
+                if (stream.url.isNullOrBlank()) return@forEach
+                if (seenUrls.add(stream.url)) {
+                    Log.d(TAG, "Adding NewPipe progressive: ${stream.resolution}")
+                    videos += Video(stream.url, "NewPipe ${stream.resolution}", stream.url, headers)
+                }
+            }
+
+            val audio = info.audioStreams.firstOrNull { !it.url.isNullOrBlank() }
+            if (audio != null) {
+                info.videoOnlyStreams.forEach { stream ->
+                    val videoUrl = stream.url ?: return@forEach
+                    if (seenUrls.add(videoUrl)) {
+                        Log.d(TAG, "Adding NewPipe video-only: ${stream.resolution}")
+                        videos += Video(
+                            videoUrl,
+                            "NewPipe ${stream.resolution}",
+                            videoUrl,
+                            headers,
+                            audioTracks = listOf(Track(audio.url, "Audio")),
+                        )
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "NewPipeExtractor failed for $videoId", e)
+        }
     }
 
     private fun buildDashManifestUrl(src: String, host: String): String {
