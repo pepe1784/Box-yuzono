@@ -507,7 +507,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
         // NewPipeExtractor fallback: if Invidious gave nothing usable, or if the
         // user explicitly chose NewPipe as preferred quality, call YouTube directly.
-        if (videos.none { it.videoUrl.isNotBlank() } || useNewPipe) {
+        if (videos.none { !it.videoUrl.isNullOrBlank() } || useNewPipe) {
             addNewPipeVideos(videoId, videos, seenUrls, headers)
         }
 
