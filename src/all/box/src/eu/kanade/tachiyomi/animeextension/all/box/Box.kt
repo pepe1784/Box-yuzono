@@ -70,27 +70,29 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
-            .also { initNewPipe(it) }
     }
 
     /**
      * Initialize NewPipeExtractor with a Rhino context factory forced to pure
-     * interpreter mode. This avoids Rhino's ClassFileWriter / bytecode generator,
-     * which references Android-missing classes such as java.beans.* and causes
-     * runtime crashes on Aniyomi.
+     * interpreter mode. This is called lazily from addNewPipeVideos() so that
+     * merely loading the extension class never triggers Rhino / NewPipe class
+     * resolution, which can throw LinkageError on Aniyomi/Animetail and prevent
+     * the extension from being registered as installed.
      */
     private fun initNewPipe(httpClient: OkHttpClient) {
         try {
             ContextFactory.initGlobal(RhinoContextFactory)
+        } catch (e: Throwable) {
+            // Already initialized or Rhino classes unavailable; ignore.
+            Log.d(TAG, "Rhino context factory init skipped: ${e.javaClass.simpleName}")
+        }
+        try {
             NewPipe.init(
                 OkHttpDownloader(httpClient),
                 Localization.DEFAULT,
                 ContentCountry.DEFAULT,
             )
-        } catch (e: IllegalStateException) {
-            // Rhino factory already initialized; ignore.
-            Log.d(TAG, "Rhino context factory already initialized")
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e(TAG, "Failed to initialize NewPipe", e)
         }
     }
@@ -521,6 +523,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         headers: Headers,
     ) {
         try {
+            initNewPipe(client)
             val service = ServiceList.YouTube
             val url = "https://www.youtube.com/watch?v=$videoId"
             val info = StreamInfo.getInfo(service, url)
@@ -568,7 +571,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                     }
                 }
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e(TAG, "NewPipeExtractor failed for $videoId", e)
         }
     }
