@@ -1,7 +1,7 @@
 ext {
     extName = 'box'
     extClass = '.Box'
-    extVersionCode = 75
+    extVersionCode = 76
 }
 
 apply plugin: "kei.plugins.extension.legacy"
@@ -23,8 +23,6 @@ android {
 dependencies {
     implementation(project(":lib:playlistutils"))
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.1.5")
-    implementation("com.github.teamnewpipe:NewPipeExtractor:v0.26.4") {
-        exclude group: "org.mozilla", module: "rhino-engine"
-    }
+    implementation("com.github.teamnewpipe:NewPipeExtractor:v0.26.4")
     implementation("org.mozilla:rhino:1.7.14")
 }
