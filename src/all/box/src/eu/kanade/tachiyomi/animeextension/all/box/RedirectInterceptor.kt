@@ -2,50 +2,49 @@ package eu.kanade.tachiyomi.animeextension.all.box
 
 import android.util.Log
 import okhttp3.Interceptor
+import okhttp3.Request
 import okhttp3.Response
 
 /**
- * Network interceptor that follows redirects manually while preserving custom
- * pass headers (X-Box-GoAway-Pass, X-Box-Anubis-Pass) across each hop.
+ * Application interceptor that follows redirects manually.
  *
- * OkHttp's default redirect follower strips application-level headers when it
- * follows a 3xx response, so a challenge interceptor's "pass" header is lost.
- * The next request then hits the challenge again, creating an infinite loop of
- * redirects and causing "ProtocolException: too many follow-up requests".
+ * OkHttp's default redirect follower strips custom headers (e.g. the pass
+ * headers used by GoAwayInterceptor/AnubisInterceptor) when it follows a 3xx
+ * response. Those headers are needed to avoid re-entering the challenge flow on
+ * the next hop, so losing them can create an infinite redirect loop that ends
+ * with "ProtocolException: too many follow-up requests".
  *
- * By following redirects in a network interceptor we keep the same request
- * object (and its headers) for every hop, preventing the loop.
+ * Implemented as an application interceptor so it can call chain.proceed()
+ * multiple times (network interceptors are not allowed to do that). Each
+ * redirect hop re-uses the same request object, keeping its custom headers.
  */
 class RedirectInterceptor : Interceptor {
 
     override fun intercept(chain: Interceptor.Chain): Response {
-        var request = chain.request()
-        var response = chain.proceed(request)
-        var redirects = 0
+        return follow(chain, chain.request(), 0)
+    }
 
-        while (redirects < MAX_REDIRECTS) {
-            val code = response.code
-            if (code !in 300..399) break
-
-            val location = response.header("Location")
-                ?: break
-            val newUrl = response.request.url.resolve(location)
-                ?: break
-
-            Log.d(
-                TAG,
-                "redirect #$redirects ${response.code} ${request.url} -> $newUrl",
+    private fun follow(chain: Interceptor.Chain, request: Request, depth: Int): Response {
+        if (depth > MAX_REDIRECTS) {
+            throw java.net.ProtocolException(
+                "Box: too many manual redirects ($depth) for ${request.url}",
             )
-            response.close()
-
-            request = request.newBuilder()
-                .url(newUrl)
-                .build()
-            response = chain.proceed(request)
-            redirects++
         }
 
-        return response
+        val response = chain.proceed(request)
+        val code = response.code
+        if (code !in 300..399) return response
+
+        val location = response.header("Location") ?: return response
+        val newUrl = request.url.resolve(location) ?: return response
+
+        Log.d(TAG, "redirect #$depth ${request.url} -> $newUrl (code=$code)")
+        response.close()
+
+        val newRequest = request.newBuilder()
+            .url(newUrl)
+            .build()
+        return follow(chain, newRequest, depth + 1)
     }
 
     companion object {

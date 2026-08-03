@@ -56,10 +56,10 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
+            .addInterceptor(RedirectInterceptor())
             .addInterceptor(CaptchaProxyInterceptor())
             .addInterceptor(GoAwayInterceptor())
             .addInterceptor(AnubisInterceptor())
-            .addNetworkInterceptor(RedirectInterceptor())
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
