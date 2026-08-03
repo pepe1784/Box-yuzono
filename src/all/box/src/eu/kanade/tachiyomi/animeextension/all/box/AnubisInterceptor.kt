@@ -4,12 +4,13 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.Cookie
-import okhttp3.CookieJar
 import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
+
+private class AnubisRetryTag(val count: Int)
 
 /**
  * Interceptor that solves the Anubis proof-of-work challenge used by some
@@ -37,6 +38,15 @@ class AnubisInterceptor : Interceptor {
         }
 
         val host = request.url.host
+
+        // Prevent infinite challenge loops if the auth cookie never sticks.
+        val retryCount = request.tag(AnubisRetryTag::class.java)?.count ?: 0
+        if (retryCount >= MAX_RETRIES) {
+            throw Exception(
+                "Anubis: la instancia sigue pidiendo challenge tras $MAX_RETRIES intentos. " +
+                    "Intenta desactivar 'Usar catálogo HTML' o cambia de instancia.",
+            )
+        }
 
         // If we already solved a challenge for this host, inject the auth
         // cookie before the request is sent.
@@ -88,6 +98,7 @@ class AnubisInterceptor : Interceptor {
 
         // Retry the original request with the auth cookie.
         val retryRequest = request.newBuilder()
+            .tag(AnubisRetryTag::class.java, AnubisRetryTag(retryCount + 1))
             .header(PASS_HEADER, "1")
             .apply {
                 authCookies[host]?.let { header("Cookie", it) }
@@ -209,6 +220,7 @@ class AnubisInterceptor : Interceptor {
 
     companion object {
         private const val PASS_HEADER = "X-Box-Anubis-Pass"
+        private const val MAX_RETRIES = 2
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private const val ANUBIS_CHALLENGE_MARKER = "id=\"anubis_challenge\""
