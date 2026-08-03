@@ -3,20 +3,30 @@ package eu.kanade.tachiyomi.animeextension.all.box
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.Cookie
+import okhttp3.CookieJar
 import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Interceptor that solves the Anubis proof-of-work challenge used by some
  * Invidious instances. It detects the challenge HTML, computes the SHA-256
  * Hashcash nonce locally, calls the pass-challenge endpoint and then retries
  * the original request with the resulting authentication cookie.
+ *
+ * The auth cookie is also cached in memory and manually injected as a
+ * "Cookie" header on later requests. This works around Aniyomi/Animetail
+ * CookieJar implementations that drop or ignore cookies with SameSite=None,
+ * which would otherwise cause every request to re-trigger the challenge and
+ * create a redirect loop.
  */
 class AnubisInterceptor : Interceptor {
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+    private val authCookies = ConcurrentHashMap<String, String>()
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -26,7 +36,20 @@ class AnubisInterceptor : Interceptor {
             return chain.proceed(request.newBuilder().removeHeader(PASS_HEADER).build())
         }
 
-        val response = chain.proceed(request)
+        val host = request.url.host
+
+        // If we already solved a challenge for this host, inject the auth
+        // cookie before the request is sent.
+        val authCookie = authCookies[host]
+        val requestWithCookie = if (authCookie != null && request.header("Cookie") == null) {
+            request.newBuilder()
+                .header("Cookie", authCookie)
+                .build()
+        } else {
+            request
+        }
+
+        val response = chain.proceed(requestWithCookie)
         val challenge = response.extractChallenge() ?: return response
 
         response.close()
@@ -59,11 +82,18 @@ class AnubisInterceptor : Interceptor {
             .header(PASS_HEADER, "1")
             .build()
 
-        // The pass-challenge response sets the auth cookie in OkHttp's cookie jar.
-        chain.proceed(passRequest).close()
+        val passResponse = chain.proceed(passRequest)
+        passResponse.extractAuthCookie(host)?.let { authCookies[host] = it }
+        passResponse.close()
 
-        // Retry the original request. The cookie jar now has the auth cookie.
-        return chain.proceed(request)
+        // Retry the original request with the auth cookie.
+        val retryRequest = request.newBuilder()
+            .header(PASS_HEADER, "1")
+            .apply {
+                authCookies[host]?.let { header("Cookie", it) }
+            }
+            .build()
+        return chain.proceed(retryRequest)
     }
 
     private fun Response.extractChallenge(): ChallengeData? {
@@ -73,6 +103,17 @@ class AnubisInterceptor : Interceptor {
         val body = peekBody(CHALLENGE_PEEK_BYTES).string()
         if (!body.contains(ANUBIS_CHALLENGE_MARKER)) return null
         return parseChallenge(body)
+    }
+
+    private fun Response.extractAuthCookie(host: String): String? {
+        val setCookies = headers("Set-Cookie")
+        for (setCookie in setCookies) {
+            val cookie = Cookie.parse(request.url, setCookie) ?: continue
+            if (cookie.name.contains("anubis-auth") && cookie.matches(request.url)) {
+                return "${cookie.name}=${cookie.value}"
+            }
+        }
+        return null
     }
 
     private fun parseChallenge(html: String): ChallengeData? {

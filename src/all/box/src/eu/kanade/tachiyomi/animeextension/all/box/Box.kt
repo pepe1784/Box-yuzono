@@ -56,7 +56,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
-            .cookieJar(MemoryCookieJar())
             .addInterceptor(RedirectInterceptor())
             .addInterceptor(CaptchaProxyInterceptor())
             .addInterceptor(GoAwayInterceptor())
