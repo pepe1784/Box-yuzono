@@ -38,7 +38,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
-import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 class Box : AnimeHttpSource(), ConfigurableAnimeSource {
@@ -140,16 +139,14 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         }
 
         if (useHtmlCatalog) {
-            val encoded = URLEncoder.encode(trimmed, "UTF-8")
             val urlBuilder = "$baseUrl/search".toHttpUrl().newBuilder()
-                .addQueryParameter("q", encoded)
+                .addQueryParameter("q", trimmed)
                 .addQueryParameter("page", page.toString())
             return GET(urlBuilder.build().toString(), htmlHeaders)
         }
 
-        val encoded = URLEncoder.encode(trimmed, "UTF-8")
         val urlBuilder = "$baseUrl/api/v1/search".toHttpUrl().newBuilder()
-            .addQueryParameter("q", encoded)
+            .addQueryParameter("q", trimmed)
             .addQueryParameter("page", page.toString())
 
         val typeFilter = filters.find { it is TypeFilter } as? TypeFilter
