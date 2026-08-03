@@ -49,11 +49,18 @@ class AnubisInterceptor : Interceptor {
         }
 
         // If we already solved a challenge for this host, inject the auth
-        // cookie before the request is sent.
+        // cookie before the request is sent. Combine it with any existing
+        // cookies (e.g. Invidious PREFS) instead of replacing them.
         val authCookie = authCookies[host]
-        val requestWithCookie = if (authCookie != null && request.header("Cookie") == null) {
+        val existingCookies = request.header("Cookie")
+        val requestWithCookie = if (authCookie != null) {
+            val merged = when {
+                existingCookies.isNullOrBlank() -> authCookie
+                existingCookies.contains(authCookie) -> existingCookies
+                else -> "$authCookie; $existingCookies"
+            }
             request.newBuilder()
-                .header("Cookie", authCookie)
+                .header("Cookie", merged)
                 .build()
         } else {
             request
