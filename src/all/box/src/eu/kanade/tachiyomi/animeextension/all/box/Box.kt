@@ -59,6 +59,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             .addInterceptor(CaptchaProxyInterceptor())
             .addInterceptor(GoAwayInterceptor())
             .addInterceptor(AnubisInterceptor())
+            .addNetworkInterceptor(RedirectInterceptor())
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
