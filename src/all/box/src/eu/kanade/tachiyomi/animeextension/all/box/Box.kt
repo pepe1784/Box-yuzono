@@ -316,24 +316,47 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
      * Fetch available caption/subtitle tracks from Invidious.
      * If the captions API is blocked by the instance, return an empty list.
      */
-    private fun fetchCaptions(videoId: String, host: String): List<Track> {
-        return try {
+    private fun fetchCaptions(videoId: String, host: String, doc: Document? = null): List<Track> {
+        val fromApi = try {
             val url = "$host/api/v1/captions/$videoId"
             val resp = client.newCall(GET(url, headers)).execute()
-            val body = resp.use { it.body?.string() } ?: return emptyList()
-            if (resp.code != 200 || body.isBlank()) return emptyList()
-            val parsed = json.decodeFromString<BoxCaptionsResponse>(body)
-            parsed.captions.map { caption ->
-                val absoluteUrl = when {
-                    caption.url.startsWith("http://") || caption.url.startsWith("https://") -> caption.url
-                    caption.url.startsWith("/") -> "$host${caption.url}"
-                    else -> "$host/${caption.url}"
+            val body = resp.use { it.body?.string() } ?: ""
+            if (resp.code == 200 && body.isNotBlank()) {
+                val parsed = json.decodeFromString<BoxCaptionsResponse>(body)
+                parsed.captions.map { caption ->
+                    val absoluteUrl = resolveCaptionUrl(caption.url, host)
+                    Track(absoluteUrl, caption.label)
                 }
-                Track(absoluteUrl, caption.label)
+            } else {
+                emptyList()
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to fetch captions for $videoId", e)
+            Log.e(TAG, "Failed to fetch captions API for $videoId", e)
             emptyList()
+        }
+        if (fromApi.isNotEmpty()) return fromApi
+        return extractCaptionsFromDoc(doc, host)
+    }
+
+    private fun extractCaptionsFromDoc(doc: Document?, host: String): List<Track> {
+        if (doc == null) return emptyList()
+        val tracks = mutableListOf<Track>()
+        doc.select("track[kind=captions], track[kind=subtitles]").forEach { track ->
+            val src = track.attr("src").takeIf { it.isNotBlank() } ?: return@forEach
+            val label = track.attr("label").ifBlank { track.attr("srclang").ifBlank { "Subtitles" } }
+            val absoluteUrl = resolveCaptionUrl(src, host)
+            if (tracks.none { it.url == absoluteUrl }) {
+                tracks += Track(absoluteUrl, label)
+            }
+        }
+        return tracks
+    }
+
+    private fun resolveCaptionUrl(url: String, host: String): String {
+        return when {
+            url.startsWith("http://") || url.startsWith("https://") -> url
+            url.startsWith("/") -> "$host$url"
+            else -> "$host/$url"
         }
     }
 
@@ -344,7 +367,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val check = extractCheck(doc) ?: ""
         val videos = mutableListOf<Video>()
         val seenUrls = mutableSetOf<String>()
-        val subtitleTracks = fetchCaptions(videoId, host)
+        val subtitleTracks = fetchCaptions(videoId, host, doc)
 
         // DASH manifest: parse it directly and expose each video Representation
         // as a Video with its matching audio track(s). Other Yuzono extensions
@@ -496,7 +519,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     private fun parseDashManifestBody(manifest: String, manifestUrl: String, subtitleTracks: List<Track>): List<Video> {
         Log.d(TAG, "parseDashManifestBody: len=${manifest.length}")
 
-        val audioUrls = mutableListOf<String>()
+        val audioTracks = mutableListOf<Track>()
         val videoReps = mutableListOf<DashRep>()
 
         ADAPTATION_SET_REGEX.findAll(manifest).forEach { asMatch ->
@@ -505,6 +528,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                 ?: asAttrs["mimeType"]?.lowercase()
                 ?: ""
             val asBlock = asMatch.groupValues[2]
+            val audioLang = asAttrs["lang"]?.takeIf { it.isNotBlank() }
+                ?: asAttrs["language"]?.takeIf { it.isNotBlank() }
 
             if (!asBlock.contains("<SegmentBase", ignoreCase = true)) return@forEach
 
@@ -525,7 +550,12 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                     ?: return@forEach
 
                 when {
-                    contentType.contains("audio") -> audioUrls += baseUrl
+                    contentType.contains("audio") -> {
+                        val label = buildAudioLabel(audioLang, repAttrs)
+                        if (audioTracks.none { it.url == baseUrl }) {
+                            audioTracks += Track(baseUrl, label)
+                        }
+                    }
                     contentType.contains("video") -> {
                         videoReps += DashRep(
                             url = baseUrl,
@@ -539,10 +569,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             }
         }
 
-        Log.d(TAG, "DASH reps: audio=${audioUrls.size}, video=${videoReps.size}")
+        Log.d(TAG, "DASH reps: audio=${audioTracks.size}, video=${videoReps.size}")
         if (videoReps.isEmpty()) return emptyList()
-
-        val audioTracks = audioUrls.map { Track(it, "Audio") }
 
         val h264 = videoReps.filter { it.codecs.startsWith("avc1") }
         val candidates = if (h264.isNotEmpty()) h264 else videoReps
@@ -555,6 +583,29 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             // Use source headers so Aniyomi/ffmpeg sends Referer/User-Agent when downloading.
             Video(rep.url, label, rep.url, headers, audioTracks = audioTracks, subtitleTracks = subtitleTracks)
         }
+    }
+
+    private fun buildAudioLabel(audioLang: String?, repAttrs: Map<String, String>): String {
+        if (!audioLang.isNullOrBlank()) {
+            val cleanLang = audioLang.trim().lowercase()
+            val display = when (cleanLang) {
+                "en", "eng" -> "English"
+                "es", "spa" -> "Español"
+                "fr", "fra" -> "Français"
+                "de", "deu" -> "Deutsch"
+                "it", "ita" -> "Italiano"
+                "pt", "por" -> "Português"
+                "ja", "jpn" -> "日本語"
+                "ko", "kor" -> "한국어"
+                "ru", "rus" -> "Русский"
+                "zh", "zho", "zh-cn" -> "中文"
+                "ar", "ara" -> "العربية"
+                else -> cleanLang.uppercase()
+            }
+            return display
+        }
+        val bitrate = repAttrs["bandwidth"]?.toLongOrNull()
+        return if (bitrate != null) "Audio ${bitrate / 1000}kbps" else "Audio"
     }
 
     private data class DashRep(
