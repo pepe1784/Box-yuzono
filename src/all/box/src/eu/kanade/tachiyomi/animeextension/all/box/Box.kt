@@ -54,10 +54,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     private val useHtmlCatalog: Boolean
         get() = preferences.getBoolean(PREF_HTML_CATALOG_KEY, PREF_HTML_CATALOG_DEFAULT)
 
-    private val audioMode: String
-        get() = preferences.getString(PREF_AUDIO_MODE_KEY, PREF_AUDIO_MODE_DEFAULT)
-            ?: PREF_AUDIO_MODE_DEFAULT
-
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
             .addInterceptor(CaptchaProxyInterceptor())
@@ -576,14 +572,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         Log.d(TAG, "DASH reps: audio=${audioTracks.size}, video=${videoReps.size}")
         if (videoReps.isEmpty()) return emptyList()
 
-        // In "auto" mode only expose the first audio track so Aniyomi/Animetail
-        // starts playback immediately without waiting for the user to pick one.
-        val effectiveAudioTracks = if (audioMode == PREF_AUDIO_MODE_AUTO && audioTracks.isNotEmpty()) {
-            listOf(audioTracks.first())
-        } else {
-            audioTracks
-        }
-
         val h264 = videoReps.filter { it.codecs.startsWith("avc1") }
         val candidates = if (h264.isNotEmpty()) h264 else videoReps
         val capped = candidates.filter { it.height <= 1080 }
@@ -593,7 +581,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return ordered.map { rep ->
             val label = "DASH ${rep.height}p"
             // Use source headers so Aniyomi/ffmpeg sends Referer/User-Agent when downloading.
-            Video(rep.url, label, rep.url, headers, audioTracks = effectiveAudioTracks, subtitleTracks = subtitleTracks)
+            Video(rep.url, label, rep.url, headers, audioTracks = audioTracks, subtitleTracks = subtitleTracks)
         }
     }
 
@@ -735,18 +723,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             },
         )
 
-        val audioModePref = screen.getListPreference(
-            key = PREF_AUDIO_MODE_KEY,
-            default = PREF_AUDIO_MODE_DEFAULT,
-            title = "Modo de audio DASH",
-            summary = "%s",
-            entries = PREF_AUDIO_MODE_ENTRIES.toList(),
-            entryValues = PREF_AUDIO_MODE_VALUES.toList(),
-            onComplete = { value ->
-                preferences.edit().putString(PREF_AUDIO_MODE_KEY, value).apply()
-            },
-        )
-
         val htmlCatalogPref = screen.getSwitchPreference(
             key = PREF_HTML_CATALOG_KEY,
             default = PREF_HTML_CATALOG_DEFAULT,
@@ -759,7 +735,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
         screen.addPreference(instancePref)
         screen.addPreference(qualityPref)
-        screen.addPreference(audioModePref)
         screen.addPreference(htmlCatalogPref)
     }
 
@@ -936,13 +911,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_HTML_CATALOG_KEY = "use_html_catalog"
         private const val PREF_HTML_CATALOG_DEFAULT = false
-
-        private const val PREF_AUDIO_MODE_KEY = "dash_audio_mode"
-        private const val PREF_AUDIO_MODE_AUTO = "auto"
-        private const val PREF_AUDIO_MODE_MANUAL = "manual"
-        private const val PREF_AUDIO_MODE_DEFAULT = PREF_AUDIO_MODE_AUTO
-        private val PREF_AUDIO_MODE_ENTRIES = arrayOf("Automático (primer audio)", "Manual (todos los audios)")
-        private val PREF_AUDIO_MODE_VALUES = arrayOf(PREF_AUDIO_MODE_AUTO, PREF_AUDIO_MODE_MANUAL)
 
         private val PREF_QUALITY_ENTRIES = arrayOf("DASH", "HD1080", "HD720", "medium", "small")
         private val PREF_QUALITY_VALUES = arrayOf("DASH", "HD1080", "HD720", "medium", "small")
