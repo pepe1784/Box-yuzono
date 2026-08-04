@@ -312,6 +312,31 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return GET("$baseUrl/watch?v=$id", watchHeaders)
     }
 
+    /**
+     * Fetch available caption/subtitle tracks from Invidious.
+     * If the captions API is blocked by the instance, return an empty list.
+     */
+    private fun fetchCaptions(videoId: String, host: String): List<Track> {
+        return try {
+            val url = "$host/api/v1/captions/$videoId"
+            val resp = client.newCall(GET(url, headers)).execute()
+            val body = resp.use { it.body?.string() } ?: return emptyList()
+            if (resp.code != 200 || body.isBlank()) return emptyList()
+            val parsed = json.decodeFromString<BoxCaptionsResponse>(body)
+            parsed.captions.map { caption ->
+                val absoluteUrl = when {
+                    caption.url.startsWith("http://") || caption.url.startsWith("https://") -> caption.url
+                    caption.url.startsWith("/") -> "$host${caption.url}"
+                    else -> "$host/${caption.url}"
+                }
+                Track(absoluteUrl, caption.label)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to fetch captions for $videoId", e)
+            emptyList()
+        }
+    }
+
     override fun videoListParse(response: Response): List<Video> {
         val doc = response.asJsoup()
         val host = response.host
@@ -319,6 +344,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val check = extractCheck(doc) ?: ""
         val videos = mutableListOf<Video>()
         val seenUrls = mutableSetOf<String>()
+        val subtitleTracks = fetchCaptions(videoId, host)
 
         // DASH manifest: parse it directly and expose each video Representation
         // as a Video with its matching audio track(s). Other Yuzono extensions
@@ -342,7 +368,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                 val resp = client.newCall(GET(url, dashHeaders(videoId))).execute()
                 val body = resp.use { it.body?.string() } ?: ""
                 if (resp.code == 200 && body.contains("<MPD", ignoreCase = true)) {
-                    val parsed = parseDashManifestBody(body, url)
+                    val parsed = parseDashManifestBody(body, url, subtitleTracks)
                     if (parsed.isNotEmpty()) {
                         parsed.forEach { video ->
                             val videoUrl = video.videoUrl ?: return@forEach
@@ -392,7 +418,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                     if ("#EXT-X-STREAM-INF" !in playlistBody) {
                         // Single-variant media playlist: pass it directly to ExoPlayer.
                         if (seenUrls.add(url)) {
-                            videos += Video(url, "HLS master ($labelPrefix)", url, headers = hlsHeaders(videoId))
+                            videos += Video(url, "HLS master ($labelPrefix)", url, headers = hlsHeaders(videoId), subtitleTracks = subtitleTracks)
                         }
                         return true
                     }
@@ -407,7 +433,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                     if (hlsVideos.isEmpty()) {
                         videos += Video("", "HLS DEBUG: $labelPrefix extractFromHls empty", "", headers)
                         if (seenUrls.add(url)) {
-                            videos += Video(url, "HLS master ($labelPrefix)", url, headers = hlsHeaders(videoId))
+                            videos += Video(url, "HLS master ($labelPrefix)", url, headers = hlsHeaders(videoId), subtitleTracks = subtitleTracks)
                         }
                         return true
                     }
@@ -440,7 +466,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             val label = source.attr("label").ifBlank { "Video" }
             if (!seenUrls.add(absolute)) return@forEach
             Log.d(TAG, "Adding progressive source: $label")
-            videos += Video(absolute, label, absolute, headers)
+            videos += Video(absolute, label, absolute, headers, subtitleTracks = subtitleTracks)
         }
 
         // Always probe progressive itags so downloads have a direct video URL.
@@ -456,7 +482,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                 }
                 if (head !in 200..399) return@forEach
                 Log.d(TAG, "Adding progressive itag $itag -> $label")
-                videos += Video(url, label, url, headers)
+                videos += Video(url, label, url, headers, subtitleTracks = subtitleTracks)
             }
         }
 
@@ -467,7 +493,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return if (src.startsWith("http")) src else "$host$src"
     }
 
-    private fun parseDashManifestBody(manifest: String, manifestUrl: String): List<Video> {
+    private fun parseDashManifestBody(manifest: String, manifestUrl: String, subtitleTracks: List<Track>): List<Video> {
         Log.d(TAG, "parseDashManifestBody: len=${manifest.length}")
 
         val audioUrls = mutableListOf<String>()
@@ -527,7 +553,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return ordered.map { rep ->
             val label = "DASH ${rep.height}p"
             // Use source headers so Aniyomi/ffmpeg sends Referer/User-Agent when downloading.
-            Video(rep.url, label, rep.url, headers, audioTracks = audioTracks)
+            Video(rep.url, label, rep.url, headers, audioTracks = audioTracks, subtitleTracks = subtitleTracks)
         }
     }
 
@@ -938,6 +964,18 @@ data class BoxFormatStream(
     @SerialName("qualityLabel")
     val qualityLabel: String? = null,
     val height: Int? = null,
+)
+
+@Serializable
+data class BoxCaptionsResponse(
+    val captions: List<BoxCaption> = emptyList(),
+)
+
+@Serializable
+data class BoxCaption(
+    val label: String,
+    val languageCode: String,
+    val url: String,
 )
 
 @Serializable
