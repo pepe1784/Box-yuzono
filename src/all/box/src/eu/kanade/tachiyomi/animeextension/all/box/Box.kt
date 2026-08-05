@@ -54,6 +54,13 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     private val useHtmlCatalog: Boolean
         get() = preferences.getBoolean(PREF_HTML_CATALOG_KEY, PREF_HTML_CATALOG_DEFAULT)
 
+    private val preferredAudioLang: String
+        get() = preferences.getString(PREF_AUDIO_LANG_KEY, PREF_AUDIO_LANG_DEFAULT)
+            ?: PREF_AUDIO_LANG_DEFAULT
+
+    private val fetchSubtitles: Boolean
+        get() = preferences.getBoolean(PREF_SUBTITLES_KEY, PREF_SUBTITLES_DEFAULT)
+
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
             .addInterceptor(CaptchaProxyInterceptor())
@@ -367,7 +374,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val check = extractCheck(doc) ?: ""
         val videos = mutableListOf<Video>()
         val seenUrls = mutableSetOf<String>()
-        val subtitleTracks = fetchCaptions(videoId, host, doc)
+        val subtitleTracks = if (fetchSubtitles) fetchCaptions(videoId, host, doc) else emptyList()
 
         // DASH manifest: parse it directly and expose each video Representation
         // as a Video with its matching audio track(s). Other Yuzono extensions
@@ -572,18 +579,60 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         Log.d(TAG, "DASH reps: audio=${audioTracks.size}, video=${videoReps.size}")
         if (videoReps.isEmpty()) return emptyList()
 
+        val filteredAudios = filterAudioTracks(audioTracks)
+        if (filteredAudios.isEmpty()) return emptyList()
+
         val h264 = videoReps.filter { it.codecs.startsWith("avc1") }
         val candidates = if (h264.isNotEmpty()) h264 else videoReps
         val capped = candidates.filter { it.height <= 1080 }
         val ordered = (if (capped.isNotEmpty()) capped else candidates)
             .sortedByDescending { it.height }
 
-        return ordered.map { rep ->
-            val label = "DASH ${rep.height}p"
-            // Use source headers so Aniyomi/ffmpeg sends Referer/User-Agent when downloading.
-            Video(rep.url, label, rep.url, headers, audioTracks = audioTracks, subtitleTracks = subtitleTracks)
+        return ordered.flatMap { rep ->
+            filteredAudios.map { audio ->
+                val label = buildDashLabel(rep, audio)
+                // Use source headers so Aniyomi/ffmpeg sends Referer/User-Agent when downloading.
+                Video(rep.url, label, rep.url, headers, audioTracks = listOf(audio), subtitleTracks = subtitleTracks)
+            }
         }
     }
+
+    private fun buildDashLabel(rep: DashRep, audio: Track): String {
+        val base = "DASH ${rep.height}p"
+        return if (audio.lang == "Audio" || audio.lang.isBlank()) {
+            base
+        } else {
+            "$base - ${audio.lang}"
+        }
+    }
+
+    private fun filterAudioTracks(audioTracks: List<Track>): List<Track> {
+        return when (preferredAudioLang) {
+            PREF_AUDIO_LANG_ORIGINAL -> audioTracks.take(2)
+            PREF_AUDIO_LANG_ALL -> audioTracks
+            PREF_AUDIO_LANG_ENGLISH -> audioTracks.filter { it.lang.isEnglishLike() }
+            PREF_AUDIO_LANG_SPANISH -> audioTracks.filter { it.lang.isSpanishLike() }
+            PREF_AUDIO_LANG_LATINO -> audioTracks.filter { it.lang.isLatinoLike() }
+            PREF_AUDIO_LANG_JAPANESE -> audioTracks.filter { it.lang.isJapaneseLike() }
+            PREF_AUDIO_LANG_CHINESE -> audioTracks.filter { it.lang.isChineseLike() }
+            else -> audioTracks
+        }
+    }
+
+    private fun String.isEnglishLike(): Boolean =
+        listOf("en", "eng", "english").any { this.contains(it, ignoreCase = true) }
+
+    private fun String.isSpanishLike(): Boolean =
+        listOf("es", "spa", "español", "spanish").any { this.contains(it, ignoreCase = true) }
+
+    private fun String.isLatinoLike(): Boolean =
+        listOf("latino", "latam", "mex", "mx").any { this.contains(it, ignoreCase = true) }
+
+    private fun String.isJapaneseLike(): Boolean =
+        listOf("ja", "jpn", "japanese", "日本語").any { this.contains(it, ignoreCase = true) }
+
+    private fun String.isChineseLike(): Boolean =
+        listOf("zh", "zho", "chinese", "中文").any { this.contains(it, ignoreCase = true) }
 
     private fun buildAudioLabel(audioLang: String?, repAttrs: Map<String, String>): String {
         if (!audioLang.isNullOrBlank()) {
@@ -733,9 +782,33 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             },
         )
 
+        val audioLangPref = screen.getListPreference(
+            key = PREF_AUDIO_LANG_KEY,
+            default = PREF_AUDIO_LANG_DEFAULT,
+            title = "Idioma de audio preferido",
+            summary = "%s",
+            entries = PREF_AUDIO_LANG_ENTRIES.toList(),
+            entryValues = PREF_AUDIO_LANG_VALUES.toList(),
+            onComplete = { value ->
+                preferences.edit().putString(PREF_AUDIO_LANG_KEY, value).apply()
+            },
+        )
+
+        val subtitlesPref = screen.getSwitchPreference(
+            key = PREF_SUBTITLES_KEY,
+            default = PREF_SUBTITLES_DEFAULT,
+            title = "Mapear subtítulos",
+            summary = "Expone los subtítulos/captions del video en el reproductor si la instancia los ofrece.",
+            onComplete = { value ->
+                preferences.edit().putBoolean(PREF_SUBTITLES_KEY, value).apply()
+            },
+        )
+
         screen.addPreference(instancePref)
         screen.addPreference(qualityPref)
         screen.addPreference(htmlCatalogPref)
+        screen.addPreference(audioLangPref)
+        screen.addPreference(subtitlesPref)
     }
 
     // ============================== Helpers ==============================
@@ -911,6 +984,29 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_HTML_CATALOG_KEY = "use_html_catalog"
         private const val PREF_HTML_CATALOG_DEFAULT = false
+
+        private const val PREF_AUDIO_LANG_KEY = "preferred_audio_lang"
+        private const val PREF_AUDIO_LANG_ORIGINAL = "original"
+        private const val PREF_AUDIO_LANG_ALL = "all"
+        private const val PREF_AUDIO_LANG_ENGLISH = "english"
+        private const val PREF_AUDIO_LANG_SPANISH = "spanish"
+        private const val PREF_AUDIO_LANG_LATINO = "latino"
+        private const val PREF_AUDIO_LANG_JAPANESE = "japanese"
+        private const val PREF_AUDIO_LANG_CHINESE = "chinese"
+        private const val PREF_AUDIO_LANG_DEFAULT = PREF_AUDIO_LANG_ORIGINAL
+        private val PREF_AUDIO_LANG_ENTRIES = arrayOf("Original (primeras 2)", "All", "English", "Español", "Latino", "日本語", "中文")
+        private val PREF_AUDIO_LANG_VALUES = arrayOf(
+            PREF_AUDIO_LANG_ORIGINAL,
+            PREF_AUDIO_LANG_ALL,
+            PREF_AUDIO_LANG_ENGLISH,
+            PREF_AUDIO_LANG_SPANISH,
+            PREF_AUDIO_LANG_LATINO,
+            PREF_AUDIO_LANG_JAPANESE,
+            PREF_AUDIO_LANG_CHINESE,
+        )
+
+        private const val PREF_SUBTITLES_KEY = "fetch_subtitles"
+        private const val PREF_SUBTITLES_DEFAULT = true
 
         private val PREF_QUALITY_ENTRIES = arrayOf("DASH", "HD1080", "HD720", "medium", "small")
         private val PREF_QUALITY_VALUES = arrayOf("DASH", "HD1080", "HD720", "medium", "small")
