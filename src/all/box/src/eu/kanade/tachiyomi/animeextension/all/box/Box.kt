@@ -61,6 +61,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     private val fetchSubtitles: Boolean
         get() = preferences.getBoolean(PREF_SUBTITLES_KEY, PREF_SUBTITLES_DEFAULT)
 
+    private var authorFilterQuery: String = ""
+
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
             .addInterceptor(CaptchaProxyInterceptor())
@@ -159,6 +161,9 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val typeFilter = filters.find { it is TypeFilter } as? TypeFilter
         val sortFilter = filters.find { it is SortFilter } as? SortFilter
         val dateFilter = filters.find { it is DateFilter } as? DateFilter
+        val authorFilter = filters.find { it is AuthorFilter } as? AuthorFilter
+
+        authorFilterQuery = authorFilter?.state?.trim()?.lowercase() ?: ""
 
         urlBuilder.addQueryParameter("type", typeFilter?.toValue() ?: "video")
         sortFilter?.toValue()?.let { urlBuilder.addQueryParameter("sort", it) }
@@ -179,7 +184,17 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                 AnimesPage(emptyList(), false)
             }
         }
-        return parseSearchResults(response)
+
+        val page = parseSearchResults(response)
+        val query = authorFilterQuery
+        return if (query.isBlank()) {
+            page
+        } else {
+            AnimesPage(
+                page.animes.filter { it.author?.lowercase()?.contains(query) == true },
+                page.hasNextPage,
+            )
+        }
     }
 
     // =========================== Anime Details ============================
@@ -970,6 +985,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         get() = request.url.run { "$scheme://$host" }
 
     override fun getFilterList() = AnimeFilterList(
+        AuthorFilter(),
         TypeFilter(),
         SortFilter(),
         DateFilter(),
@@ -1164,4 +1180,6 @@ private class DateFilter : AnimeFilter.Select<String>(
         else -> null
     }
 }
+
+private class AuthorFilter : AnimeFilter.Text("Author", "")
 
