@@ -1,10 +1,9 @@
 package eu.kanade.tachiyomi.animeextension.all.box
 
 import android.text.InputType
-import android.util.Base64
 import android.util.Log
-import aniyomi.lib.playlistutils.PlaylistUtils
 import androidx.preference.PreferenceScreen
+import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -31,6 +30,7 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.CookieJar
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -40,7 +40,9 @@ import okhttp3.Response
 import org.jsoup.nodes.Document
 import java.util.concurrent.TimeUnit
 
-class Box : AnimeHttpSource(), ConfigurableAnimeSource {
+class Box :
+    AnimeHttpSource(),
+    ConfigurableAnimeSource {
 
     override val name = "box"
     override val lang = "all"
@@ -65,11 +67,26 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
+            .cookieJar(boxCookieJar)
+            .addInterceptor(RetryServerErrorInterceptor())
             .addInterceptor(CaptchaProxyInterceptor())
             .addInterceptor(GoAwayInterceptor())
-            .addInterceptor(AnubisInterceptor())
+            .addInterceptor(AnubisInterceptor(boxCookieJar, passClient))
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val boxCookieJar = AnubisCookieJar(network.client.cookieJar)
+
+    // Anubis answers pass-challenge with a 302 carrying Set-Cookie; the cookie
+    // would be swallowed by OkHttp's redirect handling, so this client does not
+    // follow redirects.
+    private val passClient: OkHttpClient by lazy {
+        network.client.newBuilder()
+            .cookieJar(CookieJar.NO_COOKIES)
+            .followRedirects(false)
+            .followSslRedirects(false)
             .build()
     }
 
@@ -116,23 +133,21 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
     // ============================== Popular ===============================
 
-    override fun popularAnimeRequest(page: Int): Request =
-        if (useHtmlCatalog) {
-            GET("$baseUrl/feed/trending", htmlHeaders)
-        } else {
-            GET("$baseUrl/api/v1/trending?$FIELDS", headers)
-        }
+    override fun popularAnimeRequest(page: Int): Request = if (useHtmlCatalog) {
+        GET("$baseUrl/feed/trending", htmlHeaders)
+    } else {
+        GET("$baseUrl/api/v1/trending?$FIELDS", headers)
+    }
 
     override fun popularAnimeParse(response: Response): AnimesPage = parseSearchResults(response)
 
     // =============================== Latest ===============================
 
-    override fun latestUpdatesRequest(page: Int): Request =
-        if (useHtmlCatalog) {
-            GET("$baseUrl/feed/trending", htmlHeaders)
-        } else {
-            GET("$baseUrl/api/v1/trending?$FIELDS", headers)
-        }
+    override fun latestUpdatesRequest(page: Int): Request = if (useHtmlCatalog) {
+        GET("$baseUrl/feed/trending", htmlHeaders)
+    } else {
+        GET("$baseUrl/api/v1/trending?$FIELDS", headers)
+    }
 
     override fun latestUpdatesParse(response: Response): AnimesPage = parseSearchResults(response)
 
@@ -248,6 +263,14 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
         val title = doc.selectFirst("meta[property=og:title]")?.attr("content")
             ?: watchData?.title ?: "Unknown"
+
+        // Anubis challenge page or a failed/empty scrape: retry through the API.
+        if (watchData == null && (title.isBlank() || title == "Unknown")) {
+            extractVideoId(requestUrl.toString())?.let { id ->
+                fetchApiVideoDetails(id, host)?.let { return it }
+            }
+        }
+
         val description = doc.selectFirst("meta[property=og:description]")?.attr("content")
         val author = doc.selectFirst("a[href^=/channel/]")?.text()
             ?: doc.selectFirst("meta[name=author]")?.attr("content")
@@ -268,6 +291,39 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                 watchData?.lengthSeconds?.let { appendLine("Duration: ${it}s") }
             }.trim()
             status = SAnime.COMPLETED
+        }
+    }
+
+    private fun fetchApiVideoDetails(videoId: String, host: String): SAnime? {
+        return try {
+            val apiUrl = "$host/api/v1/videos/$videoId?$DETAIL_FIELDS"
+            val resp = client.newCall(GET(apiUrl, headers)).execute()
+            val body = resp.use { if (it.isSuccessful) it.body.string() else "" }
+            if (body.isBlank()) return null
+            val obj = json.parseToJsonElement(body).jsonObject
+            val title = obj["title"]?.jsonPrimitive?.content ?: return null
+            val author = obj["author"]?.jsonPrimitive?.content
+            val description = obj["description"]?.jsonPrimitive?.content
+            SAnime.create().apply {
+                this.title = title
+                url = "$host/watch?v=$videoId"
+                thumbnail_url = "$host/vi/$videoId/mqdefault.jpg"
+                this.author = author
+                this.description = buildString {
+                    if (!description.isNullOrBlank()) {
+                        appendLine(description.replace(Regex("<br\\s*/?>"), "\n").take(800))
+                        appendLine()
+                    }
+                    author?.let { appendLine("Author: $it") }
+                    obj["lengthSeconds"]?.jsonPrimitive?.content?.let {
+                        appendLine("Duration: ${it}s")
+                    }
+                }.trim()
+                status = SAnime.COMPLETED
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchApiVideoDetails failed for $videoId", e)
+            null
         }
     }
 
@@ -324,14 +380,13 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return allVideos
     }
 
-    override fun episodeListParse(response: Response): List<SEpisode> =
-        throw UnsupportedOperationException()
+    override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
 
     // ============================ Video Links =============================
 
     override fun videoListRequest(episode: SEpisode): Request {
         val id = extractVideoId(episode.url) ?: episode.url
-        return GET("$baseUrl/watch?v=$id", watchHeaders)
+        return GET("$baseUrl/api/v1/videos/$id?$DETAIL_FIELDS", headers)
     }
 
     /**
@@ -374,18 +429,56 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return tracks
     }
 
-    private fun resolveCaptionUrl(url: String, host: String): String {
-        return when {
-            url.startsWith("http://") || url.startsWith("https://") -> url
-            url.startsWith("/") -> "$host$url"
-            else -> "$host/$url"
-        }
+    private fun resolveCaptionUrl(url: String, host: String): String = when {
+        url.startsWith("http://") || url.startsWith("https://") -> url
+        url.startsWith("/") -> "$host$url"
+        else -> "$host/$url"
     }
 
     override fun videoListParse(response: Response): List<Video> {
+        val contentType = response.header("Content-Type") ?: ""
+        val videoId = extractVideoId(response.request.url.toString())
+        if (contentType.contains("json", ignoreCase = true)) {
+            val body = response.use { it.body.string() }
+            val fromApi = try {
+                parseApiVideos(body, response.host)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to parse API videos, falling back", e)
+                emptyList()
+            }
+            if (fromApi.isNotEmpty()) return fromApi
+            return videoId?.let { resolveVideos(it, response.host) } ?: emptyList()
+        }
+
+        if (videoId == null) return emptyList()
         val doc = response.asJsoup()
-        val host = response.host
-        val videoId = extractVideoId(response.request.url.toString()) ?: return emptyList()
+        if (doc.select("#anubis_challenge").isNotEmpty()) {
+            return resolveVideos(videoId, response.host)
+        }
+        return parseWatchPageVideos(doc, response.host, videoId)
+    }
+
+    private fun resolveVideos(videoId: String, host: String): List<Video> = fetchApiVideos(videoId, host).ifEmpty { fetchWatchPageVideos(videoId) }
+
+    private fun fetchApiVideos(videoId: String, host: String): List<Video> = try {
+        val resp = client.newCall(GET("$host/api/v1/videos/$videoId?$DETAIL_FIELDS", headers))
+            .execute()
+        val body = resp.use { if (it.isSuccessful) it.body.string() else "" }
+        if (body.isBlank()) emptyList() else parseApiVideos(body, host)
+    } catch (e: Exception) {
+        Log.e(TAG, "fetchApiVideos failed for $videoId", e)
+        emptyList()
+    }
+
+    private fun fetchWatchPageVideos(videoId: String): List<Video> = try {
+        val resp = client.newCall(GET("$baseUrl/watch?v=$videoId", watchHeaders)).execute()
+        resp.use { if (!it.isSuccessful) emptyList() else parseWatchPageVideos(it.asJsoup(), it.host, videoId) }
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to fetch watch page for $videoId", e)
+        emptyList()
+    }
+
+    private fun parseWatchPageVideos(doc: Document, host: String, videoId: String): List<Video> {
         val check = extractCheck(doc) ?: ""
         val videos = mutableListOf<Video>()
         val seenUrls = mutableSetOf<String>()
@@ -442,8 +535,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             if (!ok && dashUrlLocal.isNotBlank()) {
                 addDashVideosFrom(dashUrlLocal, "local")
             }
-        } else {
-            videos += Video("", "DASH DEBUG: empty dashUrl", "", headers)
         }
 
         // HLS fallback: Invidious also exposes an HLS master playlist.
@@ -476,7 +567,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                         videoNameGen = { quality -> "HLS $quality" },
                     )
                     if (hlsVideos.isEmpty()) {
-                        videos += Video("", "HLS DEBUG: $labelPrefix extractFromHls empty", "", headers)
                         if (seenUrls.add(url)) {
                             videos += Video(url, "HLS master ($labelPrefix)", url, headers = hlsHeaders(videoId), subtitleTracks = subtitleTracks)
                         }
@@ -492,7 +582,6 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
                     true
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse HLS playlist $labelPrefix", e)
-                    videos += Video("", "HLS DEBUG: $labelPrefix ${e.javaClass.simpleName}: ${e.message}", "", headers)
                     false
                 }
             }
@@ -534,9 +623,91 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return videos
     }
 
-    private fun buildDashManifestUrl(src: String, host: String): String {
-        return if (src.startsWith("http")) src else "$host$src"
+    private fun parseApiVideos(body: String, host: String): List<Video> {
+        val trimmed = body.trimStart()
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return emptyList()
+        val obj = try {
+            json.parseToJsonElement(body).jsonObject
+        } catch (e: Exception) {
+            Log.e(TAG, "API videos response is not valid JSON", e)
+            return emptyList()
+        }
+        if (obj["videoId"]?.jsonPrimitive?.content.isNullOrBlank()) return emptyList()
+
+        val subtitleTracks = if (fetchSubtitles) {
+            obj["captions"]?.jsonArray?.mapNotNull { el ->
+                val track = el.jsonObject
+                val url = track["url"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                val label = track["label"]?.jsonPrimitive?.content ?: "Subtitles"
+                Track(resolveCaptionUrl(url, host), label)
+            } ?: emptyList()
+        } else {
+            emptyList()
+        }
+
+        val muxed = obj["formatStreams"]?.jsonArray?.mapNotNull { el ->
+            val stream = el.jsonObject
+            val url = stream["url"]?.jsonPrimitive?.content ?: return@mapNotNull null
+            val label = stream["qualityLabel"]?.jsonPrimitive?.content ?: "Video"
+            Video(url, "Muxed $label", url, headers, subtitleTracks = subtitleTracks)
+        } ?: emptyList()
+
+        val videoReps = mutableListOf<DashRep>()
+        val audioTracks = mutableListOf<Track>()
+        obj["adaptiveFormats"]?.jsonArray?.forEach { el ->
+            val format = el.jsonObject
+            val url = format["url"]?.jsonPrimitive?.content ?: return@forEach
+            val mime = format["mimeType"]?.jsonPrimitive?.content?.lowercase() ?: ""
+            when {
+                mime.startsWith("video/") -> {
+                    val height = format["height"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
+                    val width = format["width"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
+                    val codecs = CODEC_REGEX.find(mime)?.groupValues?.getOrNull(1) ?: ""
+                    val bitrate = format["bitrate"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0
+                    videoReps += DashRep(url, height, width, codecs, bitrate)
+                }
+                mime.startsWith("audio/") -> {
+                    val lang = format["audioTrack"]?.jsonObject
+                        ?.get("displayName")?.jsonPrimitive?.content
+                    val label = if (!lang.isNullOrBlank()) lang else "Audio"
+                    if (audioTracks.none { it.url == url }) audioTracks += Track(url, label)
+                }
+            }
+        }
+
+        val filteredAudios = filterAudioTracks(audioTracks)
+        val adaptiveVideos = if (videoReps.isNotEmpty() && filteredAudios.isNotEmpty()) {
+            val h264 = videoReps.filter { it.codecs.startsWith("avc1") }
+            val candidates = if (h264.isNotEmpty()) h264 else videoReps
+            val capped = candidates.filter { it.height <= 1080 }
+            val ordered = (if (capped.isNotEmpty()) capped else candidates)
+                .sortedByDescending { it.height }
+            ordered.flatMap { rep ->
+                filteredAudios.map { audio ->
+                    Video(
+                        rep.url,
+                        buildDashLabel(rep, audio),
+                        rep.url,
+                        headers,
+                        audioTracks = listOf(audio),
+                        subtitleTracks = subtitleTracks,
+                    )
+                }
+            }
+        } else {
+            emptyList()
+        }
+
+        val result = mutableListOf<Video>()
+        val seen = mutableSetOf<String>()
+        (muxed + adaptiveVideos).forEach { video ->
+            val videoUrl = video.videoUrl ?: return@forEach
+            if (seen.add(videoUrl)) result += video
+        }
+        return result
     }
+
+    private fun buildDashManifestUrl(src: String, host: String): String = if (src.startsWith("http")) src else "$host$src"
 
     private fun parseDashManifestBody(manifest: String, manifestUrl: String, subtitleTracks: List<Track>): List<Video> {
         Log.d(TAG, "parseDashManifestBody: len=${manifest.length}")
@@ -621,33 +792,26 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         }
     }
 
-    private fun filterAudioTracks(audioTracks: List<Track>): List<Track> {
-        return when (preferredAudioLang) {
-            PREF_AUDIO_LANG_ORIGINAL -> audioTracks.take(2)
-            PREF_AUDIO_LANG_ALL -> audioTracks
-            PREF_AUDIO_LANG_ENGLISH -> audioTracks.filter { it.lang.isEnglishLike() }
-            PREF_AUDIO_LANG_SPANISH -> audioTracks.filter { it.lang.isSpanishLike() }
-            PREF_AUDIO_LANG_LATINO -> audioTracks.filter { it.lang.isLatinoLike() }
-            PREF_AUDIO_LANG_JAPANESE -> audioTracks.filter { it.lang.isJapaneseLike() }
-            PREF_AUDIO_LANG_CHINESE -> audioTracks.filter { it.lang.isChineseLike() }
-            else -> audioTracks
-        }
+    private fun filterAudioTracks(audioTracks: List<Track>): List<Track> = when (preferredAudioLang) {
+        PREF_AUDIO_LANG_ORIGINAL -> audioTracks.take(2)
+        PREF_AUDIO_LANG_ALL -> audioTracks
+        PREF_AUDIO_LANG_ENGLISH -> audioTracks.filter { it.lang.isEnglishLike() }
+        PREF_AUDIO_LANG_SPANISH -> audioTracks.filter { it.lang.isSpanishLike() }
+        PREF_AUDIO_LANG_LATINO -> audioTracks.filter { it.lang.isLatinoLike() }
+        PREF_AUDIO_LANG_JAPANESE -> audioTracks.filter { it.lang.isJapaneseLike() }
+        PREF_AUDIO_LANG_CHINESE -> audioTracks.filter { it.lang.isChineseLike() }
+        else -> audioTracks
     }
 
-    private fun String.isEnglishLike(): Boolean =
-        listOf("en", "eng", "english").any { this.contains(it, ignoreCase = true) }
+    private fun String.isEnglishLike(): Boolean = listOf("en", "eng", "english").any { this.contains(it, ignoreCase = true) }
 
-    private fun String.isSpanishLike(): Boolean =
-        listOf("es", "spa", "español", "spanish").any { this.contains(it, ignoreCase = true) }
+    private fun String.isSpanishLike(): Boolean = listOf("es", "spa", "español", "spanish").any { this.contains(it, ignoreCase = true) }
 
-    private fun String.isLatinoLike(): Boolean =
-        listOf("latino", "latam", "mex", "mx").any { this.contains(it, ignoreCase = true) }
+    private fun String.isLatinoLike(): Boolean = listOf("latino", "latam", "mex", "mx").any { this.contains(it, ignoreCase = true) }
 
-    private fun String.isJapaneseLike(): Boolean =
-        listOf("ja", "jpn", "japanese", "日本語").any { this.contains(it, ignoreCase = true) }
+    private fun String.isJapaneseLike(): Boolean = listOf("ja", "jpn", "japanese", "日本語").any { this.contains(it, ignoreCase = true) }
 
-    private fun String.isChineseLike(): Boolean =
-        listOf("zh", "zho", "chinese", "中文").any { this.contains(it, ignoreCase = true) }
+    private fun String.isChineseLike(): Boolean = listOf("zh", "zho", "chinese", "中文").any { this.contains(it, ignoreCase = true) }
 
     private fun buildAudioLabel(audioLang: String?, repAttrs: Map<String, String>): String {
         if (!audioLang.isNullOrBlank()) {
@@ -680,17 +844,15 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         val bandwidth: Long,
     )
 
-    private fun resolveManifestUrl(raw: String, manifestUrl: String): String {
-        return when {
-            raw.startsWith("http://") || raw.startsWith("https://") -> raw
-            raw.startsWith("/") -> {
-                val url = manifestUrl.toHttpUrl()
-                "${url.scheme}://${url.host}$raw"
-            }
-            else -> {
-                val base = manifestUrl.substringBeforeLast("/")
-                "$base/$raw"
-            }
+    private fun resolveManifestUrl(raw: String, manifestUrl: String): String = when {
+        raw.startsWith("http://") || raw.startsWith("https://") -> raw
+        raw.startsWith("/") -> {
+            val url = manifestUrl.toHttpUrl()
+            "${url.scheme}://${url.host}$raw"
+        }
+        else -> {
+            val base = manifestUrl.substringBeforeLast("/")
+            "$base/$raw"
         }
     }
 
@@ -730,17 +892,13 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         }
     }
 
-    private fun resolveVideoUrl(url: String): String {
-        return client.newCall(GET(url, watchHeaders)).execute().use {
-            it.request.url.toString()
-        }
+    private fun resolveVideoUrl(url: String): String = client.newCall(GET(url, watchHeaders)).execute().use {
+        it.request.url.toString()
     }
 
-    private fun extractCheck(doc: Document): String? {
-        return doc.select("video#player source").mapNotNull { source ->
-            CHECK_REGEX.find(source.attr("src"))?.groupValues?.getOrNull(1)
-        }.firstOrNull()
-    }
+    private fun extractCheck(doc: Document): String? = doc.select("video#player source").mapNotNull { source ->
+        CHECK_REGEX.find(source.attr("src"))?.groupValues?.getOrNull(1)
+    }.firstOrNull()
 
     override fun List<Video>.sort(): List<Video> {
         val pref = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)
@@ -751,9 +909,7 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         )
     }
 
-    private fun extractHeight(quality: String): Int {
-        return Regex("""(\d+)p""").find(quality)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-    }
+    private fun extractHeight(quality: String): Int = Regex("""(\d+)p""").find(quality)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
     // ============================== Preferences ==============================
 
@@ -959,7 +1115,8 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
     private fun extractVideoId(url: String): String? {
         if (url.startsWith("video:")) return url.substringAfter("video:")
         val patterns = listOf(
-            Regex("""(?:v=|/v/|/embed/|youtu\\.be/)([a-zA-Z0-9_-]{11})"""),
+            Regex("""/api/v1/videos/([a-zA-Z0-9_-]{11})"""),
+            Regex("""(?:v=|/v/|/embed/|youtu\.be/)([a-zA-Z0-9_-]{11})"""),
             Regex("""^([a-zA-Z0-9_-]{11})$"""),
         )
         patterns.forEach { regex ->
@@ -968,17 +1125,13 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
         return null
     }
 
-    private fun String.extractChannelId(): String? {
-        return if (startsWith("channel:")) substringAfter("channel:") else null
-    }
+    private fun String.extractChannelId(): String? = if (startsWith("channel:")) substringAfter("channel:") else null
 
-    private fun fixThumbnail(url: String, host: String): String {
-        return when {
-            url.startsWith("http://inv.") -> url.replace(Regex("""^http://inv\.[^/]+(:3000)?"""), host)
-            url.startsWith("https://inv.") -> url.replace(Regex("""^https://inv\.[^/]+(:3000)?"""), host)
-            url.startsWith("/") -> "$host$url"
-            else -> url
-        }
+    private fun fixThumbnail(url: String, host: String): String = when {
+        url.startsWith("http://inv.") -> url.replace(Regex("""^http://inv\.[^/]+(:3000)?"""), host)
+        url.startsWith("https://inv.") -> url.replace(Regex("""^https://inv\.[^/]+(:3000)?"""), host)
+        url.startsWith("/") -> "$host$url"
+        else -> url
     }
 
     private val Response.host: String
@@ -1039,7 +1192,9 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
             "17" to "small",
         )
 
-        private val CHECK_REGEX = Regex("""check=([A-Za-z0-9_-]+)""")
+        private val CHECK_REGEX = Regex("""check=([A-Za-z0-9_=%+-]+)""")
+
+        private val CODEC_REGEX = Regex("""codecs="([^"]*)"""")
 
         private val ADAPTATION_SET_REGEX = Regex(
             """<AdaptationSet([^>]*)>(.*?)</AdaptationSet>""",
@@ -1053,7 +1208,10 @@ class Box : AnimeHttpSource(), ConfigurableAnimeSource {
 
         private const val FIELDS = "fields=videoId,title,author,lengthSeconds,viewCount,publishedText"
         private const val DETAIL_FIELDS =
-            "fields=videoId,title,description,author,lengthSeconds,viewCount,publishedText,formatStreams,recommendedVideos&local=true"
+            "fields=videoId,title,description,author,lengthSeconds,viewCount,publishedText," +
+                "formatStreams[itag,url,qualityLabel,height]," +
+                "adaptiveFormats[itag,url,qualityLabel,mimeType,height,width,bitrate]," +
+                "captions[label,language_code,url]"
 
         private const val TAG = "Box"
     }
@@ -1149,17 +1307,19 @@ data class BoxWatchData(
     val lengthSeconds: Double? = null,
 )
 
-private class TypeFilter : AnimeFilter.Select<String>(
-    "Tipo",
-    arrayOf("Video", "Channel"),
-) {
+private class TypeFilter :
+    AnimeFilter.Select<String>(
+        "Tipo",
+        arrayOf("Video", "Channel"),
+    ) {
     fun toValue() = if (state == 1) "channel" else "video"
 }
 
-private class SortFilter : AnimeFilter.Select<String>(
-    "Ordenar por",
-    arrayOf("Date (newest)", "Relevance", "Views"),
-) {
+private class SortFilter :
+    AnimeFilter.Select<String>(
+        "Ordenar por",
+        arrayOf("Date (newest)", "Relevance", "Views"),
+    ) {
     fun toValue() = when (state) {
         1 -> "relevance"
         2 -> "views"
@@ -1167,10 +1327,11 @@ private class SortFilter : AnimeFilter.Select<String>(
     }
 }
 
-private class DateFilter : AnimeFilter.Select<String>(
-    "Fecha",
-    arrayOf("Any", "Hour", "Today", "Week", "Month", "Year"),
-) {
+private class DateFilter :
+    AnimeFilter.Select<String>(
+        "Fecha",
+        arrayOf("Any", "Hour", "Today", "Week", "Month", "Year"),
+    ) {
     fun toValue() = when (state) {
         1 -> "hour"
         2 -> "today"
@@ -1182,4 +1343,3 @@ private class DateFilter : AnimeFilter.Select<String>(
 }
 
 private class AuthorFilter : AnimeFilter.Text("Author", "")
-

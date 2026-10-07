@@ -1,7 +1,7 @@
 ext {
     extName = 'box'
     extClass = '.Box'
-    extVersionCode = 92
+    extVersionCode = 93
 }
 
 apply plugin: "kei.plugins.extension.legacy"
