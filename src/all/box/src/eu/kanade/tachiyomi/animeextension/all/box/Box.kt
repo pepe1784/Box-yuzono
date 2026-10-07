@@ -591,11 +591,13 @@ class Box :
         }
 
         // Progressive streams exposed by the player page (HD720, medium, small).
-        // Leave the Invidious redirect URL so Aniyomi/ffmpeg follows it with source headers.
+        // Skip Invidious Companion proxied URLs: the companion endpoint answers 5xx
+        // with an HTML page, breaking the external player with "unexpected '<'".
         doc.select("video#player source").forEach { source ->
             if (source.hasAttr("hidequalityoption")) return@forEach
             if (source.attr("type").contains("dash", ignoreCase = true)) return@forEach
             val src = source.attr("src").takeIf { it.isNotBlank() } ?: return@forEach
+            if (src.contains("/companion/", ignoreCase = true)) return@forEach
             val absolute = if (src.startsWith("http")) src else "$host$src"
             val label = source.attr("label").ifBlank { "Video" }
             if (!seenUrls.add(absolute)) return@forEach
@@ -604,19 +606,30 @@ class Box :
         }
 
         // Always probe progressive itags so downloads have a direct video URL.
-        // Keep the Invidious /latest_version URL; let the downloader follow the redirect.
+        // Resolve the Invidious /latest_version redirect now (Anubis challenge
+        // included) and only keep links that end on a playable, non-Companion host;
+        // the external player cannot solve Anubis or parse a 5xx HTML page itself.
         if (check.isNotBlank()) {
             ITAG_LABELS.forEach { (itag, label) ->
                 val url = "$host/latest_version?id=$videoId&itag=$itag&check=$check"
-                if (!seenUrls.add(url)) return@forEach
-                val head = try {
-                    client.newCall(GET(url, watchHeaders)).execute().use { it.code }
+                val resolved = try {
+                    client.newCall(GET(url, watchHeaders)).execute().use { resp ->
+                        if (resp.code !in 200..399) {
+                            null
+                        } else if (resp.request.url.toString() == url) {
+                            null
+                        } else {
+                            resp.request.url.toString()
+                        }
+                    }
                 } catch (_: Exception) {
-                    -1
+                    null
                 }
-                if (head !in 200..399) return@forEach
-                Log.d(TAG, "Adding progressive itag $itag -> $label")
-                videos += Video(url, label, url, headers, subtitleTracks = subtitleTracks)
+                val playable = resolved?.takeUnless { it.contains("/companion/", ignoreCase = true) }
+                    ?: return@forEach
+                if (!seenUrls.add(playable)) return@forEach
+                Log.d(TAG, "Adding resolved progressive itag $itag -> $label")
+                videos += Video(playable, label, playable, headers, subtitleTracks = subtitleTracks)
             }
         }
 
@@ -657,16 +670,17 @@ class Box :
         obj["adaptiveFormats"]?.jsonArray?.forEach { el ->
             val format = el.jsonObject
             val url = format["url"]?.jsonPrimitive?.content ?: return@forEach
-            val mime = format["mimeType"]?.jsonPrimitive?.content?.lowercase() ?: ""
+            val contentType = (format["type"] ?: format["mimeType"])
+                ?.jsonPrimitive?.content?.lowercase() ?: ""
             when {
-                mime.startsWith("video/") -> {
-                    val height = format["height"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
-                    val width = format["width"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
-                    val codecs = CODEC_REGEX.find(mime)?.groupValues?.getOrNull(1) ?: ""
+                contentType.startsWith("video/") -> {
+                    val itag = format["itag"]?.jsonPrimitive?.content ?: ""
+                    val height = ADAPTIVE_HEIGHTS[itag] ?: 0
                     val bitrate = format["bitrate"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0
-                    videoReps += DashRep(url, height, width, codecs, bitrate)
+                    val codecs = CODEC_REGEX.find(contentType)?.groupValues?.getOrNull(1) ?: ""
+                    videoReps += DashRep(url, height, 0, codecs, bitrate)
                 }
-                mime.startsWith("audio/") -> {
+                contentType.startsWith("audio/") -> {
                     val lang = format["audioTrack"]?.jsonObject
                         ?.get("displayName")?.jsonPrimitive?.content
                     val label = if (!lang.isNullOrBlank()) lang else "Audio"
@@ -784,7 +798,11 @@ class Box :
     }
 
     private fun buildDashLabel(rep: DashRep, audio: Track): String {
-        val base = "DASH ${rep.height}p"
+        val base = if (rep.height > 0) {
+            "DASH ${rep.height}p"
+        } else {
+            "DASH ${rep.bandwidth / 1000}kbps"
+        }
         return if (audio.lang == "Audio" || audio.lang.isBlank()) {
             base
         } else {
@@ -1192,6 +1210,24 @@ class Box :
             "17" to "small",
         )
 
+        private val ADAPTIVE_HEIGHTS = mapOf(
+            "160" to 144,
+            "394" to 144,
+            "133" to 240,
+            "395" to 240,
+            "134" to 360,
+            "396" to 360,
+            "135" to 480,
+            "397" to 480,
+            "136" to 720,
+            "398" to 720,
+            "137" to 1080,
+            "399" to 1080,
+            "298" to 720,
+            "299" to 1080,
+            "140" to 0,
+        )
+
         private val CHECK_REGEX = Regex("""check=([A-Za-z0-9_=%+-]+)""")
 
         private val CODEC_REGEX = Regex("""codecs="([^"]*)"""")
@@ -1210,7 +1246,7 @@ class Box :
         private const val DETAIL_FIELDS =
             "fields=videoId,title,description,author,lengthSeconds,viewCount,publishedText," +
                 "formatStreams[itag,url,qualityLabel,height]," +
-                "adaptiveFormats[itag,url,qualityLabel,mimeType,height,width,bitrate]," +
+                "adaptiveFormats[itag,url,qualityLabel,type,mimeType,height,width,bitrate,audioTrack]," +
                 "captions[label,language_code,url]"
 
         private const val TAG = "Box"
