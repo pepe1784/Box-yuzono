@@ -21,7 +21,9 @@ jobs:
           path: patch
 
       - name: Clone Yuzono extensions source
-        run: git clone --depth 1 https://github.com/yuzono/anime-extensions.git source
+        run: |
+          git clone https://github.com/yuzono/anime-extensions.git source
+          git -C source checkout b505109405dab30604a962be2c5a997eaf8822e3
 
       - name: Decode signing keystore
         run: echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > source/signingkey.jks
