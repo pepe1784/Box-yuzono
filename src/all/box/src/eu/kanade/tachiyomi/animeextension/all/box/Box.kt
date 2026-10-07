@@ -455,7 +455,21 @@ class Box :
         if (doc.select("#anubis_challenge").isNotEmpty()) {
             return resolveVideos(videoId, response.host)
         }
+        throwIfChallenge(doc, response.host)
         return parseWatchPageVideos(doc, response.host, videoId)
+    }
+
+    private fun throwIfChallenge(doc: Document, host: String) {
+        if (doc.title().contains("Human Verification", ignoreCase = true) ||
+            doc.title().contains("gandalf", ignoreCase = true) ||
+            doc.select("cap-widget, #captchaForm, .verifyngo-challenge").isNotEmpty() ||
+            doc.outerHtml().contains("gandalf_id=", ignoreCase = true)
+        ) {
+            throw Exception(
+                "$host is behind a JavaScript captcha (cap.js/Gandalf) that an automated client cannot solve. " +
+                    "Configure the extension to an open Invidious instance instead.",
+            )
+        }
     }
 
     private fun resolveVideos(videoId: String, host: String): List<Video> = fetchApiVideos(videoId, host).ifEmpty { fetchWatchPageVideos(videoId) }
@@ -479,6 +493,7 @@ class Box :
     }
 
     private fun parseWatchPageVideos(doc: Document, host: String, videoId: String): List<Video> {
+        throwIfChallenge(doc, host)
         val check = extractCheck(doc) ?: ""
         val videos = mutableListOf<Video>()
         val seenUrls = mutableSetOf<String>()
