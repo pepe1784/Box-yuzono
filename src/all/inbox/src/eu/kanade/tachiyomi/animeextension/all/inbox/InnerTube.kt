@@ -131,20 +131,17 @@ internal class InnerTube(
             ?: PLAYER_CLIENTS.first()
         val order = listOf(first) + PLAYER_CLIENTS.filter { it.name != first.name }
 
-        val errors = mutableListOf<String>()
-        val body = response.use { it.body?.string() }.orEmpty()
+        var body = response.use { it.body?.string() }.orEmpty()
 
         for ((index, spec) in order.withIndex()) {
             if (index > 0) {
                 body = try {
                     client.newCall(playerRequest(videoId, spec)).execute().use { it.body?.string() }.orEmpty()
                 } catch (e: Exception) {
-                    errors += "${spec.name}: ${e.message}"
                     continue
                 }
             }
             if (body.isBlank()) {
-                errors += "${spec.name}: empty response"
                 continue
             }
             try {
@@ -158,9 +155,7 @@ internal class InnerTube(
                     preferredQuality,
                 )
                 if (videos.isNotEmpty()) return videos
-                errors += "${spec.name}: no usable formats"
             } catch (e: Exception) {
-                errors += "${spec.name}: ${e.message}"
             }
         }
 
@@ -194,8 +189,8 @@ internal class InnerTube(
                 val url = format.str("url") ?: return@mapNotNull null
                 val mime = format.str("mimeType").orEmpty()
                 if (!mime.startsWith("video/")) return@mapNotNull null
-                val height = format.int("height") ?: 0
-                val bitrate = format.int("bitrate") ?: 0
+                val height = parseInt(format.str("height")) ?: 0
+                val bitrate = parseInt(format.str("bitrate")) ?: 0
                 val label = format.str("qualityLabel") ?: if (height > 0) "${height}p" else "Muxed"
                 MuxedRep(height, bitrate, label, url)
             }.sortedWith(compareByDescending<MuxedRep> { it.height }.thenByDescending { it.bitrate })
@@ -211,7 +206,7 @@ internal class InnerTube(
                 val format = element as? JsonObject ?: return@mapNotNull null
                 val url = format.str("url") ?: return@mapNotNull null
                 if (!format.str("mimeType").orEmpty().startsWith("audio/mp4")) return@mapNotNull null
-                val bitrate = format.int("bitrate") ?: 0
+                val bitrate = parseInt(format.str("bitrate")) ?: 0
                 val track = format.obj("audioTrack")
                 val lang = track?.str("languageCode") ?: ""
                 val display = track?.str("displayName")?.takeIf { it.isNotBlank() }
@@ -226,9 +221,9 @@ internal class InnerTube(
                     val url = format.str("url") ?: return@mapNotNull null
                     val mime = format.str("mimeType").orEmpty()
                     if (!mime.startsWith("video/mp4") || !mime.contains("avc1")) return@mapNotNull null
-                    val height = format.int("height") ?: return@mapNotNull null
+                    val height = parseInt(format.str("height")) ?: return@mapNotNull null
                     if (height > 1080) return@mapNotNull null
-                    VideoRep(url, height, format.int("bitrate") ?: 0)
+                    VideoRep(url, height, parseInt(format.str("bitrate")) ?: 0)
                 }.distinctBy { it.height }.sortedByDescending { it.height }
                 for (rep in videoReps) {
                     if (!passesQuality(rep.height, preferredQuality)) continue
@@ -393,6 +388,6 @@ internal fun JsonObject.obj(key: String): JsonObject? = this[key] as? JsonObject
 
 internal fun JsonObject.arr(key: String): JsonArray? = this[key] as? JsonArray
 
-internal fun JsonObject.int(key: String): Int? = (this[key] as? JsonPrimitive)?.intOrNull
+private fun parseInt(s: String?): Int? = s?.toLongOrNull()?.toInt()
 
 private fun String.encodeUrl(): String = java.net.URLEncoder.encode(this, "UTF-8")
