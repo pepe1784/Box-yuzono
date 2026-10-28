@@ -254,8 +254,8 @@ class InBox :
         val context = screen.context
         screen.getPreferenceItem {
             key = PREF_LOGIN_KEY
-            title = "Sign in / Get PoToken (WebView)"
-            summary = "Open YouTube in WebView to capture poToken for DASH"
+            title = "Open YouTube in WebView to get PoToken"
+            summary = "Open YouTube (or a specific video) in WebView and paste poToken below"
             setOnPreferenceClickListener {
                 try {
                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com"))
@@ -269,7 +269,7 @@ class InBox :
         screen.getTextPreference(
             key = PREF_PO_TOKEN_KEY,
             title = "PoToken (paste here)",
-            summary = "Paste poToken captured from WebView or logs",
+            summary = "Paste poToken from YouTube WebView (or network logs). Try opening the video in WebView.",
             default = "",
         )
         screen.getListPreference(

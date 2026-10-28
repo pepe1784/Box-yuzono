@@ -129,10 +129,6 @@ internal class InnerTube(
 
     fun playerRequest(videoId: String, spec: ClientSpec, poToken: String = ""): Request {
         val ctx = context(spec)
-        if (poToken.isNotBlank()) {
-            ctx.obj("client")?.let { clientObj ->
-            }
-        }
         val body = buildJsonObject {
             put("context", ctx)
             put("videoId", videoId)
@@ -141,6 +137,11 @@ internal class InnerTube(
             if (poToken.isNotBlank()) {
                 put("serviceIntegrityDimensions", buildJsonObject {
                     put("poToken", poToken)
+                })
+                put("playbackContext", buildJsonObject {
+                    put("contentPlaybackContext", buildJsonObject {
+                        put("signatureTimestamp", 20057)
+                    })
                 })
             }
         }
@@ -204,6 +205,31 @@ internal class InnerTube(
                 )
                 if (videos.isNotEmpty()) return videos
             } catch (e: Exception) {
+            }
+        }
+
+        if (poToken.isBlank()) {
+            for ((index, spec) in order.withIndex()) {
+                body = try {
+                    client.newCall(playerRequest(videoId, spec, "")).execute().use { it.body?.string() }.orEmpty()
+                } catch (e: Exception) {
+                    continue
+                }
+                if (body.isBlank()) continue
+                try {
+                    val videos = parsePlayer(
+                        JSON.parseToJsonElement(body).jsonObject,
+                        spec,
+                        includeDash,
+                        includeMuxed,
+                        fetchSubtitles,
+                        preferredAudioLang,
+                        preferredSubtitleLang,
+                        preferredQuality,
+                    )
+                    if (videos.isNotEmpty()) return videos
+                } catch (e: Exception) {
+                }
             }
         }
 
