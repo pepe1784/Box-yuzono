@@ -8,7 +8,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import okhttp3.Headers
 import okhttp3.MediaType.Companion.toMediaType
@@ -132,7 +132,7 @@ internal class InnerTube(
         val order = listOf(first) + PLAYER_CLIENTS.filter { it.name != first.name }
 
         val errors = mutableListOf<String>()
-        var body = response.use { it.body?.string() }.orEmpty()
+        val body = response.use { it.body?.string() }.orEmpty()
 
         for ((index, spec) in order.withIndex()) {
             if (index > 0) {
