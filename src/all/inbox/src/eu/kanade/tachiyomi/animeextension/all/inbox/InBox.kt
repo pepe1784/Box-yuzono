@@ -233,6 +233,19 @@ class InBox :
     }
 
     override fun videoListParse(response: Response): List<Video> {
+        val videoId = extractVideoId(response.request.url.toString())
+            ?: response.request.header(InnerTube.HEADER_VIDEO_ID)
+        var token = poToken
+        if (token.isBlank() && videoId != null && includeDash) {
+            token = try {
+                innerTube.fetchWatchPagePoToken(videoId)
+            } catch (e: Exception) {
+                ""
+            }
+            if (token.isNotBlank()) {
+                preferences.edit().putString(PREF_PO_TOKEN_KEY, token).apply()
+            }
+        }
         val videos = innerTube.resolvePlayer(
             response,
             includeDash = includeDash,
@@ -242,7 +255,7 @@ class InBox :
             preferredSubtitleLang = preferredSubtitleLang,
             preferredQuality = preferredQuality,
             preferredClient = preferredClient,
-            poToken = poToken,
+            poToken = token,
         )
         Log.d(TAG, "Resolved ${videos.size} videos")
         return videos

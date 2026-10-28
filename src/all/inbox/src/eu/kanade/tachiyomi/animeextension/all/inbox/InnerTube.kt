@@ -154,6 +154,32 @@ internal class InnerTube(
             .build()
     }
 
+    fun fetchWatchPagePoToken(videoId: String): String {
+        return try {
+            val req = Request.Builder()
+                .url("$BASE_URL/watch?v=$videoId")
+                .header("User-Agent", WEB.userAgent)
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .get()
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val html = resp.body?.string().orEmpty()
+                extractPoToken(html)
+            }
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun extractPoToken(html: String): String {
+        if (html.isBlank()) return ""
+        Regex("\"poToken\"\\s*:\\s*\"([^\"]+)\"").find(html)?.let { return it.groupValues[1] }
+        Regex("'poToken'\\s*:\\s*'([^']+)'").find(html)?.let { return it.groupValues[1] }
+        Regex("poToken=([A-Za-z0-9_-]+)").find(html)?.let { return it.groupValues[1] }
+        return ""
+    }
+
     fun oembedRequest(videoId: String): Request {
         val url = "$OEMBED_URL?url=${"https://www.youtube.com/watch?v=$videoId".encodeUrl()}&format=json"
         return Request.Builder().url(url).headers(apiHeaders(WEB)).get().build()
