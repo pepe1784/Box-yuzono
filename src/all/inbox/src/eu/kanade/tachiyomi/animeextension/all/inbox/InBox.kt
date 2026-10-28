@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.all.inbox
 
-import android.text.InputType
+import android.content.Intent
+import android.net.Uri
 import android.util.Log
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
@@ -16,6 +17,7 @@ import eu.kanade.tachiyomi.network.GET
 import keiyoushi.utils.getListPreference
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.getSwitchPreference
+import keiyoushi.utils.getTextPreference
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
@@ -66,6 +68,9 @@ class InBox :
 
     private val preferredClient: String
         get() = preferences.getString(PREF_CLIENT_KEY, PREF_CLIENT_DEFAULT) ?: PREF_CLIENT_DEFAULT
+
+    private val poToken: String
+        get() = preferences.getString(PREF_PO_TOKEN_KEY, "").orEmpty()
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
@@ -133,13 +138,24 @@ class InBox :
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
-        if (response.request.url.encodedPath.contains("/oembed")) {
+        val path = response.request.url.encodedPath
+        if (path.contains("/oembed")) {
             return AnimesPage(listOf(parseOembed(response)), false)
         }
-        if (response.request.url.encodedPath.contains("/browse")) {
+        if (path.contains("/browse")) {
             return parseBrowse(response)
         }
-        return parseSearch(response)
+        if (path.contains("/search")) {
+            return parseSearch(response)
+        }
+        val body = try { response.use { it.body?.string() } ?: "" } catch (e: Exception) { "" }
+        if (body.contains("\"videoRenderer\"")) {
+            return parseSearch(response)
+        }
+        if (body.contains("\"channelRenderer\"") || body.contains("\"playlistRenderer\"")) {
+            return parseBrowse(response)
+        }
+        return AnimesPage(emptyList(), false)
     }
 
     private fun parseSearch(response: Response): AnimesPage {
@@ -226,6 +242,7 @@ class InBox :
             preferredSubtitleLang = preferredSubtitleLang,
             preferredQuality = preferredQuality,
             preferredClient = preferredClient,
+            poToken = poToken,
         )
         Log.d(TAG, "Resolved ${videos.size} videos")
         return videos
@@ -234,6 +251,27 @@ class InBox :
     // ============================ Settings =============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        val context = screen.context
+        screen.getPreferenceItem {
+            key = PREF_LOGIN_KEY
+            title = "Sign in / Get PoToken (WebView)"
+            summary = "Open YouTube in WebView to capture poToken for DASH"
+            setOnPreferenceClickListener {
+                try {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com"))
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(intent)
+                } catch (e: Exception) {
+                }
+                true
+            }
+        }
+        screen.getTextPreference(
+            key = PREF_PO_TOKEN_KEY,
+            title = "PoToken (paste here)",
+            summary = "Paste poToken captured from WebView or logs",
+            default = "",
+        )
         screen.getListPreference(
             key = PREF_CLIENT_KEY,
             default = PREF_CLIENT_DEFAULT,
@@ -320,6 +358,9 @@ class InBox :
 
     companion object {
         private const val TAG = "INbox"
+
+        private const val PREF_LOGIN_KEY = "pref_login_pot"
+        private const val PREF_PO_TOKEN_KEY = "pref_potoken"
 
         private const val PREF_CLIENT_KEY = "pref_client"
         private const val PREF_CLIENT_DEFAULT = "auto"

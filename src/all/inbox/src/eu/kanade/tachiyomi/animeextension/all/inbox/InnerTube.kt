@@ -95,11 +95,7 @@ internal class InnerTube(
             put("query", query.ifBlank { "trending" })
             put("params", params)
         }
-        return Request.Builder()
-            .url("$API_URL/search?prettyPrint=false")
-            .post(body.toString().toRequestBody(JSON_MEDIA))
-            .headers(apiHeaders(WEB))
-            .build()
+        return Request.Builder().url("$API_URL/search?prettyPrint=false").post(body.toString().toRequestBody(JSON_MEDIA)).headers(apiHeaders(WEB)).build()
     }
 
     fun searchChannelRequest(query: String): Request {
@@ -121,7 +117,7 @@ internal class InnerTube(
     }
 
     fun channelRequest(id: String): Request = browseRequest(id)
-    fun playlistRequest(id: String): Request = browseRequest("VL$id")
+    fun playlistRequest(id: String): Request = browseRequest(if (id.startsWith("VL")) id else "VL$id")
 
     private fun browseRequest(browseId: String): Request {
         val body = buildJsonObject {
@@ -131,12 +127,22 @@ internal class InnerTube(
         return Request.Builder().url("$API_URL/browse?prettyPrint=false").post(body.toString().toRequestBody(JSON_MEDIA)).headers(apiHeaders(WEB)).build()
     }
 
-    fun playerRequest(videoId: String, spec: ClientSpec): Request {
+    fun playerRequest(videoId: String, spec: ClientSpec, poToken: String = ""): Request {
+        val ctx = context(spec)
+        if (poToken.isNotBlank()) {
+            ctx.obj("client")?.let { clientObj ->
+            }
+        }
         val body = buildJsonObject {
-            put("context", context(spec))
+            put("context", ctx)
             put("videoId", videoId)
             put("contentCheckOk", true)
             put("racyCheckOk", true)
+            if (poToken.isNotBlank()) {
+                put("serviceIntegrityDimensions", buildJsonObject {
+                    put("poToken", poToken)
+                })
+            }
         }
         return Request.Builder()
             .url("$API_URL/player?prettyPrint=false")
@@ -161,6 +167,7 @@ internal class InnerTube(
         preferredSubtitleLang: String,
         preferredQuality: String,
         preferredClient: String,
+        poToken: String = "",
     ): List<Video> {
         val videoId = response.request.header(HEADER_VIDEO_ID)
             ?: extractVideoId(response.request.url.toString())
@@ -178,7 +185,7 @@ internal class InnerTube(
         for ((index, spec) in order.withIndex()) {
             if (index > 0) {
                 body = try {
-                    client.newCall(playerRequest(videoId, spec)).execute().use { it.body?.string() }.orEmpty()
+                    client.newCall(playerRequest(videoId, spec, poToken)).execute().use { it.body?.string() }.orEmpty()
                 } catch (e: Exception) {
                     continue
                 }
@@ -325,7 +332,6 @@ internal class InnerTube(
                 "es" -> audio.lang.startsWith("es")
                 "en" -> audio.lang.startsWith("en")
                 "ja" -> audio.lang.startsWith("ja")
-                "original" -> audios.isNotEmpty()
                 else -> true
             }
         }
@@ -359,35 +365,40 @@ internal class InnerTube(
     fun parseSearch(response: Response): List<YouTubeVideo> {
         val body = response.use { it.body?.string() } ?: return emptyList()
         val root = JSON.parseToJsonElement(body)
-        return collectObjects(root, "videoRenderer")
-            .mapNotNull { toVideo(it) }
+        val list = collectObjects(root, "videoRenderer") + collectObjects(root, "gridVideoRenderer") + collectObjects(root, "reelItemRenderer")
+        return list.mapNotNull { toVideo(it) }
             .distinctBy { it.id }
     }
 
     fun parseBrowse(response: Response): List<YouTubeVideo> {
         val body = response.use { it.body?.string() } ?: return emptyList()
         val root = JSON.parseToJsonElement(body)
-        val list = collectObjects(root, "videoRenderer") + collectObjects(root, "gridVideoRenderer")
+        val list = collectObjects(root, "videoRenderer") + collectObjects(root, "gridVideoRenderer") + collectObjects(root, "reelItemRenderer") + collectObjects(root, "playlistRenderer") + collectObjects(root, "channelRenderer")
         return list.mapNotNull { toVideo(it) }.distinctBy { it.id }
     }
 
     private fun toVideo(renderer: JsonObject): YouTubeVideo? {
-        val id = renderer.str("videoId") ?: return null
+        val id = renderer.str("videoId") ?: renderer.obj("videoId")?.str("videoId") ?: renderer.str("playlistId") ?: renderer.str("channelId") ?: return null
         val title = renderer.obj("title").let { titleObj ->
             titleObj?.arr("runs")?.joinToString("") { (it as? JsonObject)?.str("text").orEmpty() }
                 ?.takeIf { it.isNotBlank() }
                 ?: titleObj?.str("simpleText")
+                ?: renderer.obj("headline")?.arr("runs")?.joinToString("") { (it as? JsonObject)?.str("text").orEmpty() }
                 ?: id
         }
         val author = renderer.obj("ownerText")?.arr("runs")?.firstOrNull()
             ?.let { it as? JsonObject }?.str("text")
             ?: renderer.obj("longBylineText")?.arr("runs")?.firstOrNull()
                 ?.let { it as? JsonObject }?.str("text")
+            ?: renderer.obj("shortBylineText")?.arr("runs")?.firstOrNull()
+                ?.let { it as? JsonObject }?.str("text")
             ?: ""
         val thumbnail = renderer.obj("thumbnail")?.arr("thumbnails")?.lastOrNull()
             ?.let { it as? JsonObject }?.str("url")
-            ?: "https://i.ytimg.com/vi/$id/hqdefault.jpg"
-        val duration = renderer.obj("lengthText")?.str("simpleText") ?: ""
+            ?: renderer.obj("richThumbnail")?.obj("movingThumbnailRenderer")?.obj("movingThumbnailDetails")?.arr("thumbnails")?.lastOrNull()
+                ?.let { it as? JsonObject }?.str("url")
+            ?: if (renderer.str("videoId") != null) "https://i.ytimg.com/vi/$id/hqdefault.jpg" else ""
+        val duration = renderer.obj("lengthText")?.str("simpleText") ?: renderer.obj("thumbnailOverlayTimeStatusRenderer")?.str("text") ?: ""
         val published = renderer.obj("publishedTimeText")?.str("simpleText") ?: ""
         return YouTubeVideo(id, title, author, thumbnail, duration, published)
     }
