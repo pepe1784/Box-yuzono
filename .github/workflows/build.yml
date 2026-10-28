@@ -1,4 +1,4 @@
-name: Build box extension
+name: Build box + INbox extensions
 
 on:
   push:
@@ -10,9 +10,33 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+      ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
     steps:
-      - name: Checkout
+      - name: Checkout patch repo
         uses: actions/checkout@v4
+        with:
+          path: patch
+
+      - name: Clone Yuzono extensions source
+        run: |
+          git clone https://github.com/yuzono/anime-extensions.git source
+          git -C source checkout b505109405dab30604a962be2c5a997eaf8822e3
+
+      - name: Decode signing keystore
+        run: echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > source/signingkey.jks
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+
+      - name: Apply extensions
+        run: |
+          cp -r patch/src/all/box source/src/all/box
+          cp -r patch/src/all/inbox source/src/all/inbox
+          mkdir -p source/lib
+          cp -r patch/lib/* source/lib/
+          cp patch/settings.gradle.kts source/settings.gradle.kts
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -22,16 +46,84 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          build-root-directory: source
+          cache-disabled: true
 
-      - name: Build box extension
-        run: ./gradlew :src:all:box:assembleRelease --stacktrace
+      - name: Apply spotless formatting
+        run: ./gradlew spotlessApply
+        working-directory: source
+
+      - name: Build extensions
+        run: ./gradlew :src:all:box:assembleRelease :src:all:inbox:assembleRelease --stacktrace
+        working-directory: source
 
       - name: Prepare repo artifacts
-        run: python .github/scripts/make-index.py
+        run: |
+          python3 - << 'PY'
+          import glob, json, os, re, shutil
+
+          EXTENSIONS = [
+              ("box", "Aniyomi: box", "eu.kanade.tachiyomi.animeextension.all.box", "9134775860771942682", "box"),
+              ("inbox", "Aniyomi: INbox", "eu.kanade.tachiyomi.animeextension.all.inbox", "4883267520314558307", "INbox"),
+          ]
+
+          os.makedirs("patch/repo/apk", exist_ok=True)
+          index = []
+          for folder, label, pkg, source_id, source_name in EXTENSIONS:
+              apks = glob.glob(f"source/src/all/{folder}/build/outputs/apk/release/*.apk")
+              if not apks:
+                  apks = glob.glob(f"source/src/all/{folder}/build/outputs/apk/**/*.apk", recursive=True)
+              if not apks:
+                  raise SystemExit(f"APK not found for {folder}")
+              apk = apks[0]
+              apk_name = os.path.basename(apk)
+              shutil.copy(apk, f"patch/repo/apk/{apk_name}")
+              with open(f"source/src/all/{folder}/build.gradle", encoding="utf-8") as f:
+                  text = f.read()
+              code = int(re.search(r"extVersionCode\s*=\s*(\d+)", text).group(1))
+              index.append({
+                  "name": label,
+                  "pkg": pkg,
+                  "apk": apk_name,
+                  "lang": "all",
+                  "code": code,
+                  "version": f"14.{code}",
+                  "nsfw": 0,
+                  "sources": [{
+                      "name": source_name,
+                      "lang": "all",
+                      "id": source_id,
+                      "baseUrl": "",
+                      "versionId": code,
+                  }],
+              })
+              print("Added", apk_name)
+
+          with open("patch/repo/index.min.json", "w", encoding="utf-8") as f:
+              json.dump(index, f, separators=(",", ":"))
+          repo_json = {
+              "meta": {
+                  "name": "Box Yuzono",
+                  "shortName": "Box Yuzono",
+                  "website": "https://github.com/pepe1784/Box-yuzono",
+                  "signingKeyFingerprint": "6d97a5e3c0638021cd7ae89fb609314895430e4121cb44c62d0a2f57806c4bed"
+              }
+          }
+          with open("patch/repo/repo.json", "w", encoding="utf-8") as f:
+              json.dump(repo_json, f, separators=(",", ":"))
+          print("Generated index.min.json with", len(index), "extensions")
+          PY
 
       - name: Deploy to repo branch
-        uses: JamesIves/github-pages-deploy-action@v4
-        with:
-          branch: repo
-          folder: repo
-          clean: true
+        run: |
+          mkdir -p /tmp/repo-deploy
+          cp -r patch/repo/. /tmp/repo-deploy/
+          cd /tmp/repo-deploy
+          git init
+          git checkout -b repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Update repo"
+          git push -f https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git repo

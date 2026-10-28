@@ -1,0 +1,18 @@
+ext {
+    extName = 'INbox'
+    extClass = '.InBox'
+    extVersionCode = 3
+}
+
+apply plugin: "kei.plugins.extension.legacy"
+
+android {
+    buildTypes {
+        release {
+            proguardFiles(
+                rootProject.file("common/proguard-rules.pro"),
+                file("proguard-rules.pro"),
+            )
+        }
+    }
+}
