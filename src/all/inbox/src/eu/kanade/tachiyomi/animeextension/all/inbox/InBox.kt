@@ -254,8 +254,8 @@ class InBox :
         val context = screen.context
         screen.getPreferenceItem {
             key = PREF_LOGIN_KEY
-            title = "Open YouTube in WebView to get PoToken"
-            summary = "Open YouTube (or a specific video) in WebView and paste poToken below"
+            title = "Open YouTube home in WebView"
+            summary = "Open https://www.youtube.com to get poToken (less reliable)"
             setOnPreferenceClickListener {
                 try {
                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com"))
@@ -267,9 +267,33 @@ class InBox :
             }
         }
         screen.getTextPreference(
+            key = PREF_WATCH_URL_KEY,
+            title = "Video URL/ID to open in WebView",
+            summary = "Paste the exact video URL or ID to open its watch page (best for poToken)",
+            default = "",
+        )
+        screen.getPreferenceItem {
+            key = PREF_OPEN_WATCH_KEY
+            title = "Open pasted video in WebView"
+            summary = "Opens watch?v=... in external WebView. Get poToken from that page"
+            setOnPreferenceClickListener {
+                try {
+                    val raw = preferences.getString(PREF_WATCH_URL_KEY, "") ?: ""
+                    val id = extractVideoId(raw) ?: raw.trim()
+                    if (id.isNotBlank()) {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/watch?v=$id"))
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        context.startActivity(intent)
+                    }
+                } catch (e: Exception) {
+                }
+                true
+            }
+        }
+        screen.getTextPreference(
             key = PREF_PO_TOKEN_KEY,
             title = "PoToken (paste here)",
-            summary = "Paste poToken from YouTube WebView (or network logs). Try opening the video in WebView.",
+            summary = "Paste poToken from the watch page WebView/network logs",
             default = "",
         )
         screen.getListPreference(
@@ -360,6 +384,8 @@ class InBox :
         private const val TAG = "INbox"
 
         private const val PREF_LOGIN_KEY = "pref_login_pot"
+        private const val PREF_WATCH_URL_KEY = "pref_watch_url"
+        private const val PREF_OPEN_WATCH_KEY = "pref_open_watch"
         private const val PREF_PO_TOKEN_KEY = "pref_potoken"
 
         private const val PREF_CLIENT_KEY = "pref_client"

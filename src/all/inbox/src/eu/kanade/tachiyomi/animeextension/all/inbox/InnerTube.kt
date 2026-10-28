@@ -174,12 +174,13 @@ internal class InnerTube(
             ?: extractVideoId(response.request.url.toString())
             ?: throw Exception("INbox: request without a video id")
 
-        val order = when (preferredClient) {
+        val baseOrder = when (preferredClient) {
             "ANDROID" -> listOf(ANDROID, ANDROID_VR, IOS)
             "ANDROID_VR" -> listOf(ANDROID_VR, ANDROID, IOS)
             "IOS" -> listOf(IOS, ANDROID, ANDROID_VR)
             else -> listOf(ANDROID, ANDROID_VR, IOS)
         }
+        val order = if (poToken.isNotBlank()) baseOrder + listOf(WEB) else baseOrder
 
         var body = response.use { it.body?.string() }.orEmpty()
 
