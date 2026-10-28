@@ -1,7 +1,7 @@
 ext {
     extName = 'INbox'
     extClass = '.InBox'
-    extVersionCode = 5
+    extVersionCode = 6
 }
 
 apply plugin: "kei.plugins.extension.legacy"

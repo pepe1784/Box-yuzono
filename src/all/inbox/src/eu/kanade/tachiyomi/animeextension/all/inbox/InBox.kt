@@ -46,6 +46,9 @@ class InBox :
 
     private val preferences by getPreferencesLazy()
 
+    private val includeMuxed: Boolean
+        get() = preferences.getBoolean(PREF_MUXED_KEY, PREF_MUXED_DEFAULT)
+
     private val includeDash: Boolean
         get() = preferences.getBoolean(PREF_DASH_KEY, PREF_DASH_DEFAULT)
 
@@ -121,10 +124,12 @@ class InBox :
         val filterList = if (filters.isNotEmpty()) filters else getFilterList()
         val type = filterList.find { it is TypeFilter } as? TypeFilter
         val sort = filterList.find { it is SortFilter } as? SortFilter
-        if (type?.state?.index == 1 && trimmed.isNotEmpty()) return innerTube.searchChannelRequest(trimmed)
-        if (type?.state?.index == 2 && trimmed.isNotEmpty()) return innerTube.searchPlaylistRequest(trimmed)
+        val typeState = type?.state ?: 0
+        val sortState = sort?.state ?: 0
+        if (typeState == 1 && trimmed.isNotEmpty()) return innerTube.searchChannelRequest(trimmed)
+        if (typeState == 2 && trimmed.isNotEmpty()) return innerTube.searchPlaylistRequest(trimmed)
 
-        return innerTube.searchRequest(trimmed.ifEmpty { "trending" }, sort?.state?.index ?: 0)
+        return innerTube.searchRequest(trimmed.ifEmpty { "trending" }, sortState)
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
