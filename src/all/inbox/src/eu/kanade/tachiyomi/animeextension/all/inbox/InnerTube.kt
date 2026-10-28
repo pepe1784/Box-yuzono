@@ -170,7 +170,7 @@ internal class InnerTube(
             "ANDROID" -> listOf(ANDROID, ANDROID_VR, IOS)
             "ANDROID_VR" -> listOf(ANDROID_VR, ANDROID, IOS)
             "IOS" -> listOf(IOS, ANDROID, ANDROID_VR)
-            else -> PLAYER_CLIENTS
+            else -> listOf(ANDROID, ANDROID_VR, IOS)
         }
 
         var body = response.use { it.body?.string() }.orEmpty()
@@ -352,6 +352,8 @@ internal class InnerTube(
         .add("User-Agent", spec.userAgent)
         .add("Accept", "*/*")
         .add("Accept-Language", "en-US,en;q=0.9")
+        .add("Origin", "https://www.youtube.com")
+        .add("Referer", "https://www.youtube.com/")
         .build()
 
     fun parseSearch(response: Response): List<YouTubeVideo> {
