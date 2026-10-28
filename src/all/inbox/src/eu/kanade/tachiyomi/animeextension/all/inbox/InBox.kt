@@ -1,8 +1,10 @@
 package eu.kanade.tachiyomi.animeextension.all.inbox
 
+import android.text.InputType
 import android.util.Log
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -44,9 +46,6 @@ class InBox :
 
     private val preferences by getPreferencesLazy()
 
-    private val includeMuxed: Boolean
-        get() = preferences.getBoolean(PREF_MUXED_KEY, PREF_MUXED_DEFAULT)
-
     private val includeDash: Boolean
         get() = preferences.getBoolean(PREF_DASH_KEY, PREF_DASH_DEFAULT)
 
@@ -58,6 +57,12 @@ class InBox :
 
     private val preferredAudioLang: String
         get() = preferences.getString(PREF_AUDIO_LANG_KEY, PREF_AUDIO_LANG_DEFAULT) ?: PREF_AUDIO_LANG_DEFAULT
+
+    private val preferredSubtitleLang: String
+        get() = preferences.getString(PREF_SUBTITLE_LANG_KEY, PREF_SUBTITLE_LANG_DEFAULT) ?: PREF_SUBTITLE_LANG_DEFAULT
+
+    private val preferredClient: String
+        get() = preferences.getString(PREF_CLIENT_KEY, PREF_CLIENT_DEFAULT) ?: PREF_CLIENT_DEFAULT
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
@@ -99,14 +104,35 @@ class InBox :
     override fun latestUpdatesParse(response: Response): AnimesPage = popularAnimeParse(response)
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        // Allow pasting a YouTube URL or a bare video id in the search box.
         val videoId = extractVideoId(query)
-        return if (videoId != null) innerTube.oembedRequest(videoId) else innerTube.searchRequest(query.trim())
+        if (videoId != null) return innerTube.oembedRequest(videoId)
+
+        val trimmed = query.trim()
+        if (trimmed.isEmpty() && page == 1) return innerTube.searchRequest("trending")
+        if (trimmed.startsWith("channel:")) {
+            val id = trimmed.removePrefix("channel:").trim()
+            return innerTube.channelRequest(id)
+        }
+        if (trimmed.startsWith("playlist:")) {
+            val id = trimmed.removePrefix("playlist:").trim()
+            return innerTube.playlistRequest(id)
+        }
+
+        val filterList = if (filters.isNotEmpty()) filters else getFilterList()
+        val type = filterList.find { it is TypeFilter } as? TypeFilter
+        val sort = filterList.find { it is SortFilter } as? SortFilter
+        if (type?.state?.index == 1 && trimmed.isNotEmpty()) return innerTube.searchChannelRequest(trimmed)
+        if (type?.state?.index == 2 && trimmed.isNotEmpty()) return innerTube.searchPlaylistRequest(trimmed)
+
+        return innerTube.searchRequest(trimmed.ifEmpty { "trending" }, sort?.state?.index ?: 0)
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
         if (response.request.url.encodedPath.contains("/oembed")) {
             return AnimesPage(listOf(parseOembed(response)), false)
+        }
+        if (response.request.url.encodedPath.contains("/browse")) {
+            return parseBrowse(response)
         }
         return parseSearch(response)
     }
@@ -119,6 +145,16 @@ class InBox :
             emptyList()
         }
         return AnimesPage(videos.map { it.toSAnime() }, false)
+    }
+
+    private fun parseBrowse(response: Response): AnimesPage {
+        val entries = try {
+            innerTube.parseBrowse(response)
+        } catch (e: Exception) {
+            Log.e(TAG, "Browse parse failed", e)
+            emptyList()
+        }
+        return AnimesPage(entries.map { it.toSAnime() }, false)
     }
 
     // ============================= Details =============================
@@ -182,15 +218,25 @@ class InBox :
             includeMuxed = includeMuxed,
             fetchSubtitles = fetchSubtitles,
             preferredAudioLang = preferredAudioLang,
+            preferredSubtitleLang = preferredSubtitleLang,
             preferredQuality = preferredQuality,
+            preferredClient = preferredClient,
         )
-        Log.d(TAG, "Resolved ${videos.size} videos: ${videos.joinToString { it.quality }}")
+        Log.d(TAG, "Resolved ${videos.size} videos")
         return videos
     }
 
     // ============================ Settings =============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        screen.getListPreference(
+            key = PREF_CLIENT_KEY,
+            default = PREF_CLIENT_DEFAULT,
+            title = "Preferred server/client",
+            summary = "%s",
+            entries = PREF_CLIENT_ENTRIES.toList(),
+            entryValues = PREF_CLIENT_VALUES.toList(),
+        )
         screen.getListPreference(
             key = PREF_QUALITY_KEY,
             default = PREF_QUALITY_DEFAULT,
@@ -203,7 +249,7 @@ class InBox :
             key = PREF_MUXED_KEY,
             default = PREF_MUXED_DEFAULT,
             title = "Show muxed streams (video + audio)",
-            summary = "Show formats that already include audio. Usually more reliable.",
+            summary = "Show formats that already include audio.",
         )
         screen.getSwitchPreference(
             key = PREF_DASH_KEY,
@@ -218,6 +264,14 @@ class InBox :
             summary = "Load YouTube caption tracks when available.",
         )
         screen.getListPreference(
+            key = PREF_SUBTITLE_LANG_KEY,
+            default = PREF_SUBTITLE_LANG_DEFAULT,
+            title = "Subtitle language",
+            summary = "%s",
+            entries = PREF_SUBTITLE_LANG_ENTRIES.toList(),
+            entryValues = PREF_SUBTITLE_LANG_VALUES.toList(),
+        )
+        screen.getListPreference(
             key = PREF_AUDIO_LANG_KEY,
             default = PREF_AUDIO_LANG_DEFAULT,
             title = "Preferred audio language",
@@ -226,6 +280,21 @@ class InBox :
             entryValues = PREF_AUDIO_LANG_VALUES.toList(),
         )
     }
+
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
+        TypeFilter(),
+        SortFilter(),
+    )
+
+    private class TypeFilter : AnimeFilter.Select<String>(
+        "Search type",
+        arrayOf("Videos", "Channels", "Playlists"),
+    )
+
+    private class SortFilter : AnimeFilter.Select<String>(
+        "Sort by",
+        arrayOf("Relevance", "Upload date", "View count", "Rating"),
+    )
 
     private fun YouTubeVideo.toSAnime(): SAnime {
         val summary = buildString {
@@ -247,6 +316,11 @@ class InBox :
     companion object {
         private const val TAG = "INbox"
 
+        private const val PREF_CLIENT_KEY = "pref_client"
+        private const val PREF_CLIENT_DEFAULT = "auto"
+        private val PREF_CLIENT_ENTRIES = arrayOf("Auto (ANDROID first)", "ANDROID", "ANDROID_VR", "IOS")
+        private val PREF_CLIENT_VALUES = arrayOf("auto", "ANDROID", "ANDROID_VR", "IOS")
+
         private const val PREF_QUALITY_KEY = "pref_quality"
         private const val PREF_QUALITY_DEFAULT = "auto"
         private val PREF_QUALITY_ENTRIES = arrayOf("Automatic", "1080p", "720p", "480p", "360p")
@@ -260,6 +334,11 @@ class InBox :
 
         private const val PREF_SUBTITLES_KEY = "pref_subs"
         private const val PREF_SUBTITLES_DEFAULT = true
+
+        private const val PREF_SUBTITLE_LANG_KEY = "pref_sub_lang"
+        private const val PREF_SUBTITLE_LANG_DEFAULT = "auto"
+        private val PREF_SUBTITLE_LANG_ENTRIES = arrayOf("Auto", "English", "Spanish", "Japanese", "All")
+        private val PREF_SUBTITLE_LANG_VALUES = arrayOf("auto", "en", "es", "ja", "all")
 
         private const val PREF_AUDIO_LANG_KEY = "pref_audio_lang"
         private const val PREF_AUDIO_LANG_DEFAULT = "original"

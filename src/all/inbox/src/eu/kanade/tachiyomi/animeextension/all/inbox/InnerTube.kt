@@ -80,19 +80,55 @@ internal class InnerTube(
         )
 
         val PLAYER_CLIENTS = listOf(ANDROID, ANDROID_VR, IOS)
+        val ALL_CLIENTS = mapOf("ANDROID" to ANDROID, "ANDROID_VR" to ANDROID_VR, "IOS" to IOS, "WEB" to WEB)
     }
 
-    fun searchRequest(query: String): Request {
+    fun searchRequest(query: String, sort: Int = 0): Request {
+        val params = when (sort) {
+            1 -> "CAISAhAB"
+            2 -> "CAMSAhAB"
+            3 -> "CAESAhAB"
+            else -> "EgIQAQ%3D%3D"
+        }
         val body = buildJsonObject {
             put("context", context(WEB))
             put("query", query.ifBlank { "trending" })
-            put("params", "EgIQAQ%3D%3D")
+            put("params", params)
         }
         return Request.Builder()
             .url("$API_URL/search?prettyPrint=false")
             .post(body.toString().toRequestBody(JSON_MEDIA))
             .headers(apiHeaders(WEB))
             .build()
+    }
+
+    fun searchChannelRequest(query: String): Request {
+        val body = buildJsonObject {
+            put("context", context(WEB))
+            put("query", query)
+            put("params", "EgIQAg%3D%3D")
+        }
+        return Request.Builder().url("$API_URL/search?prettyPrint=false").post(body.toString().toRequestBody(JSON_MEDIA)).headers(apiHeaders(WEB)).build()
+    }
+
+    fun searchPlaylistRequest(query: String): Request {
+        val body = buildJsonObject {
+            put("context", context(WEB))
+            put("query", query)
+            put("params", "EgIQAw%3D%3D")
+        }
+        return Request.Builder().url("$API_URL/search?prettyPrint=false").post(body.toString().toRequestBody(JSON_MEDIA)).headers(apiHeaders(WEB)).build()
+    }
+
+    fun channelRequest(id: String): Request = browseRequest(id)
+    fun playlistRequest(id: String): Request = browseRequest("VL$id")
+
+    private fun browseRequest(browseId: String): Request {
+        val body = buildJsonObject {
+            put("context", context(WEB))
+            put("browseId", browseId)
+        }
+        return Request.Builder().url("$API_URL/browse?prettyPrint=false").post(body.toString().toRequestBody(JSON_MEDIA)).headers(apiHeaders(WEB)).build()
     }
 
     fun playerRequest(videoId: String, spec: ClientSpec): Request {
@@ -122,14 +158,20 @@ internal class InnerTube(
         includeMuxed: Boolean,
         fetchSubtitles: Boolean,
         preferredAudioLang: String,
+        preferredSubtitleLang: String,
         preferredQuality: String,
+        preferredClient: String,
     ): List<Video> {
         val videoId = response.request.header(HEADER_VIDEO_ID)
             ?: extractVideoId(response.request.url.toString())
             ?: throw Exception("INbox: request without a video id")
-        val first = PLAYER_CLIENTS.firstOrNull { it.name == response.request.header(HEADER_CLIENT) }
-            ?: PLAYER_CLIENTS.first()
-        val order = listOf(first) + PLAYER_CLIENTS.filter { it.name != first.name }
+
+        val order = when (preferredClient) {
+            "ANDROID" -> listOf(ANDROID, ANDROID_VR, IOS)
+            "ANDROID_VR" -> listOf(ANDROID_VR, ANDROID, IOS)
+            "IOS" -> listOf(IOS, ANDROID, ANDROID_VR)
+            else -> PLAYER_CLIENTS
+        }
 
         var body = response.use { it.body?.string() }.orEmpty()
 
@@ -141,9 +183,7 @@ internal class InnerTube(
                     continue
                 }
             }
-            if (body.isBlank()) {
-                continue
-            }
+            if (body.isBlank()) continue
             try {
                 val videos = parsePlayer(
                     JSON.parseToJsonElement(body).jsonObject,
@@ -152,6 +192,7 @@ internal class InnerTube(
                     includeMuxed,
                     fetchSubtitles,
                     preferredAudioLang,
+                    preferredSubtitleLang,
                     preferredQuality,
                 )
                 if (videos.isNotEmpty()) return videos
@@ -169,6 +210,7 @@ internal class InnerTube(
         includeMuxed: Boolean,
         fetchSubtitles: Boolean,
         preferredAudioLang: String,
+        preferredSubtitleLang: String,
         preferredQuality: String,
     ): List<Video> {
         val status = json.obj("playabilityStatus")
@@ -180,7 +222,7 @@ internal class InnerTube(
 
         val streamingData = json.obj("streamingData") ?: throw Exception("missing streamingData")
         val streamHeaders = streamHeaders(spec)
-        val subtitles = if (fetchSubtitles) extractSubtitles(json) else emptyList()
+        val subtitles = if (fetchSubtitles) filterSubtitles(extractSubtitles(json), preferredSubtitleLang) else emptyList()
         val videos = mutableListOf<Video>()
 
         if (includeMuxed) {
@@ -209,9 +251,7 @@ internal class InnerTube(
                 val bitrate = parseInt(format.str("bitrate")) ?: 0
                 val track = format.obj("audioTrack")
                 val lang = track?.str("languageCode") ?: ""
-                val display = track?.str("displayName")?.takeIf { it.isNotBlank() }
-                    ?: track?.str("audioIsDefault")?.let { if (it == "true") "Original" else "Audio" }
-                    ?: "Audio"
+                val display = track?.str("displayName")?.takeIf { it.isNotBlank() } ?: if (lang.isNotBlank()) lang else "Audio"
                 AudioRep(url, bitrate, lang.lowercase(Locale.US), display)
             }
             val filteredAudios = filterAudios(audios, preferredAudioLang)
@@ -241,7 +281,7 @@ internal class InnerTube(
             }
         }
 
-        return videos.distinctBy { it.videoUrl to it.quality }
+        return videos.distinctBy { it.videoUrl to it.quality to it.audioTracks.size }
     }
 
     private fun extractSubtitles(json: JsonObject): List<Track> {
@@ -251,12 +291,20 @@ internal class InnerTube(
         return tracks.mapNotNull { element ->
             val track = element as? JsonObject ?: return@mapNotNull null
             val baseUrl = track.str("baseUrl") ?: return@mapNotNull null
+            val lang = track.str("languageCode") ?: ""
             val name = track.obj("name")?.arr("runs")?.joinToString("") { (it as? JsonObject)?.str("text").orEmpty() }
-                ?.takeIf { it.isNotBlank() }
-                ?: track.str("languageCode") ?: "Subtitles"
+                ?.takeIf { it.isNotBlank() } ?: if (lang.isNotBlank()) lang else "Subtitles"
             val url = if (baseUrl.contains("&fmt=") || baseUrl.contains("?fmt=")) baseUrl else "$baseUrl&fmt=vtt"
             Track(url, name)
-        }.distinctBy { it.lang to it.url }
+        }
+    }
+
+    private fun filterSubtitles(tracks: List<Track>, preferredSubtitleLang: String): List<Track> {
+        if (preferredSubtitleLang == "all") return tracks.distinctBy { it.url }
+        if (preferredSubtitleLang == "auto") return tracks.distinctBy { it.url }
+        val filtered = tracks.filter { it.lang.lowercase(Locale.US).startsWith(preferredSubtitleLang) }
+        val result = if (filtered.isNotEmpty()) filtered else tracks
+        return result.distinctBy { it.url }
     }
 
     private fun passesQuality(height: Int, preferredQuality: String): Boolean {
@@ -277,6 +325,7 @@ internal class InnerTube(
                 "es" -> audio.lang.startsWith("es")
                 "en" -> audio.lang.startsWith("en")
                 "ja" -> audio.lang.startsWith("ja")
+                "original" -> audios.isNotEmpty()
                 else -> true
             }
         }
@@ -311,6 +360,13 @@ internal class InnerTube(
         return collectObjects(root, "videoRenderer")
             .mapNotNull { toVideo(it) }
             .distinctBy { it.id }
+    }
+
+    fun parseBrowse(response: Response): List<YouTubeVideo> {
+        val body = response.use { it.body?.string() } ?: return emptyList()
+        val root = JSON.parseToJsonElement(body)
+        val list = collectObjects(root, "videoRenderer") + collectObjects(root, "gridVideoRenderer")
+        return list.mapNotNull { toVideo(it) }.distinctBy { it.id }
     }
 
     private fun toVideo(renderer: JsonObject): YouTubeVideo? {
