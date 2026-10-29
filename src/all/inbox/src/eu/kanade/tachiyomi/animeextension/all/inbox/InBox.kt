@@ -265,100 +265,75 @@ class InBox :
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val context = screen.context
-        screen.getPreferenceItem {
-            key = PREF_LOGIN_KEY
-            title = "Open YouTube home in WebView"
-            summary = "Open https://www.youtube.com to get poToken (less reliable)"
-            setOnPreferenceClickListener {
-                try {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com"))
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(intent)
-                } catch (e: Exception) {
-                }
-                true
-            }
+
+        val poTokenPref = androidx.preference.EditTextPreference(screen.context).apply {
+            key = PREF_PO_TOKEN_KEY
+            title = "PoToken (auto)"
+            summary = "Auto-fetched from watch page if empty"
+            setDefaultValue("")
         }
-        screen.getTextPreference(
-            key = PREF_WATCH_URL_KEY,
-            title = "Video URL/ID to open in WebView",
-            summary = "Paste the exact video URL or ID to open its watch page (best for poToken)",
-            default = "",
-        )
-        screen.getPreferenceItem {
-            key = PREF_OPEN_WATCH_KEY
-            title = "Open pasted video in WebView"
-            summary = "Opens watch?v=... in external WebView. Get poToken from that page"
-            setOnPreferenceClickListener {
-                try {
-                    val raw = preferences.getString(PREF_WATCH_URL_KEY, "") ?: ""
-                    val id = extractVideoId(raw) ?: raw.trim()
-                    if (id.isNotBlank()) {
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/watch?v=$id"))
-                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        context.startActivity(intent)
-                    }
-                } catch (e: Exception) {
-                }
-                true
-            }
+        screen.addPreference(poTokenPref)
+
+        val clientPref = androidx.preference.ListPreference(screen.context).apply {
+            key = PREF_CLIENT_KEY
+            title = "Preferred server/client"
+            entries = PREF_CLIENT_ENTRIES
+            entryValues = PREF_CLIENT_VALUES
+            setDefaultValue(PREF_CLIENT_DEFAULT)
+            summary = "%s"
         }
-        screen.getTextPreference(
-            key = PREF_PO_TOKEN_KEY,
-            title = "PoToken (paste here)",
-            summary = "Paste poToken from the watch page WebView/network logs",
-            default = "",
-        )
-        screen.getListPreference(
-            key = PREF_CLIENT_KEY,
-            default = PREF_CLIENT_DEFAULT,
-            title = "Preferred server/client",
-            summary = "%s",
-            entries = PREF_CLIENT_ENTRIES.toList(),
-            entryValues = PREF_CLIENT_VALUES.toList(),
-        )
-        screen.getListPreference(
-            key = PREF_QUALITY_KEY,
-            default = PREF_QUALITY_DEFAULT,
-            title = "Preferred quality",
-            summary = "%s",
-            entries = PREF_QUALITY_ENTRIES.toList(),
-            entryValues = PREF_QUALITY_VALUES.toList(),
-        )
-        screen.getSwitchPreference(
-            key = PREF_MUXED_KEY,
-            default = PREF_MUXED_DEFAULT,
-            title = "Show muxed streams (video + audio)",
-            summary = "Show formats that already include audio.",
-        )
-        screen.getSwitchPreference(
-            key = PREF_DASH_KEY,
-            default = PREF_DASH_DEFAULT,
-            title = "Show DASH (separate video + audio)",
-            summary = "Show per-resolution DASH entries with audio track selection.",
-        )
-        screen.getSwitchPreference(
-            key = PREF_SUBTITLES_KEY,
-            default = PREF_SUBTITLES_DEFAULT,
-            title = "Fetch subtitles/CC",
-            summary = "Load YouTube caption tracks when available.",
-        )
-        screen.getListPreference(
-            key = PREF_SUBTITLE_LANG_KEY,
-            default = PREF_SUBTITLE_LANG_DEFAULT,
-            title = "Subtitle language",
-            summary = "%s",
-            entries = PREF_SUBTITLE_LANG_ENTRIES.toList(),
-            entryValues = PREF_SUBTITLE_LANG_VALUES.toList(),
-        )
-        screen.getListPreference(
-            key = PREF_AUDIO_LANG_KEY,
-            default = PREF_AUDIO_LANG_DEFAULT,
-            title = "Preferred audio language",
-            summary = "%s",
-            entries = PREF_AUDIO_LANG_ENTRIES.toList(),
-            entryValues = PREF_AUDIO_LANG_VALUES.toList(),
-        )
+        screen.addPreference(clientPref)
+
+        val qualityPref = androidx.preference.ListPreference(screen.context).apply {
+            key = PREF_QUALITY_KEY
+            title = "Preferred quality"
+            entries = PREF_QUALITY_ENTRIES
+            entryValues = PREF_QUALITY_VALUES
+            setDefaultValue(PREF_QUALITY_DEFAULT)
+            summary = "%s"
+        }
+        screen.addPreference(qualityPref)
+
+        val muxedPref = androidx.preference.SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_MUXED_KEY
+            title = "Show muxed streams (video + audio)"
+            setDefaultValue(PREF_MUXED_DEFAULT)
+        }
+        screen.addPreference(muxedPref)
+
+        val dashPref = androidx.preference.SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_DASH_KEY
+            title = "Show DASH (separate video + audio)"
+            setDefaultValue(PREF_DASH_DEFAULT)
+        }
+        screen.addPreference(dashPref)
+
+        val subsPref = androidx.preference.SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SUBTITLES_KEY
+            title = "Fetch subtitles/CC"
+            setDefaultValue(PREF_SUBTITLES_DEFAULT)
+        }
+        screen.addPreference(subsPref)
+
+        val subLangPref = androidx.preference.ListPreference(screen.context).apply {
+            key = PREF_SUBTITLE_LANG_KEY
+            title = "Subtitle language"
+            entries = PREF_SUBTITLE_LANG_ENTRIES
+            entryValues = PREF_SUBTITLE_LANG_VALUES
+            setDefaultValue(PREF_SUBTITLE_LANG_DEFAULT)
+            summary = "%s"
+        }
+        screen.addPreference(subLangPref)
+
+        val audioLangPref = androidx.preference.ListPreference(screen.context).apply {
+            key = PREF_AUDIO_LANG_KEY
+            title = "Preferred audio language"
+            entries = PREF_AUDIO_LANG_ENTRIES
+            entryValues = PREF_AUDIO_LANG_VALUES
+            setDefaultValue(PREF_AUDIO_LANG_DEFAULT)
+            summary = "%s"
+        }
+        screen.addPreference(audioLangPref)
     }
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
