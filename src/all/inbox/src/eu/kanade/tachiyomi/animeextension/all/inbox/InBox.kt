@@ -1,23 +1,20 @@
 package eu.kanade.tachiyomi.animeextension.all.inbox
 
-import android.content.Intent
-import android.net.Uri
 import android.util.Log
-import androidx.preference.EditTextPreference
-import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
-import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
-import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
-import eu.kanade.tachiyomi.network.GET
+import keiyoushi.utils.getListPreference
 import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.getSwitchPreference
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
@@ -28,13 +25,12 @@ import okhttp3.Response
 import java.util.concurrent.TimeUnit
 
 /**
- * INbox: YouTube as an Aniyomi source, talking to InnerTube directly.
+ * INbox: YouTube as an Aniyomi source, talking to the InnerTube API directly.
  *
- * Slice 1 only handles videos with sound: one search hit (or a pasted URL) is
- * one series with a single episode, and the episode resolves to a muxed stream
- * (video + AAC audio) so playback never depends on a separate audio track.
- *
- * DASH (video-only + audioTracks) is available behind an experimental switch.
+ * A search hit can be a video, a playlist or a channel:
+ * - videos are one series with a single episode;
+ * - playlists and channels expand into one episode per video;
+ * - every episode exposes muxed formats plus DASH (separate video + audio).
  */
 class InBox :
     AnimeHttpSource(),
@@ -57,6 +53,9 @@ class InBox :
     private val fetchSubtitles: Boolean
         get() = preferences.getBoolean(PREF_SUBTITLES_KEY, PREF_SUBTITLES_DEFAULT)
 
+    private val verifyStreams: Boolean
+        get() = preferences.getBoolean(PREF_VERIFY_KEY, PREF_VERIFY_DEFAULT)
+
     private val preferredQuality: String
         get() = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT) ?: PREF_QUALITY_DEFAULT
 
@@ -64,13 +63,11 @@ class InBox :
         get() = preferences.getString(PREF_AUDIO_LANG_KEY, PREF_AUDIO_LANG_DEFAULT) ?: PREF_AUDIO_LANG_DEFAULT
 
     private val preferredSubtitleLang: String
-        get() = preferences.getString(PREF_SUBTITLE_LANG_KEY, PREF_SUBTITLE_LANG_DEFAULT) ?: PREF_SUBTITLE_LANG_DEFAULT
+        get() = preferences.getString(PREF_SUBTITLE_LANG_KEY, PREF_SUBTITLE_LANG_DEFAULT)
+            ?: PREF_SUBTITLE_LANG_DEFAULT
 
     private val preferredClient: String
         get() = preferences.getString(PREF_CLIENT_KEY, PREF_CLIENT_DEFAULT) ?: PREF_CLIENT_DEFAULT
-
-    private val poToken: String
-        get() = preferences.getString(PREF_PO_TOKEN_KEY, "").orEmpty()
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
@@ -85,114 +82,125 @@ class InBox :
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    private fun innertubeHeaders(spec: ClientSpec, videoId: String? = null): Headers =
-        headersBuilder().apply {
-            set("User-Agent", spec.userAgent)
-            set("Content-Type", "application/json")
-            set("Accept", "application/json")
-            set("Accept-Language", "en-US,en;q=0.9")
-            set("X-YouTube-Client-Name", spec.id)
-            set("X-YouTube-Client-Version", spec.version)
-            set("X-Goog-Api-Format-Version", "1")
-            set("Origin", InnerTube.BASE_URL)
-            set("Referer", "${InnerTube.BASE_URL}/")
-            add("Cookie", CONSENT_COOKIE)
-            videoId?.let { set(InnerTube.HEADER_VIDEO_ID, it) }
-            set(InnerTube.HEADER_CLIENT, spec.name)
-        }.build()
+    private fun innertubeHeaders(spec: ClientSpec): Headers = headersBuilder().apply {
+        set("User-Agent", spec.userAgent)
+        set("Content-Type", "application/json")
+        set("Accept", "application/json")
+        set("Accept-Language", "en-US,en;q=0.9")
+        set("X-YouTube-Client-Name", spec.id)
+        set("X-YouTube-Client-Version", spec.version)
+        set("Origin", InnerTube.BASE_URL)
+        set("Referer", "${InnerTube.BASE_URL}/")
+        add("Cookie", CONSENT_COOKIE)
+    }.build()
 
     // ============================ Catalog ============================
 
-    override fun popularAnimeRequest(page: Int): Request = innerTube.searchRequest("trending")
+    override fun popularAnimeRequest(page: Int): Request = innerTube.searchRequest("trending", InnerTube.sortParams(2))
 
-    override fun popularAnimeParse(response: Response): AnimesPage = parseSearch(response)
+    override fun popularAnimeParse(response: Response): AnimesPage = parseListing(response)
 
     override fun latestUpdatesRequest(page: Int): Request = popularAnimeRequest(page)
 
     override fun latestUpdatesParse(response: Response): AnimesPage = popularAnimeParse(response)
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val videoId = extractVideoId(query)
-        if (videoId != null) return innerTube.oembedRequest(videoId)
-
         val trimmed = query.trim()
-        if (trimmed.isEmpty() && page == 1) return innerTube.searchRequest("trending")
-        if (trimmed.startsWith("channel:")) {
-            val id = trimmed.removePrefix("channel:").trim()
-            return innerTube.channelRequest(id)
+
+        // Pasted links resolve straight to the matching series/video.
+        extractPlaylistId(trimmed)?.let {
+            return tagged(innerTube.playlistRequest(it), InnerTube.Kind.PLAYLIST, it)
         }
-        if (trimmed.startsWith("playlist:")) {
-            val id = trimmed.removePrefix("playlist:").trim()
-            return innerTube.playlistRequest(id)
+        extractChannelId(trimmed)?.let {
+            return tagged(innerTube.channelVideosRequest(it), InnerTube.Kind.CHANNEL, it)
         }
+        extractVideoId(trimmed)?.let { return innerTube.oembedRequest(it) }
 
         val filterList = if (filters.isNotEmpty()) filters else getFilterList()
-        val type = filterList.find { it is TypeFilter } as? TypeFilter
-        val sort = filterList.find { it is SortFilter } as? SortFilter
-        val typeState = type?.state ?: 0
-        val sortState = sort?.state ?: 0
-        if (typeState == 1 && trimmed.isNotEmpty()) return innerTube.searchChannelRequest(trimmed)
-        if (typeState == 2 && trimmed.isNotEmpty()) return innerTube.searchPlaylistRequest(trimmed)
+        val typeState = (filterList.find { it is TypeFilter } as? TypeFilter)?.state ?: 0
+        val sortState = (filterList.find { it is SortFilter } as? SortFilter)?.state ?: 0
 
-        return innerTube.searchRequest(trimmed.ifEmpty { "trending" }, sortState)
+        val params = when (typeState) {
+            1 -> InnerTube.PARAMS_CHANNELS
+            2 -> InnerTube.PARAMS_PLAYLISTS
+            else -> InnerTube.sortParams(sortState)
+        }
+        return innerTube.searchRequest(trimmed.ifEmpty { "trending" }, params)
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
-        val path = response.request.url.encodedPath
-        if (path.contains("/oembed")) {
+        // A pasted playlist/channel becomes a single series instead of a grid of its videos.
+        val kind = response.request.header(InnerTube.HEADER_TARGET)
+        if (kind != null) {
+            val targetUrl = response.request.header(InnerTube.HEADER_TARGET_URL).orEmpty()
+            val body = response.use { runCatching { it.body.string() }.getOrNull() }.orEmpty()
+            return AnimesPage(listOf(animeFromBody(kind, targetUrl, body)), false)
+        }
+        return parseListing(response)
+    }
+
+    /** Marks a request as belonging to one series so the parsers know what they are reading. */
+    private fun tagged(request: Request, kind: InnerTube.Kind, id: String): Request = request.newBuilder()
+        .header(InnerTube.HEADER_TARGET, kind.name)
+        .header(InnerTube.HEADER_TARGET_URL, InnerTube.Target(kind, id).encode())
+        .build()
+
+    private fun parseListing(response: Response): AnimesPage {
+        if (response.request.url.encodedPath.contains("/oembed")) {
             return AnimesPage(listOf(parseOembed(response)), false)
         }
-        if (path.contains("/browse")) {
-            return parseBrowse(response)
-        }
-        if (path.contains("/search")) {
-            return parseSearch(response)
-        }
-        val body = try { response.use { it.body?.string() } ?: "" } catch (e: Exception) { "" }
-        if (body.contains("\"videoRenderer\"")) {
-            return parseSearch(response)
-        }
-        if (body.contains("\"channelRenderer\"") || body.contains("\"playlistRenderer\"")) {
-            return parseBrowse(response)
-        }
-        return AnimesPage(emptyList(), false)
-    }
-
-    private fun parseSearch(response: Response): AnimesPage {
-        val videos = try {
-            innerTube.parseSearch(response)
+        val body = try {
+            response.use { it.body.string() }.orEmpty()
         } catch (e: Exception) {
-            Log.e(TAG, "Search parse failed", e)
-            emptyList()
+            Log.e(TAG, "Listing body failed", e)
+            ""
         }
-        return AnimesPage(videos.map { it.toSAnime() }, false)
-    }
-
-    private fun parseBrowse(response: Response): AnimesPage {
-        val entries = try {
-            innerTube.parseBrowse(response)
-        } catch (e: Exception) {
-            Log.e(TAG, "Browse parse failed", e)
-            emptyList()
-        }
-        return AnimesPage(entries.map { it.toSAnime() }, false)
+        val listing = innerTube.parseListing(body)
+        if (listing.entries.isEmpty()) Log.d(TAG, "No entries in ${response.request.url.encodedPath}")
+        // Single page: returning hasNextPage=true would re-request page 1 forever.
+        return AnimesPage(listing.entries.map { it.toSAnime() }, false)
     }
 
     // ============================= Details =============================
 
     override fun animeDetailsRequest(anime: SAnime): Request {
-        val videoId = extractVideoId(anime.url) ?: anime.url
-        return innerTube.oembedRequest(videoId)
+        val target = decodeTarget(anime.url)
+        val request = when (target.kind) {
+            InnerTube.Kind.PLAYLIST -> innerTube.playlistRequest(target.id)
+            InnerTube.Kind.CHANNEL -> innerTube.channelVideosRequest(target.id)
+            InnerTube.Kind.VIDEO -> innerTube.oembedRequest(target.id)
+        }
+        return tagged(request, target.kind, target.id)
     }
 
-    override fun animeDetailsParse(response: Response): SAnime = parseOembed(response)
+    override fun animeDetailsParse(response: Response): SAnime {
+        val kind = response.request.header(InnerTube.HEADER_TARGET)
+        if (kind == null || kind == InnerTube.Kind.VIDEO.name) return parseOembed(response)
+
+        val targetUrl = response.request.header(InnerTube.HEADER_TARGET_URL).orEmpty()
+        val body = response.use { runCatching { it.body.string() }.getOrNull() }.orEmpty()
+        return animeFromBody(kind, targetUrl, body)
+    }
+
+    private fun animeFromBody(kind: String, targetUrl: String, body: String): SAnime {
+        val metadata = innerTube.parseMetadata(body)
+        val fallback = decodeTarget(targetUrl).id
+        return SAnime.create().apply {
+            url = targetUrl
+            title = metadata?.title?.takeIf { it.isNotBlank() } ?: fallback
+            author = metadata?.author.orEmpty()
+            thumbnail_url = metadata?.thumbnail.asAbsoluteUrl()
+            description = metadata?.description.orEmpty()
+            genre = if (kind == InnerTube.Kind.CHANNEL.name) "YouTube channel" else "YouTube playlist"
+        }
+    }
 
     private fun parseOembed(response: Response): SAnime {
         val watchUrl = response.request.url.queryParameter("url").orEmpty()
         val videoId = extractVideoId(watchUrl)
             ?: extractVideoId(response.request.url.toString())
             ?: response.request.url.toString()
-        val body = response.use { it.body?.string() }.orEmpty()
+        val body = response.use { it.body.string() }.orEmpty()
         val obj = try {
             json.parseToJsonElement(body).jsonObject
         } catch (e: Exception) {
@@ -201,10 +209,10 @@ class InBox :
         }
         val title = obj.str("title") ?: videoId
         return SAnime.create().apply {
-            url = videoId
+            url = "video:$videoId"
             this.title = title
             author = obj.str("author_name").orEmpty()
-            thumbnail_url = obj.str("thumbnail_url") ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+            thumbnail_url = obj.str("thumbnail_url").asAbsoluteUrl().ifBlank { "https://i.ytimg.com/vi/$videoId/hqdefault.jpg" }
             description = "YouTube video"
             genre = "YouTube"
         }
@@ -213,41 +221,73 @@ class InBox :
     // ============================ Episodes =============================
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
-        val videoId = extractVideoId(anime.url) ?: anime.url
-        return listOf(
-            SEpisode.create().apply {
-                url = videoId
-                name = anime.title.ifBlank { "Video" }
-                episode_number = 1F
-            },
-        )
+        val target = decodeTarget(anime.url)
+        return withContext(Dispatchers.IO) {
+            when (target.kind) {
+                InnerTube.Kind.VIDEO -> listOf(singleEpisode(anime, target.id))
+                InnerTube.Kind.PLAYLIST -> collectEpisodes(innerTube.playlistRequest(target.id))
+                InnerTube.Kind.CHANNEL -> collectEpisodes(innerTube.channelVideosRequest(target.id))
+            }
+        }
     }
 
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
+
+    private fun singleEpisode(anime: SAnime, videoId: String): SEpisode = SEpisode.create().apply {
+        url = videoId
+        name = anime.title.ifBlank { "Video" }
+        episode_number = 1F
+    }
+
+    /** Walks the browse continuations so playlists and channels expose their full listing. */
+    private fun collectEpisodes(firstRequest: Request): List<SEpisode> {
+        val seen = mutableSetOf<String>()
+        val episodes = mutableListOf<SEpisode>()
+        var request: Request? = firstRequest
+        var pages = 0
+
+        while (request != null && pages < MAX_PAGES && episodes.size < MAX_EPISODES) {
+            val listing = try {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        Log.e(TAG, "Episode page HTTP ${response.code}")
+                        null
+                    } else {
+                        innerTube.parseListing(response.body.string().orEmpty())
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Episode page failed", e)
+                null
+            } ?: break
+
+            for (entry in listing.entries) {
+                if (entry.kind != InnerTube.Kind.VIDEO) continue
+                if (!seen.add(entry.id)) continue
+                episodes += SEpisode.create().apply {
+                    url = entry.id
+                    name = entry.title
+                    episode_number = episodes.size + 1F
+                }
+                if (episodes.size >= MAX_EPISODES) break
+            }
+            request = listing.continuation?.let { innerTube.continuationRequest(it) }
+            pages++
+        }
+        Log.d(TAG, "Loaded ${episodes.size} episodes from $pages page(s)")
+        return episodes
+    }
 
     // ============================== Video ==============================
 
     override fun videoListRequest(episode: SEpisode): Request {
         val videoId = extractVideoId(episode.url) ?: episode.url
-        return innerTube.playerRequest(videoId, InnerTube.PLAYER_CLIENTS.first())
+        return innerTube.playerRequest(videoId, InnerTube.playerOrder(preferredClient).first())
     }
 
     override fun videoListParse(response: Response): List<Video> {
-        val videoId = extractVideoId(response.request.url.toString())
-            ?: response.request.header(InnerTube.HEADER_VIDEO_ID)
-        var token = poToken
-        if (token.isBlank() && videoId != null && includeDash) {
-            token = try {
-                innerTube.fetchWatchPagePoToken(videoId)
-            } catch (e: Exception) {
-                ""
-            }
-            if (token.isNotBlank()) {
-                preferences.edit().putString(PREF_PO_TOKEN_KEY, token).apply()
-            }
-        }
         val videos = innerTube.resolvePlayer(
-            response,
+            response = response,
             includeDash = includeDash,
             includeMuxed = includeMuxed,
             fetchSubtitles = fetchSubtitles,
@@ -255,7 +295,7 @@ class InBox :
             preferredSubtitleLang = preferredSubtitleLang,
             preferredQuality = preferredQuality,
             preferredClient = preferredClient,
-            poToken = token,
+            verifyStreams = verifyStreams,
         )
         Log.d(TAG, "Resolved ${videos.size} videos")
         return videos
@@ -264,74 +304,63 @@ class InBox :
     // ============================ Settings =============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        val poTokenPref = EditTextPreference(screen.context).apply {
-            key = PREF_PO_TOKEN_KEY
-            title = "PoToken (auto)"
-            summary = "Auto-fetched from watch page if empty"
-            setDefaultValue("")
-        }
-        screen.addPreference(poTokenPref)
-
-        val clientPref = ListPreference(screen.context).apply {
-            key = PREF_CLIENT_KEY
-            title = "Preferred server/client"
-            entries = PREF_CLIENT_ENTRIES
-            entryValues = PREF_CLIENT_VALUES
-            setDefaultValue(PREF_CLIENT_DEFAULT)
-            summary = "%s"
-        }
-        screen.addPreference(clientPref)
-
-        val qualityPref = ListPreference(screen.context).apply {
-            key = PREF_QUALITY_KEY
-            title = "Preferred quality"
-            entries = PREF_QUALITY_ENTRIES
-            entryValues = PREF_QUALITY_VALUES
-            setDefaultValue(PREF_QUALITY_DEFAULT)
-            summary = "%s"
-        }
-        screen.addPreference(qualityPref)
-
-        val muxedPref = SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_MUXED_KEY
-            title = "Show muxed streams (video + audio)"
-            setDefaultValue(PREF_MUXED_DEFAULT)
-        }
-        screen.addPreference(muxedPref)
-
-        val dashPref = SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_DASH_KEY
-            title = "Show DASH (separate video + audio)"
-            setDefaultValue(PREF_DASH_DEFAULT)
-        }
-        screen.addPreference(dashPref)
-
-        val subsPref = SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_SUBTITLES_KEY
-            title = "Fetch subtitles/CC"
-            setDefaultValue(PREF_SUBTITLES_DEFAULT)
-        }
-        screen.addPreference(subsPref)
-
-        val subLangPref = ListPreference(screen.context).apply {
-            key = PREF_SUBTITLE_LANG_KEY
-            title = "Subtitle language"
-            entries = PREF_SUBTITLE_LANG_ENTRIES
-            entryValues = PREF_SUBTITLE_LANG_VALUES
-            setDefaultValue(PREF_SUBTITLE_LANG_DEFAULT)
-            summary = "%s"
-        }
-        screen.addPreference(subLangPref)
-
-        val audioLangPref = ListPreference(screen.context).apply {
-            key = PREF_AUDIO_LANG_KEY
-            title = "Preferred audio language"
-            entries = PREF_AUDIO_LANG_ENTRIES
-            entryValues = PREF_AUDIO_LANG_VALUES
-            setDefaultValue(PREF_AUDIO_LANG_DEFAULT)
-            summary = "%s"
-        }
-        screen.addPreference(audioLangPref)
+        screen.getListPreference(
+            key = PREF_CLIENT_KEY,
+            default = PREF_CLIENT_DEFAULT,
+            title = "Preferred server/client",
+            summary = "%s",
+            entries = PREF_CLIENT_ENTRIES.toList(),
+            entryValues = PREF_CLIENT_VALUES.toList(),
+        )
+        screen.getListPreference(
+            key = PREF_QUALITY_KEY,
+            default = PREF_QUALITY_DEFAULT,
+            title = "Preferred quality",
+            summary = "%s",
+            entries = PREF_QUALITY_ENTRIES.toList(),
+            entryValues = PREF_QUALITY_VALUES.toList(),
+        )
+        screen.getSwitchPreference(
+            key = PREF_MUXED_KEY,
+            default = PREF_MUXED_DEFAULT,
+            title = "Show muxed streams (video + audio)",
+            summary = "Already combined. Lower resolution, but the most compatible option.",
+        )
+        screen.getSwitchPreference(
+            key = PREF_DASH_KEY,
+            default = PREF_DASH_DEFAULT,
+            title = "Show DASH (separate video + audio)",
+            summary = "Up to 1080p with selectable audio. Needs a player that accepts external audio.",
+        )
+        screen.getSwitchPreference(
+            key = PREF_VERIFY_KEY,
+            default = PREF_VERIFY_DEFAULT,
+            title = "Check streams before playing",
+            summary = "Sends a 2-byte request per format and hides links YouTube answers with 403. " +
+                "Adds about a second when loading an episode.",
+        )
+        screen.getSwitchPreference(
+            key = PREF_SUBTITLES_KEY,
+            default = PREF_SUBTITLES_DEFAULT,
+            title = "Fetch subtitles/CC",
+            summary = "Load YouTube caption tracks when available.",
+        )
+        screen.getListPreference(
+            key = PREF_SUBTITLE_LANG_KEY,
+            default = PREF_SUBTITLE_LANG_DEFAULT,
+            title = "Subtitle language",
+            summary = "%s",
+            entries = PREF_SUBTITLE_LANG_ENTRIES.toList(),
+            entryValues = PREF_SUBTITLE_LANG_VALUES.toList(),
+        )
+        screen.getListPreference(
+            key = PREF_AUDIO_LANG_KEY,
+            default = PREF_AUDIO_LANG_DEFAULT,
+            title = "Preferred audio language",
+            summary = "%s",
+            entries = PREF_AUDIO_LANG_ENTRIES.toList(),
+            entryValues = PREF_AUDIO_LANG_VALUES.toList(),
+        )
     }
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
@@ -339,28 +368,41 @@ class InBox :
         SortFilter(),
     )
 
-    private class TypeFilter : AnimeFilter.Select<String>(
-        "Search type",
-        arrayOf("Videos", "Channels", "Playlists"),
-    )
+    private class TypeFilter :
+        AnimeFilter.Select<String>(
+            "Search type",
+            arrayOf("Videos", "Channels", "Playlists"),
+        )
 
-    private class SortFilter : AnimeFilter.Select<String>(
-        "Sort by",
-        arrayOf("Relevance", "Upload date", "View count", "Rating"),
-    )
+    private class SortFilter :
+        AnimeFilter.Select<String>(
+            "Sort by",
+            arrayOf("Relevance", "Upload date", "View count", "Rating"),
+        )
 
-    private fun YouTubeVideo.toSAnime(): SAnime {
+    /** Some YouTube payloads use protocol-relative URLs, which Coil will not load. */
+    private fun String?.asAbsoluteUrl(): String = when {
+        this == null -> ""
+        startsWith("//") -> "https:$this"
+        else -> this
+    }
+
+    private fun InnerTube.Entry.toSAnime(): SAnime {
+        val prefix = when (kind) {
+            InnerTube.Kind.PLAYLIST -> "YouTube playlist"
+            InnerTube.Kind.CHANNEL -> "YouTube channel"
+            InnerTube.Kind.VIDEO -> "YouTube video"
+        }
         val summary = buildString {
-            append("YouTube video")
-            if (duration.isNotBlank()) append(" · $duration")
-            if (published.isNotBlank()) append(" · $published")
-            if (author.isNotBlank()) append("\n$author")
+            append(prefix)
+            if (description.isNotBlank()) append(" · ").append(description)
+            if (author.isNotBlank()) append("\n").append(author)
         }
         return SAnime.create().apply {
-            url = id
+            url = InnerTube.Target(kind, id).encode()
             title = this@toSAnime.title
             author = this@toSAnime.author
-            thumbnail_url = this@toSAnime.thumbnail
+            thumbnail_url = this@toSAnime.thumbnail.asAbsoluteUrl()
             description = summary
             genre = "YouTube"
         }
@@ -369,10 +411,8 @@ class InBox :
     companion object {
         private const val TAG = "INbox"
 
-        private const val PREF_LOGIN_KEY = "pref_login_pot"
-        private const val PREF_WATCH_URL_KEY = "pref_watch_url"
-        private const val PREF_OPEN_WATCH_KEY = "pref_open_watch"
-        private const val PREF_PO_TOKEN_KEY = "pref_potoken"
+        private const val MAX_PAGES = 5
+        private const val MAX_EPISODES = 200
 
         private const val PREF_CLIENT_KEY = "pref_client"
         private const val PREF_CLIENT_DEFAULT = "auto"
@@ -389,6 +429,9 @@ class InBox :
 
         private const val PREF_DASH_KEY = "pref_dash"
         private const val PREF_DASH_DEFAULT = true
+
+        private const val PREF_VERIFY_KEY = "pref_verify"
+        private const val PREF_VERIFY_DEFAULT = true
 
         private const val PREF_SUBTITLES_KEY = "pref_subs"
         private const val PREF_SUBTITLES_DEFAULT = true

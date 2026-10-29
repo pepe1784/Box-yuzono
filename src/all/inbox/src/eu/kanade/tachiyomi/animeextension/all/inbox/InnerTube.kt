@@ -1,5 +1,6 @@
-﻿package eu.kanade.tachiyomi.animeextension.all.inbox
+package eu.kanade.tachiyomi.animeextension.all.inbox
 
+import android.util.Log
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import kotlinx.serialization.json.Json
@@ -17,18 +18,36 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 internal class InnerTube(
     private val client: OkHttpClient,
     private val apiHeaders: (ClientSpec) -> Headers,
 ) {
     companion object {
+        private const val TAG = "INbox"
+
         const val BASE_URL = "https://www.youtube.com"
         private const val API_URL = "$BASE_URL/youtubei/v1"
         private const val OEMBED_URL = "$BASE_URL/oembed"
 
         const val HEADER_VIDEO_ID = "X-Inbox-Video-Id"
         const val HEADER_CLIENT = "X-Inbox-Client"
+        const val HEADER_TARGET = "X-Inbox-Target"
+        const val HEADER_TARGET_URL = "X-Inbox-Target-Url"
+
+        /** InnerTube search params (base64 protobuf) for the result type. */
+        const val PARAMS_VIDEOS = "EgIQAQ=="
+        const val PARAMS_CHANNELS = "EgIQAg=="
+        const val PARAMS_PLAYLISTS = "EgIQAw=="
+        const val PARAMS_CHANNEL_VIDEOS = "EgZ2aWRlb3PyBgQKAjoA"
+
+        fun sortParams(sort: Int): String = when (sort) {
+            1 -> "CAISAhAB"
+            2 -> "CAMSAhAB"
+            3 -> "CAESAhAB"
+            else -> PARAMS_VIDEOS
+        }
 
         private val JSON = Json { ignoreUnknownKeys = true }
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
@@ -80,110 +99,291 @@ internal class InnerTube(
         )
 
         val PLAYER_CLIENTS = listOf(ANDROID, ANDROID_VR, IOS)
-        val ALL_CLIENTS = mapOf("ANDROID" to ANDROID, "ANDROID_VR" to ANDROID_VR, "IOS" to IOS, "WEB" to WEB)
+
+        fun playerOrder(preferred: String): List<ClientSpec> = when (preferred) {
+            "ANDROID" -> listOf(ANDROID, ANDROID_VR, IOS)
+            "ANDROID_VR" -> listOf(ANDROID_VR, ANDROID, IOS)
+            "IOS" -> listOf(IOS, ANDROID, ANDROID_VR)
+            else -> listOf(ANDROID, ANDROID_VR, IOS)
+        }
     }
 
-    fun searchRequest(query: String, sort: Int = 0): Request {
-        val params = when (sort) {
-            1 -> "CAISAhAB"
-            2 -> "CAMSAhAB"
-            3 -> "CAESAhAB"
-            else -> "EgIQAQ%3D%3D"
-        }
+    /** The piece of the app the player will call next: a single video, a playlist or a channel. */
+    internal enum class Kind { VIDEO, PLAYLIST, CHANNEL }
+
+    internal data class Target(val kind: Kind, val id: String)
+
+    internal data class Entry(
+        val id: String,
+        val kind: Kind,
+        val title: String,
+        val author: String,
+        val thumbnail: String,
+        val description: String,
+    )
+
+    internal data class Listing(val entries: List<Entry>, val continuation: String?)
+
+    internal data class Metadata(val title: String, val author: String, val thumbnail: String, val description: String)
+
+    private val probeClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .callTimeout(6, TimeUnit.SECONDS)
+            .build()
+    }
+
+    // ============================== Requests ==============================
+
+    fun searchRequest(query: String, params: String = PARAMS_VIDEOS): Request {
         val body = buildJsonObject {
             put("context", context(WEB))
             put("query", query.ifBlank { "trending" })
             put("params", params)
         }
-        return Request.Builder().url("$API_URL/search?prettyPrint=false").post(body.toString().toRequestBody(JSON_MEDIA)).headers(apiHeaders(WEB)).build()
+        return post("$API_URL/search?prettyPrint=false", body, apiHeaders(WEB))
     }
 
-    fun searchChannelRequest(query: String): Request {
-        val body = buildJsonObject {
-            put("context", context(WEB))
-            put("query", query)
-            put("params", "EgIQAg%3D%3D")
-        }
-        return Request.Builder().url("$API_URL/search?prettyPrint=false").post(body.toString().toRequestBody(JSON_MEDIA)).headers(apiHeaders(WEB)).build()
-    }
-
-    fun searchPlaylistRequest(query: String): Request {
-        val body = buildJsonObject {
-            put("context", context(WEB))
-            put("query", query)
-            put("params", "EgIQAw%3D%3D")
-        }
-        return Request.Builder().url("$API_URL/search?prettyPrint=false").post(body.toString().toRequestBody(JSON_MEDIA)).headers(apiHeaders(WEB)).build()
-    }
-
-    fun channelRequest(id: String): Request = browseRequest(id)
-    fun playlistRequest(id: String): Request = browseRequest(if (id.startsWith("VL")) id else "VL$id")
-
-    private fun browseRequest(browseId: String): Request {
+    fun browseRequest(browseId: String, params: String? = null): Request {
         val body = buildJsonObject {
             put("context", context(WEB))
             put("browseId", browseId)
+            if (params != null) put("params", params)
         }
-        return Request.Builder().url("$API_URL/browse?prettyPrint=false").post(body.toString().toRequestBody(JSON_MEDIA)).headers(apiHeaders(WEB)).build()
+        return post("$API_URL/browse?prettyPrint=false", body, apiHeaders(WEB))
     }
 
-    fun playerRequest(videoId: String, spec: ClientSpec, poToken: String = ""): Request {
-        val ctx = context(spec)
+    fun playlistRequest(playlistId: String): Request = browseRequest(if (playlistId.startsWith("VL")) playlistId else "VL$playlistId")
+
+    fun channelVideosRequest(channelId: String): Request = browseRequest(channelId, PARAMS_CHANNEL_VIDEOS)
+
+    fun continuationRequest(token: String): Request {
         val body = buildJsonObject {
-            put("context", ctx)
+            put("context", context(WEB))
+            put("continuation", token)
+        }
+        return post("$API_URL/browse?prettyPrint=false", body, apiHeaders(WEB))
+    }
+
+    fun playerRequest(videoId: String, spec: ClientSpec): Request {
+        val body = buildJsonObject {
+            put("context", context(spec))
             put("videoId", videoId)
             put("contentCheckOk", true)
             put("racyCheckOk", true)
-            if (poToken.isNotBlank()) {
-                put("serviceIntegrityDimensions", buildJsonObject {
-                    put("poToken", poToken)
-                })
-                put("playbackContext", buildJsonObject {
-                    put("contentPlaybackContext", buildJsonObject {
-                        put("signatureTimestamp", 20057)
-                    })
-                })
-            }
+            put(
+                "playbackContext",
+                buildJsonObject {
+                    put(
+                        "contentPlaybackContext",
+                        buildJsonObject {
+                            put("html5Preference", "HTML5_PREF_WANTS")
+                        },
+                    )
+                },
+            )
         }
-        return Request.Builder()
-            .url("$API_URL/player?prettyPrint=false")
-            .post(body.toString().toRequestBody(JSON_MEDIA))
-            .headers(apiHeaders(spec))
+        return post("$API_URL/player?prettyPrint=false", body, apiHeaders(spec))
+            .newBuilder()
             .header(HEADER_VIDEO_ID, videoId)
             .header(HEADER_CLIENT, spec.name)
             .build()
-    }
-
-    fun fetchWatchPagePoToken(videoId: String): String {
-        return try {
-            val req = Request.Builder()
-                .url("$BASE_URL/watch?v=$videoId")
-                .header("User-Agent", WEB.userAgent)
-                .header("Accept-Language", "en-US,en;q=0.9")
-                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                .get()
-                .build()
-            client.newCall(req).execute().use { resp ->
-                val html = resp.body?.string().orEmpty()
-                extractPoToken(html)
-            }
-        } catch (e: Exception) {
-            ""
-        }
-    }
-
-    private fun extractPoToken(html: String): String {
-        if (html.isBlank()) return ""
-        Regex("\"poToken\"\\s*:\\s*\"([^\"]+)\"").find(html)?.let { return it.groupValues[1] }
-        Regex("'poToken'\\s*:\\s*'([^']+)'").find(html)?.let { return it.groupValues[1] }
-        Regex("poToken=([A-Za-z0-9_-]+)").find(html)?.let { return it.groupValues[1] }
-        return ""
     }
 
     fun oembedRequest(videoId: String): Request {
         val url = "$OEMBED_URL?url=${"https://www.youtube.com/watch?v=$videoId".encodeUrl()}&format=json"
         return Request.Builder().url(url).headers(apiHeaders(WEB)).get().build()
     }
+
+    private fun post(url: String, body: JsonObject, headers: Headers): Request = Request.Builder()
+        .url(url)
+        .post(body.toString().toRequestBody(JSON_MEDIA))
+        .headers(headers)
+        .build()
+
+    // ============================== Parsing ===============================
+
+    fun parseListing(body: String): Listing {
+        if (body.isBlank()) return Listing(emptyList(), null)
+        val root = try {
+            JSON.parseToJsonElement(body)
+        } catch (e: Exception) {
+            Log.e(TAG, "Listing parse failed", e)
+            return Listing(emptyList(), null)
+        }
+        val entries = mutableListOf<Entry>()
+        walkRenderers(root, entries)
+        return Listing(entries.distinctBy { it.kind to it.id }, findContinuation(root))
+    }
+
+    private val rendererKeys = setOf(
+        "videoRenderer",
+        "gridVideoRenderer",
+        "reelItemRenderer",
+        "playlistVideoRenderer",
+        "playlistRenderer",
+        "channelRenderer",
+        "lockupViewModel",
+        "shortsLockupViewModel",
+    )
+
+    private fun walkRenderers(element: JsonElement, out: MutableList<Entry>) {
+        when (element) {
+            is JsonObject -> {
+                element.forEach { (key, value) ->
+                    if (key in rendererKeys) {
+                        (value as? JsonObject)?.let { parseRenderer(key, it)?.let(out::add) }
+                    } else {
+                        walkRenderers(value, out)
+                    }
+                }
+            }
+            is JsonArray -> element.forEach { walkRenderers(it, out) }
+            else -> Unit
+        }
+    }
+
+    private fun parseRenderer(key: String, renderer: JsonObject): Entry? = when (key) {
+        "videoRenderer", "gridVideoRenderer", "reelItemRenderer" -> parseVideoRenderer(renderer)
+        "playlistVideoRenderer" -> parsePlaylistVideoRenderer(renderer)
+        "playlistRenderer" -> parsePlaylistRenderer(renderer)
+        "channelRenderer" -> parseChannelRenderer(renderer)
+        "lockupViewModel" -> parseLockup(renderer)
+        "shortsLockupViewModel" -> parseShortsLockup(renderer)
+        else -> null
+    }
+
+    private fun parseVideoRenderer(renderer: JsonObject): Entry? {
+        val id = renderer.str("videoId") ?: renderer.obj("videoId")?.str("videoId") ?: return null
+        val title = renderer.obj("title").text() ?: id
+        val author = renderer.obj("ownerText").text()
+            ?: renderer.obj("longBylineText").text()
+            ?: renderer.obj("shortBylineText").text()
+            ?: ""
+        val thumbnail = renderer.obj("thumbnail").thumbUrl()
+            ?: "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+        val duration = renderer.obj("lengthText").text().orEmpty()
+        val published = renderer.obj("publishedTimeText").text().orEmpty()
+        return Entry(id, Kind.VIDEO, title, author, thumbnail, joinInfo(duration, published))
+    }
+
+    private fun parsePlaylistVideoRenderer(renderer: JsonObject): Entry? {
+        val id = renderer.str("videoId") ?: return null
+        val title = renderer.obj("title").text() ?: id
+        val author = renderer.obj("shortBylineText").text().orEmpty()
+        val thumbnail = renderer.obj("thumbnail").thumbUrl()
+            ?: "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+        val duration = renderer.obj("lengthText").text().orEmpty()
+        return Entry(id, Kind.VIDEO, title, author, thumbnail, joinInfo(duration))
+    }
+
+    private fun parsePlaylistRenderer(renderer: JsonObject): Entry? {
+        val id = renderer.str("playlistId") ?: return null
+        val title = renderer.obj("title").text() ?: id
+        val author = renderer.obj("shortBylineText").text()
+            ?: renderer.obj("longBylineText").text()
+            ?: ""
+        val thumbnail = renderer.thumbUrl()
+            ?: "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+        val count = renderer.obj("videoCountText").text()
+            ?: renderer.str("videoCount")
+            ?: ""
+        return Entry(id, Kind.PLAYLIST, title, author, thumbnail, joinInfo(count))
+    }
+
+    private fun parseChannelRenderer(renderer: JsonObject): Entry? {
+        val id = renderer.str("channelId") ?: return null
+        val title = renderer.obj("title").text() ?: id
+        val thumbnail = renderer.obj("thumbnail").thumbUrl().orEmpty()
+        val subscribers = renderer.obj("videoCountText").text()
+            ?: renderer.obj("subscriberCountText").text()
+            ?: ""
+        val description = renderer.obj("descriptionSnippet").text().orEmpty()
+        return Entry(id, Kind.CHANNEL, title, subscribers, thumbnail, description)
+    }
+
+    private fun parseLockup(lockup: JsonObject): Entry? {
+        val id = lockup.str("contentId") ?: return null
+        val contentType = lockup.str("contentType").orEmpty()
+        val kind = when {
+            contentType.contains("PLAYLIST") || contentType.contains("SHOW") ||
+                contentType.contains("COURSE") || contentType.contains("ALBUM") -> Kind.PLAYLIST
+            contentType.contains("CHANNEL") -> Kind.CHANNEL
+            contentType.contains("VIDEO") -> Kind.VIDEO
+            id.startsWith("UC") && id.length == 24 -> Kind.CHANNEL
+            id.startsWith("PL") || id.startsWith("UU") || id.startsWith("OL") -> Kind.PLAYLIST
+            else -> Kind.VIDEO
+        }
+        val metadata = lockup.obj("metadata")?.obj("lockupMetadataViewModel")
+        val title = metadata?.obj("title").text() ?: id
+        val parts = metadata?.obj("metadata")
+            ?.obj("contentMetadataViewModel")
+            ?.arr("metadataRows")
+            .orEmpty()
+            .flatMap { row ->
+                (row as? JsonObject)?.arr("metadataParts").orEmpty()
+                    .mapNotNull { (it as? JsonObject)?.obj("text").text()?.takeIf(String::isNotBlank) }
+            }
+        val author = parts.firstOrNull().orEmpty()
+        val info = parts.drop(1).filterNot { it.equals("Playlist", true) }.joinToString(" · ")
+        val thumbnail = lockup.obj("contentImage").let { image ->
+            image?.obj("thumbnailViewModel")?.thumbUrl()
+                ?: image?.obj("collectionThumbnailViewModel")?.obj("primaryThumbnail")
+                    ?.obj("thumbnailViewModel")?.thumbUrl()
+                ?: image?.obj("backgroundImageViewModel")?.obj("thumbnailViewModel")?.thumbUrl()
+        }.orEmpty()
+        return Entry(id, kind, title, author, thumbnail, info)
+    }
+
+    private fun parseShortsLockup(shorts: JsonObject): Entry? {
+        val reel = shorts.obj("onTap")?.obj("innertubeCommand")?.obj("reelWatchEndpoint")
+        val id = shorts.str("entityId")?.removePrefix("shorts-shelf-item-")
+            ?: reel?.str("videoId")
+            ?: return null
+        val overlay = shorts.obj("overlayMetadata")
+        val title = overlay?.obj("primaryText").text()
+            ?: shorts.str("accessibilityText")?.substringBefore(",")
+            ?: id
+        val views = overlay?.obj("secondaryText").text().orEmpty()
+        val thumbnail = reel?.obj("thumbnail")?.thumbUrl()
+            ?: "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+        return Entry(id, Kind.VIDEO, title, "", thumbnail, views)
+    }
+
+    fun parseMetadata(body: String): Metadata? {
+        if (body.isBlank()) return null
+        val root = try {
+            JSON.parseToJsonElement(body)
+        } catch (e: Exception) {
+            return null
+        }
+        val microformat = findFirst(root, "microformatDataRenderer")
+        val playlist = findFirst(root, "playlistMetadataRenderer")
+        if (playlist != null) {
+            return Metadata(
+                title = playlist.str("title").orEmpty(),
+                author = "",
+                thumbnail = microformat?.obj("thumbnail").thumbUrl().orEmpty(),
+                description = playlist.str("description").orEmpty(),
+            )
+        }
+        val channel = findFirst(root, "channelMetadataRenderer")
+        if (channel != null) {
+            return Metadata(
+                title = channel.str("title").orEmpty(),
+                author = channel.str("vanityChannelUrl").orEmpty(),
+                thumbnail = channel.obj("avatar")?.thumbUrl().orEmpty(),
+                description = channel.str("description").orEmpty(),
+            )
+        }
+        return null
+    }
+
+    private fun findContinuation(root: JsonElement): String? {
+        val item = findFirst(root, "continuationItemRenderer") ?: return null
+        return item.obj("continuationEndpoint")?.obj("continuationCommand")?.str("token")
+    }
+
+    // ============================== Player ===============================
 
     fun resolvePlayer(
         response: Response,
@@ -194,76 +394,76 @@ internal class InnerTube(
         preferredSubtitleLang: String,
         preferredQuality: String,
         preferredClient: String,
-        poToken: String = "",
+        verifyStreams: Boolean,
     ): List<Video> {
         val videoId = response.request.header(HEADER_VIDEO_ID)
             ?: extractVideoId(response.request.url.toString())
             ?: throw Exception("INbox: request without a video id")
 
-        val baseOrder = when (preferredClient) {
-            "ANDROID" -> listOf(ANDROID, ANDROID_VR, IOS)
-            "ANDROID_VR" -> listOf(ANDROID_VR, ANDROID, IOS)
-            "IOS" -> listOf(IOS, ANDROID, ANDROID_VR)
-            else -> listOf(ANDROID, ANDROID_VR, IOS)
-        }
-        val order = if (poToken.isNotBlank()) baseOrder + listOf(WEB) else baseOrder
-
-        var body = response.use { it.body?.string() }.orEmpty()
+        val order = playerOrder(preferredClient)
+        var body = response.use { it.body.string() }.orEmpty()
+        val failures = mutableListOf<String>()
 
         for ((index, spec) in order.withIndex()) {
             if (index > 0) {
                 body = try {
-                    client.newCall(playerRequest(videoId, spec, poToken)).execute().use { it.body?.string() }.orEmpty()
+                    client.newCall(playerRequest(videoId, spec)).execute()
+                        .use { it.body.string() }.orEmpty()
                 } catch (e: Exception) {
+                    failures += "${spec.name}: ${e.message}"
                     continue
                 }
             }
-            if (body.isBlank()) continue
-            try {
-                val videos = parsePlayer(
-                    JSON.parseToJsonElement(body).jsonObject,
-                    spec,
-                    includeDash,
-                    includeMuxed,
-                    fetchSubtitles,
-                    preferredAudioLang,
-                    preferredSubtitleLang,
-                    preferredQuality,
-                )
-                if (videos.isNotEmpty()) return videos
+            if (body.isBlank()) {
+                failures += "${spec.name}: empty response"
+                continue
+            }
+            val json = try {
+                JSON.parseToJsonElement(body).jsonObject
             } catch (e: Exception) {
+                failures += "${spec.name}: invalid json"
+                continue
             }
+            val status = json.obj("playabilityStatus")
+            val state = status?.str("status") ?: "UNKNOWN"
+            if (state != "OK") {
+                val reason = status?.str("reason").orEmpty()
+                failures += "${spec.name}: $state${if (reason.isNotBlank()) " ($reason)" else ""}"
+                continue
+            }
+
+            val videos = try {
+                buildVideos(
+                    json = json,
+                    spec = spec,
+                    includeDash = includeDash,
+                    includeMuxed = includeMuxed,
+                    fetchSubtitles = fetchSubtitles,
+                    preferredAudioLang = preferredAudioLang,
+                    preferredSubtitleLang = preferredSubtitleLang,
+                    preferredQuality = preferredQuality,
+                )
+            } catch (e: Exception) {
+                failures += "${spec.name}: ${e.message}"
+                continue
+            }
+            if (videos.isEmpty()) {
+                failures += "${spec.name}: no formats"
+                continue
+            }
+
+            val playable = if (verifyStreams) filterPlayable(videos, spec) else videos
+            if (playable.isNotEmpty()) {
+                Log.d(TAG, "Resolved ${playable.size} streams with ${spec.name} (${videos.size} candidates)")
+                return playable
+            }
+            failures += "${spec.name}: ${videos.size} format(s) rejected (HTTP 4xx, likely blocked)"
         }
 
-        if (poToken.isBlank()) {
-            for ((index, spec) in order.withIndex()) {
-                body = try {
-                    client.newCall(playerRequest(videoId, spec, "")).execute().use { it.body?.string() }.orEmpty()
-                } catch (e: Exception) {
-                    continue
-                }
-                if (body.isBlank()) continue
-                try {
-                    val videos = parsePlayer(
-                        JSON.parseToJsonElement(body).jsonObject,
-                        spec,
-                        includeDash,
-                        includeMuxed,
-                        fetchSubtitles,
-                        preferredAudioLang,
-                        preferredSubtitleLang,
-                        preferredQuality,
-                    )
-                    if (videos.isNotEmpty()) return videos
-                } catch (e: Exception) {
-                }
-            }
-        }
-
-        throw Exception("INbox: no playable stream")
+        throw Exception("INbox: no playable stream. ${failures.joinToString(" | ")}")
     }
 
-    private fun parsePlayer(
+    private fun buildVideos(
         json: JsonObject,
         spec: ClientSpec,
         includeDash: Boolean,
@@ -273,32 +473,30 @@ internal class InnerTube(
         preferredSubtitleLang: String,
         preferredQuality: String,
     ): List<Video> {
-        val status = json.obj("playabilityStatus")
-        val state = status?.str("status") ?: "UNKNOWN"
-        if (state != "OK") {
-            val reason = status?.str("reason").orEmpty()
-            throw Exception("$state${if (reason.isNotBlank()) ": $reason" else ""}")
-        }
-
         val streamingData = json.obj("streamingData") ?: throw Exception("missing streamingData")
-        val streamHeaders = streamHeaders(spec)
-        val subtitles = if (fetchSubtitles) filterSubtitles(extractSubtitles(json), preferredSubtitleLang) else emptyList()
+        val headers = streamHeaders(spec)
+        val subtitles = if (fetchSubtitles) {
+            filterSubtitles(extractSubtitles(json), preferredSubtitleLang)
+        } else {
+            emptyList()
+        }
         val videos = mutableListOf<Video>()
+        val wantMuxed = includeMuxed || !includeDash
 
-        if (includeMuxed) {
-            val muxedList = streamingData.arr("formats").orEmpty().mapNotNull { element ->
+        if (wantMuxed) {
+            val muxed = streamingData.arr("formats").orEmpty().mapNotNull { element ->
                 val format = element as? JsonObject ?: return@mapNotNull null
                 val url = format.str("url") ?: return@mapNotNull null
-                val mime = format.str("mimeType").orEmpty()
-                if (!mime.startsWith("video/")) return@mapNotNull null
+                if (!format.str("mimeType").orEmpty().startsWith("video/")) return@mapNotNull null
                 val height = parseInt(format.str("height")) ?: 0
                 val bitrate = parseInt(format.str("bitrate")) ?: 0
                 val label = format.str("qualityLabel") ?: if (height > 0) "${height}p" else "Muxed"
                 MuxedRep(height, bitrate, label, url)
             }.sortedWith(compareByDescending<MuxedRep> { it.height }.thenByDescending { it.bitrate })
-            for (rep in muxedList) {
+
+            for (rep in muxed) {
                 if (!passesQuality(rep.height, preferredQuality)) continue
-                videos += Video(rep.url, "Muxed ${rep.label} (AAC)", rep.url, streamHeaders, subtitleTracks = subtitles)
+                videos += Video(rep.url, "Muxed ${rep.label}", rep.url, headers, subtitleTracks = subtitles)
             }
         }
 
@@ -307,24 +505,32 @@ internal class InnerTube(
             val audios = adaptive.mapNotNull { element ->
                 val format = element as? JsonObject ?: return@mapNotNull null
                 val url = format.str("url") ?: return@mapNotNull null
-                if (!format.str("mimeType").orEmpty().startsWith("audio/mp4")) return@mapNotNull null
-                val bitrate = parseInt(format.str("bitrate")) ?: 0
+                val mime = format.str("mimeType").orEmpty()
+                if (!mime.startsWith("audio/mp4") && !mime.startsWith("audio/webm")) return@mapNotNull null
                 val track = format.obj("audioTrack")
-                val lang = track?.str("languageCode") ?: ""
-                val display = track?.str("displayName")?.takeIf { it.isNotBlank() } ?: if (lang.isNotBlank()) lang else "Audio"
-                AudioRep(url, bitrate, lang.lowercase(Locale.US), display)
-            }
+                val lang = track?.str("languageCode").orEmpty().lowercase(Locale.US)
+                val display = track?.str("displayName")?.takeIf { it.isNotBlank() }
+                    ?: format.str("audioQuality")?.takeIf { it.isNotBlank() }
+                    ?: if (lang.isNotBlank()) lang else "Audio"
+                val bitrate = parseInt(format.str("bitrate")) ?: 0
+                AudioRep(url, bitrate, lang, display, mime.startsWith("audio/mp4"))
+            }.sortedWith(compareByDescending<AudioRep> { it.bitrate })
+                .distinctBy { it.lang to it.bitrate }
             val filteredAudios = filterAudios(audios, preferredAudioLang)
+
             if (filteredAudios.isNotEmpty()) {
                 val videoReps = adaptive.mapNotNull { element ->
                     val format = element as? JsonObject ?: return@mapNotNull null
                     val url = format.str("url") ?: return@mapNotNull null
                     val mime = format.str("mimeType").orEmpty()
-                    if (!mime.startsWith("video/mp4") || !mime.contains("avc1")) return@mapNotNull null
+                    if (!mime.startsWith("video/mp4")) return@mapNotNull null
+                    val codec = mime.substringAfter("codecs=\"", "").substringBefore("\"")
+                    if (codec.isNotBlank() && !codec.startsWith("avc1")) return@mapNotNull null
                     val height = parseInt(format.str("height")) ?: return@mapNotNull null
                     if (height > 1080) return@mapNotNull null
                     VideoRep(url, height, parseInt(format.str("bitrate")) ?: 0)
                 }.distinctBy { it.height }.sortedByDescending { it.height }
+
                 for (rep in videoReps) {
                     if (!passesQuality(rep.height, preferredQuality)) continue
                     for (audio in filteredAudios) {
@@ -332,7 +538,7 @@ internal class InnerTube(
                             rep.url,
                             "DASH ${rep.height}p • ${audio.display}",
                             rep.url,
-                            streamHeaders,
+                            headers,
                             audioTracks = listOf(Track(audio.url, audio.display)),
                             subtitleTracks = subtitles,
                         )
@@ -341,7 +547,45 @@ internal class InnerTube(
             }
         }
 
-        return videos.distinctBy { it.videoUrl to it.quality to it.audioTracks.size }
+        return videos.distinctBy { it.videoUrl to it.quality }
+    }
+
+    /**
+     * YouTube hands out googlevideo URLs that can be rejected (403) depending on the account,
+     * region, IP family or the `n` throttling parameter. Probing a single byte tells us which
+     * formats the device can actually play, so the player never receives a dead URL.
+     */
+    private fun filterPlayable(videos: List<Video>, spec: ClientSpec): List<Video> {
+        val cache = mutableMapOf<String, Boolean>()
+        fun playable(url: String): Boolean = cache.getOrPut(url) { probe(url, spec) }
+        return videos.filter { video ->
+            val videoUrl = video.videoUrl
+            videoUrl != null && playable(videoUrl) && video.audioTracks.all { playable(it.url) }
+        }
+    }
+
+    private fun probe(url: String, spec: ClientSpec): Boolean {
+        val request = try {
+            Request.Builder()
+                .url(url)
+                .headers(streamHeaders(spec))
+                .header("Range", "bytes=0-1")
+                .get()
+                .build()
+        } catch (e: Exception) {
+            return true
+        }
+        return try {
+            probeClient.newCall(request).execute().use { response ->
+                val code = response.code
+                if (code !in 200..299) Log.w(TAG, "Probe HTTP $code (${url.substringBefore('?').takeLast(40)})")
+                // 5xx / network hiccups are not proof that the stream is dead.
+                code in 200..299 || code >= 500
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Probe failed: ${e.message}")
+            true
+        }
     }
 
     private fun extractSubtitles(json: JsonObject): List<Track> {
@@ -351,20 +595,22 @@ internal class InnerTube(
         return tracks.mapNotNull { element ->
             val track = element as? JsonObject ?: return@mapNotNull null
             val baseUrl = track.str("baseUrl") ?: return@mapNotNull null
-            val lang = track.str("languageCode") ?: ""
-            val name = track.obj("name")?.arr("runs")?.joinToString("") { (it as? JsonObject)?.str("text").orEmpty() }
-                ?.takeIf { it.isNotBlank() } ?: if (lang.isNotBlank()) lang else "Subtitles"
+            val lang = track.str("languageCode").orEmpty()
+            val kind = track.str("kind").orEmpty()
+            val name = track.obj("name").text()
+                ?: if (lang.isNotBlank()) lang else "Subtitles"
+            val label = if (kind.contains("asr", ignoreCase = true)) "$name (auto)" else name
             val url = if (baseUrl.contains("&fmt=") || baseUrl.contains("?fmt=")) baseUrl else "$baseUrl&fmt=vtt"
-            Track(url, name)
+            Track(url, label)
         }
     }
 
     private fun filterSubtitles(tracks: List<Track>, preferredSubtitleLang: String): List<Track> {
+        if (tracks.isEmpty()) return emptyList()
         if (preferredSubtitleLang == "all") return tracks.distinctBy { it.url }
-        if (preferredSubtitleLang == "auto") return tracks.distinctBy { it.url }
+        if (preferredSubtitleLang == "auto") return tracks.take(1)
         val filtered = tracks.filter { it.lang.lowercase(Locale.US).startsWith(preferredSubtitleLang) }
-        val result = if (filtered.isNotEmpty()) filtered else tracks
-        return result.distinctBy { it.url }
+        return (if (filtered.isNotEmpty()) filtered else tracks.take(1)).distinctBy { it.url }
     }
 
     private fun passesQuality(height: Int, preferredQuality: String): Boolean {
@@ -379,8 +625,11 @@ internal class InnerTube(
     }
 
     private fun filterAudios(audios: List<AudioRep>, preferredAudioLang: String): List<AudioRep> {
-        if (preferredAudioLang == "all") return audios.sortedByDescending { it.bitrate }
-        val filtered = audios.filter { audio ->
+        val ordered = audios.sortedWith(
+            compareByDescending<AudioRep> { it.mp4 }.thenByDescending { it.bitrate },
+        )
+        if (preferredAudioLang == "all") return ordered
+        val filtered = ordered.filter { audio ->
             when (preferredAudioLang) {
                 "es" -> audio.lang.startsWith("es")
                 "en" -> audio.lang.startsWith("en")
@@ -388,8 +637,7 @@ internal class InnerTube(
                 else -> true
             }
         }
-        val result = if (filtered.isNotEmpty()) filtered else audios
-        return result.sortedByDescending { it.bitrate }
+        return if (filtered.isNotEmpty()) filtered else ordered
     }
 
     private fun context(spec: ClientSpec): JsonObject = buildJsonObject {
@@ -415,47 +663,30 @@ internal class InnerTube(
         .add("Referer", "https://www.youtube.com/")
         .build()
 
-    fun parseSearch(response: Response): List<YouTubeVideo> {
-        val body = response.use { it.body?.string() } ?: return emptyList()
-        val root = JSON.parseToJsonElement(body)
-        val list = collectObjects(root, "videoRenderer") + collectObjects(root, "gridVideoRenderer") + collectObjects(root, "reelItemRenderer")
-        return list.mapNotNull { toVideo(it) }
-            .distinctBy { it.id }
-    }
+    // ============================== Helpers ==============================
 
-    fun parseBrowse(response: Response): List<YouTubeVideo> {
-        val body = response.use { it.body?.string() } ?: return emptyList()
-        val root = JSON.parseToJsonElement(body)
-        val list = collectObjects(root, "videoRenderer") + collectObjects(root, "gridVideoRenderer") + collectObjects(root, "reelItemRenderer") + collectObjects(root, "playlistRenderer") + collectObjects(root, "channelRenderer")
-        return list.mapNotNull { toVideo(it) }.distinctBy { it.id }
-    }
-
-    private fun toVideo(renderer: JsonObject): YouTubeVideo? {
-        val id = renderer.str("videoId") ?: renderer.obj("videoId")?.str("videoId") ?: renderer.str("playlistId") ?: renderer.str("channelId") ?: return null
-        val title = renderer.obj("title").let { titleObj ->
-            titleObj?.arr("runs")?.joinToString("") { (it as? JsonObject)?.str("text").orEmpty() }
-                ?.takeIf { it.isNotBlank() }
-                ?: titleObj?.str("simpleText")
-                ?: renderer.obj("headline")?.arr("runs")?.joinToString("") { (it as? JsonObject)?.str("text").orEmpty() }
-                ?: id
+    private fun findFirst(root: JsonElement, key: String): JsonObject? {
+        when (root) {
+            is JsonObject -> {
+                (root[key] as? JsonObject)?.let { return it }
+                for (value in root.values) {
+                    findFirst(value, key)?.let { return it }
+                }
+            }
+            is JsonArray -> {
+                for (value in root) {
+                    findFirst(value, key)?.let { return it }
+                }
+            }
+            else -> Unit
         }
-        val author = renderer.obj("ownerText")?.arr("runs")?.firstOrNull()
-            ?.let { it as? JsonObject }?.str("text")
-            ?: renderer.obj("longBylineText")?.arr("runs")?.firstOrNull()
-                ?.let { it as? JsonObject }?.str("text")
-            ?: renderer.obj("shortBylineText")?.arr("runs")?.firstOrNull()
-                ?.let { it as? JsonObject }?.str("text")
-            ?: ""
-        val thumbnail = renderer.obj("thumbnail")?.arr("thumbnails")?.lastOrNull()
-            ?.let { it as? JsonObject }?.str("url")
-            ?: renderer.obj("richThumbnail")?.obj("movingThumbnailRenderer")?.obj("movingThumbnailDetails")?.arr("thumbnails")?.lastOrNull()
-                ?.let { it as? JsonObject }?.str("url")
-            ?: if (renderer.str("videoId") != null) "https://i.ytimg.com/vi/$id/hqdefault.jpg" else ""
-        val duration = renderer.obj("lengthText")?.str("simpleText") ?: renderer.obj("thumbnailOverlayTimeStatusRenderer")?.str("text") ?: ""
-        val published = renderer.obj("publishedTimeText")?.str("simpleText") ?: ""
-        return YouTubeVideo(id, title, author, thumbnail, duration, published)
+        return null
     }
+
+    private fun joinInfo(vararg parts: String?): String = parts.filterNot { it.isNullOrBlank() }.joinToString(" · ")
 }
+
+// ============================== Model ==============================
 
 internal data class ClientSpec(
     val id: String,
@@ -465,18 +696,15 @@ internal data class ClientSpec(
     val extra: JsonObject = JsonObject(emptyMap()),
 )
 
-internal data class YouTubeVideo(
-    val id: String,
-    val title: String,
-    val author: String,
-    val thumbnail: String,
-    val duration: String,
-    val published: String,
-)
-
 private data class VideoRep(val url: String, val height: Int, val bitrate: Int)
 private data class MuxedRep(val height: Int, val bitrate: Int, val label: String, val url: String)
-private data class AudioRep(val url: String, val bitrate: Int, val lang: String, val display: String)
+private data class AudioRep(
+    val url: String,
+    val bitrate: Int,
+    val lang: String,
+    val display: String,
+    val mp4: Boolean,
+)
 
 internal fun extractVideoId(text: String): String? {
     val trimmed = text.trim()
@@ -488,20 +716,40 @@ internal fun extractVideoId(text: String): String? {
     return null
 }
 
-private fun collectObjects(
-    root: JsonElement,
-    key: String,
-    out: MutableList<JsonObject> = mutableListOf(),
-): List<JsonObject> {
-    when (root) {
-        is JsonObject -> {
-            (root[key] as? JsonObject)?.let { out += it }
-            root.values.forEach { collectObjects(it, key, out) }
-        }
-        is JsonArray -> root.forEach { collectObjects(it, key, out) }
-        else -> Unit
+internal fun extractPlaylistId(text: String): String? {
+    val trimmed = text.trim()
+    Regex("[?&]list=([A-Za-z0-9_-]+)").find(trimmed)?.let { return it.groupValues[1] }
+    if (trimmed.startsWith("playlist:")) return trimmed.removePrefix("playlist:").trim().takeIf { it.isNotEmpty() }
+    return null
+}
+
+internal fun extractChannelId(text: String): String? {
+    val trimmed = text.trim()
+    Regex("youtube\\.com/channel/(UC[A-Za-z0-9_-]{22})").find(trimmed)?.let { return it.groupValues[1] }
+    if (trimmed.startsWith("channel:")) return trimmed.removePrefix("channel:").trim().takeIf { it.isNotEmpty() }
+    return null
+}
+
+internal fun InnerTube.Target.encode(): String = when (kind) {
+    InnerTube.Kind.PLAYLIST -> "playlist:$id"
+    InnerTube.Kind.CHANNEL -> "channel:$id"
+    InnerTube.Kind.VIDEO -> "video:$id"
+}
+
+internal fun decodeTarget(url: String): InnerTube.Target {
+    val trimmed = url.trim()
+    return when {
+        trimmed.startsWith("playlist:") ->
+            InnerTube.Target(InnerTube.Kind.PLAYLIST, trimmed.removePrefix("playlist:").trim())
+        trimmed.startsWith("channel:") ->
+            InnerTube.Target(InnerTube.Kind.CHANNEL, trimmed.removePrefix("channel:").trim())
+        trimmed.startsWith("video:") ->
+            InnerTube.Target(InnerTube.Kind.VIDEO, trimmed.removePrefix("video:").trim())
+        else -> InnerTube.Target(
+            InnerTube.Kind.VIDEO,
+            extractVideoId(trimmed) ?: trimmed,
+        )
     }
-    return out
 }
 
 internal fun JsonObject.str(key: String): String? = (this[key] as? JsonPrimitive)?.content?.takeIf { it != "null" }
@@ -509,6 +757,28 @@ internal fun JsonObject.str(key: String): String? = (this[key] as? JsonPrimitive
 internal fun JsonObject.obj(key: String): JsonObject? = this[key] as? JsonObject
 
 internal fun JsonObject.arr(key: String): JsonArray? = this[key] as? JsonArray
+
+internal fun JsonElement?.text(): String? {
+    val element = this ?: return null
+    if (element is JsonPrimitive) return element.content.takeIf { it != "null" && it.isNotBlank() }
+    val obj = element as? JsonObject ?: return null
+    obj.str("simpleText")?.let { return it }
+    obj.str("content")?.let { return it }
+    val runs = obj.arr("runs") ?: return null
+    return runs.mapNotNull { (it as? JsonObject)?.str("text") }
+        .joinToString("")
+        .takeIf { it.isNotBlank() }
+}
+
+internal fun JsonElement?.thumbUrl(): String? {
+    val obj = this as? JsonObject ?: return null
+    obj.arr("thumbnails")?.lastOrNull()?.let { (it as? JsonObject)?.str("url")?.let { url -> return url } }
+    obj.obj("thumbnail")?.arr("thumbnails")?.lastOrNull()
+        ?.let { (it as? JsonObject)?.str("url")?.let { url -> return url } }
+    obj.obj("image")?.arr("sources")?.lastOrNull()
+        ?.let { (it as? JsonObject)?.str("url")?.let { url -> return url } }
+    return null
+}
 
 private fun parseInt(s: String?): Int? = s?.toLongOrNull()?.toInt()
 
