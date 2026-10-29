@@ -30,6 +30,7 @@ internal class InnerTube(
         const val BASE_URL = "https://www.youtube.com"
         private const val API_URL = "$BASE_URL/youtubei/v1"
         private const val OEMBED_URL = "$BASE_URL/oembed"
+        private const val CONSENT_COOKIE = "SOCS=CAESEwgDEgk0ODE3Nzk3NTQaAmVuIAEaBgiA_K-fBg"
 
         const val HEADER_VIDEO_ID = "X-Inbox-Video-Id"
         const val HEADER_CLIENT = "X-Inbox-Client"
@@ -48,6 +49,8 @@ internal class InnerTube(
             3 -> "CAESAhAB"
             else -> PARAMS_VIDEOS
         }
+
+        fun watchUrl(videoId: String): String = "$BASE_URL/watch?v=$videoId"
 
         private val JSON = Json { ignoreUnknownKeys = true }
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
@@ -193,6 +196,20 @@ internal class InnerTube(
         val url = "$OEMBED_URL?url=${"https://www.youtube.com/watch?v=$videoId".encodeUrl()}&format=json"
         return Request.Builder().url(url).headers(apiHeaders(WEB)).get().build()
     }
+
+    /** Real watch page, used for details and for the client's WebView. */
+    fun watchPageRequest(videoId: String): Request = Request.Builder()
+        .url(watchUrl(videoId))
+        .header("User-Agent", WEB.userAgent)
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .addHeader("Cookie", CONSENT_COOKIE)
+        .get()
+        .build()
+
+    /** The video id of a player response, read back from the request it was built from. */
+    fun videoIdOf(response: Response): String? = response.request.header(HEADER_VIDEO_ID)
+        ?: extractVideoId(response.request.url.toString())
 
     private fun post(url: String, body: JsonObject, headers: Headers): Request = Request.Builder()
         .url(url)
@@ -395,15 +412,20 @@ internal class InnerTube(
         preferredQuality: String,
         preferredClient: String,
         verifyStreams: Boolean,
+        pagePlayer: ((String) -> String?)? = null,
     ): List<Video> {
         val videoId = response.request.header(HEADER_VIDEO_ID)
             ?: extractVideoId(response.request.url.toString())
             ?: throw Exception("INbox: request without a video id")
 
         val order = playerOrder(preferredClient)
-        var body = response.use { it.body.string() }.orEmpty()
         val failures = mutableListOf<String>()
+        // With the page route on, the app-side player is only asked for muxed
+        // streams: its DASH links are the tokenless ones that answer 403.
+        val usePageForDash = includeDash && pagePlayer != null
+        var muxed: List<Video> = emptyList()
 
+        var body = response.use { it.body.string() }.orEmpty()
         for ((index, spec) in order.withIndex()) {
             if (index > 0) {
                 body = try {
@@ -436,8 +458,8 @@ internal class InnerTube(
                 buildVideos(
                     json = json,
                     spec = spec,
-                    includeDash = includeDash,
-                    includeMuxed = includeMuxed,
+                    includeDash = includeDash && !usePageForDash,
+                    includeMuxed = includeMuxed || usePageForDash,
                     fetchSubtitles = fetchSubtitles,
                     preferredAudioLang = preferredAudioLang,
                     preferredSubtitleLang = preferredSubtitleLang,
@@ -454,13 +476,103 @@ internal class InnerTube(
 
             val playable = if (verifyStreams) filterPlayable(videos, spec) else videos
             if (playable.isNotEmpty()) {
-                Log.d(TAG, "Resolved ${playable.size} streams with ${spec.name} (${videos.size} candidates)")
-                return playable
+                if (!usePageForDash) {
+                    Log.d(TAG, "Resolved ${playable.size} streams with ${spec.name} (${videos.size} candidates)")
+                    return playable
+                }
+                Log.d(TAG, "Resolved ${playable.size} muxed stream(s) with ${spec.name}")
+                muxed = playable
+                break
             }
             failures += "${spec.name}: ${videos.size} format(s) rejected (HTTP 4xx, likely blocked)"
         }
 
+        if (!usePageForDash) {
+            throw Exception("INbox: no playable stream. ${failures.joinToString(" | ")}")
+        }
+
+        // The page route: YouTube's own player response, whose DASH links carry `pot`.
+        val page = runCatching { pagePlayer.invoke(videoId) }.getOrNull()
+        if (page != null) {
+            val dash = runCatching {
+                buildVideos(
+                    json = JSON.parseToJsonElement(page).jsonObject,
+                    spec = WEB,
+                    includeDash = true,
+                    includeMuxed = false,
+                    fetchSubtitles = fetchSubtitles,
+                    preferredAudioLang = preferredAudioLang,
+                    preferredSubtitleLang = preferredSubtitleLang,
+                    preferredQuality = preferredQuality,
+                )
+            }.getOrElse {
+                failures += "page: ${it.message}"
+                emptyList()
+            }
+            if (dash.isNotEmpty()) {
+                Log.d(TAG, "Resolved ${dash.size} DASH stream(s) from the watch page")
+                return dash + muxed
+            }
+            if (failures.none { it.startsWith("page:") }) failures += "page: no DASH formats"
+        } else {
+            failures += "page: no player response"
+        }
+
+        // Page route failed: fall back to the tokenless DASH links anyway.
+        val nativeDash = nativeDash(
+            videoId = videoId,
+            order = order,
+            fetchSubtitles = fetchSubtitles,
+            preferredAudioLang = preferredAudioLang,
+            preferredSubtitleLang = preferredSubtitleLang,
+            preferredQuality = preferredQuality,
+            verifyStreams = verifyStreams,
+            failures = failures,
+        )
+        if (nativeDash.isNotEmpty()) return nativeDash + muxed
+        if (muxed.isNotEmpty()) return muxed
         throw Exception("INbox: no playable stream. ${failures.joinToString(" | ")}")
+    }
+
+    /** Last resort when the watch page could not be read: DASH straight from InnerTube. */
+    private fun nativeDash(
+        videoId: String,
+        order: List<ClientSpec>,
+        fetchSubtitles: Boolean,
+        preferredAudioLang: String,
+        preferredSubtitleLang: String,
+        preferredQuality: String,
+        verifyStreams: Boolean,
+        failures: MutableList<String>,
+    ): List<Video> {
+        for (spec in order) {
+            val body = try {
+                client.newCall(playerRequest(videoId, spec)).execute()
+                    .use { it.body.string() }
+            } catch (e: Exception) {
+                failures += "${spec.name} DASH: ${e.message}"
+                continue
+            }
+            val json = runCatching { JSON.parseToJsonElement(body).jsonObject }.getOrNull() ?: continue
+            if (json.obj("playabilityStatus")?.str("status") != "OK") continue
+            val videos = runCatching {
+                buildVideos(
+                    json = json,
+                    spec = spec,
+                    includeDash = true,
+                    includeMuxed = false,
+                    fetchSubtitles = fetchSubtitles,
+                    preferredAudioLang = preferredAudioLang,
+                    preferredSubtitleLang = preferredSubtitleLang,
+                    preferredQuality = preferredQuality,
+                )
+            }.getOrNull().orEmpty()
+            if (videos.isEmpty()) continue
+            val playable = if (verifyStreams) filterPlayable(videos, spec) else videos
+            if (playable.isNotEmpty()) return playable
+            failures += "${spec.name} DASH: ${videos.size} format(s) rejected"
+        }
+        return emptyList()
     }
 
     private fun buildVideos(

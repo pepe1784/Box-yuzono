@@ -1,7 +1,9 @@
 package eu.kanade.tachiyomi.animeextension.all.inbox
 
 import android.util.Log
+import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -10,9 +12,7 @@ import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
-import keiyoushi.utils.getListPreference
 import keiyoushi.utils.getPreferencesLazy
-import keiyoushi.utils.getSwitchPreference
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -69,6 +69,9 @@ class InBox :
     private val preferredClient: String
         get() = preferences.getString(PREF_CLIENT_KEY, PREF_CLIENT_DEFAULT) ?: PREF_CLIENT_DEFAULT
 
+    private val pageDash: Boolean
+        get() = preferences.getBoolean(PREF_PAGE_DASH_KEY, PREF_PAGE_DASH_DEFAULT)
+
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
             .connectTimeout(30, TimeUnit.SECONDS)
@@ -79,6 +82,8 @@ class InBox :
     private val innerTube: InnerTube by lazy {
         InnerTube(client) { spec -> innertubeHeaders(spec) }
     }
+
+    private val pagePlayer by lazy { PagePlayer() }
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -168,17 +173,20 @@ class InBox :
         val request = when (target.kind) {
             InnerTube.Kind.PLAYLIST -> innerTube.playlistRequest(target.id)
             InnerTube.Kind.CHANNEL -> innerTube.channelVideosRequest(target.id)
-            InnerTube.Kind.VIDEO -> innerTube.oembedRequest(target.id)
+            // The real watch page, not the oEmbed JSON: the client's WebView button
+            // opens this request, and nobody wants a page full of JSON.
+            InnerTube.Kind.VIDEO -> innerTube.watchPageRequest(target.id)
         }
         return tagged(request, target.kind, target.id)
     }
 
     override fun animeDetailsParse(response: Response): SAnime {
         val kind = response.request.header(InnerTube.HEADER_TARGET)
-        if (kind == null || kind == InnerTube.Kind.VIDEO.name) return parseOembed(response)
-
         val targetUrl = response.request.header(InnerTube.HEADER_TARGET_URL).orEmpty()
         val body = response.use { runCatching { it.body.string() }.getOrNull() }.orEmpty()
+        if (kind == null || kind == InnerTube.Kind.VIDEO.name) {
+            return parseWatchPage(body, decodeTarget(targetUrl).id.ifBlank { response.request.url.toString() })
+        }
         return animeFromBody(kind, targetUrl, body)
     }
 
@@ -195,6 +203,39 @@ class InBox :
         }
     }
 
+    /** Pulls the fields we care about out of the watch page's Open Graph tags. */
+    private fun parseWatchPage(body: String, fallbackVideoId: String): SAnime {
+        val videoId = extractVideoId(fallbackVideoId) ?: fallbackVideoId
+        val title = metaContent(body, "og:title")
+            ?: Regex("<title>([^<]+)</title>").find(body)?.groupValues?.get(1)?.removeSuffix(" - YouTube")
+            ?: videoId
+        val thumbnail = metaContent(body, "og:image")
+            ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+        val description = metaContent(body, "og:description").orEmpty()
+        val author = Regex("\"author\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.get(1).orEmpty()
+        return SAnime.create().apply {
+            url = InnerTube.watchUrl(videoId)
+            this.title = title.htmlUnescape()
+            this.author = author.htmlUnescape()
+            thumbnail_url = thumbnail.asAbsoluteUrl()
+            this.description = description.htmlUnescape()
+            genre = "YouTube"
+        }
+    }
+
+    private fun metaContent(html: String, property: String): String? = Regex(
+        "<meta[^>]+(?:property|name)=[\"']" + Regex.escape(property) + "[\"'][^>]+content=[\"']([^\"']*)[\"']",
+    ).find(html)?.groupValues?.get(1)
+        ?: Regex(
+            "<meta[^>]+content=[\"']([^\"']*)[\"'][^>]+(?:property|name)=[\"']" + Regex.escape(property) + "[\"']",
+        ).find(html)?.groupValues?.get(1)
+
+    private fun String.htmlUnescape(): String = replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+
     private fun parseOembed(response: Response): SAnime {
         val watchUrl = response.request.url.queryParameter("url").orEmpty()
         val videoId = extractVideoId(watchUrl)
@@ -209,7 +250,7 @@ class InBox :
         }
         val title = obj.str("title") ?: videoId
         return SAnime.create().apply {
-            url = "video:$videoId"
+            url = InnerTube.watchUrl(videoId)
             this.title = title
             author = obj.str("author_name").orEmpty()
             thumbnail_url = obj.str("thumbnail_url").asAbsoluteUrl().ifBlank { "https://i.ytimg.com/vi/$videoId/hqdefault.jpg" }
@@ -234,7 +275,7 @@ class InBox :
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
 
     private fun singleEpisode(anime: SAnime, videoId: String): SEpisode = SEpisode.create().apply {
-        url = videoId
+        url = InnerTube.watchUrl(videoId)
         name = anime.title.ifBlank { "Video" }
         episode_number = 1F
     }
@@ -265,7 +306,7 @@ class InBox :
                 if (entry.kind != InnerTube.Kind.VIDEO) continue
                 if (!seen.add(entry.id)) continue
                 episodes += SEpisode.create().apply {
-                    url = entry.id
+                    url = InnerTube.watchUrl(entry.id)
                     name = entry.title
                     episode_number = episodes.size + 1F
                 }
@@ -296,6 +337,7 @@ class InBox :
             preferredQuality = preferredQuality,
             preferredClient = preferredClient,
             verifyStreams = verifyStreams,
+            pagePlayer = if (pageDash) { id -> pagePlayer.playerResponse(id) } else null,
         )
         Log.d(TAG, "Resolved ${videos.size} videos")
         return videos
@@ -304,62 +346,90 @@ class InBox :
     // ============================ Settings =============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        screen.getListPreference(
-            key = PREF_CLIENT_KEY,
-            default = PREF_CLIENT_DEFAULT,
-            title = "Preferred server/client",
-            summary = "%s",
-            entries = PREF_CLIENT_ENTRIES.toList(),
-            entryValues = PREF_CLIENT_VALUES.toList(),
+        // Plain preference widgets: the keiyoushi helpers render an empty screen
+        // on some clients, and a settings page with no controls is worse than
+        // a few extra lines here.
+        screen.addPreference(
+            ListPreference(screen.context).apply {
+                key = PREF_CLIENT_KEY
+                title = "Preferred server/client"
+                entries = PREF_CLIENT_ENTRIES
+                entryValues = PREF_CLIENT_VALUES
+                setDefaultValue(PREF_CLIENT_DEFAULT)
+                summary = "%s"
+            },
         )
-        screen.getListPreference(
-            key = PREF_QUALITY_KEY,
-            default = PREF_QUALITY_DEFAULT,
-            title = "Preferred quality",
-            summary = "%s",
-            entries = PREF_QUALITY_ENTRIES.toList(),
-            entryValues = PREF_QUALITY_VALUES.toList(),
+        screen.addPreference(
+            ListPreference(screen.context).apply {
+                key = PREF_QUALITY_KEY
+                title = "Preferred quality"
+                entries = PREF_QUALITY_ENTRIES
+                entryValues = PREF_QUALITY_VALUES
+                setDefaultValue(PREF_QUALITY_DEFAULT)
+                summary = "%s"
+            },
         )
-        screen.getSwitchPreference(
-            key = PREF_MUXED_KEY,
-            default = PREF_MUXED_DEFAULT,
-            title = "Show muxed streams (video + audio)",
-            summary = "Already combined. Lower resolution, but the most compatible option.",
+        screen.addPreference(
+            SwitchPreferenceCompat(screen.context).apply {
+                key = PREF_MUXED_KEY
+                title = "Show muxed streams (video + audio)"
+                summary = "Already combined. Lower resolution, but the most compatible option."
+                setDefaultValue(PREF_MUXED_DEFAULT)
+            },
         )
-        screen.getSwitchPreference(
-            key = PREF_DASH_KEY,
-            default = PREF_DASH_DEFAULT,
-            title = "Show DASH (separate video + audio)",
-            summary = "Up to 1080p with selectable audio. Needs a player that accepts external audio.",
+        screen.addPreference(
+            SwitchPreferenceCompat(screen.context).apply {
+                key = PREF_DASH_KEY
+                title = "Show DASH (separate video + audio)"
+                summary = "Up to 1080p with selectable audio."
+                setDefaultValue(PREF_DASH_DEFAULT)
+            },
         )
-        screen.getSwitchPreference(
-            key = PREF_VERIFY_KEY,
-            default = PREF_VERIFY_DEFAULT,
-            title = "Check streams before playing",
-            summary = "Sends a 2-byte request per format and hides links YouTube answers with 403. " +
-                "Adds about a second when loading an episode.",
+        screen.addPreference(
+            SwitchPreferenceCompat(screen.context).apply {
+                key = PREF_PAGE_DASH_KEY
+                title = "Get DASH from the video page (background)"
+                summary = "Loads the watch page in a hidden WebView so the links come with " +
+                    "the poToken and do not answer 403. Nothing is shown on screen."
+                setDefaultValue(PREF_PAGE_DASH_DEFAULT)
+            },
         )
-        screen.getSwitchPreference(
-            key = PREF_SUBTITLES_KEY,
-            default = PREF_SUBTITLES_DEFAULT,
-            title = "Fetch subtitles/CC",
-            summary = "Load YouTube caption tracks when available.",
+        screen.addPreference(
+            SwitchPreferenceCompat(screen.context).apply {
+                key = PREF_VERIFY_KEY
+                title = "Check streams before playing"
+                summary = "Drops the YouTube links the device cannot play (HTTP 403) " +
+                    "and falls back to muxed when everything else fails."
+                setDefaultValue(PREF_VERIFY_DEFAULT)
+            },
         )
-        screen.getListPreference(
-            key = PREF_SUBTITLE_LANG_KEY,
-            default = PREF_SUBTITLE_LANG_DEFAULT,
-            title = "Subtitle language",
-            summary = "%s",
-            entries = PREF_SUBTITLE_LANG_ENTRIES.toList(),
-            entryValues = PREF_SUBTITLE_LANG_VALUES.toList(),
+        screen.addPreference(
+            SwitchPreferenceCompat(screen.context).apply {
+                key = PREF_SUBTITLES_KEY
+                title = "Fetch subtitles/CC"
+                summary = "Load YouTube caption tracks when available."
+                setDefaultValue(PREF_SUBTITLES_DEFAULT)
+            },
         )
-        screen.getListPreference(
-            key = PREF_AUDIO_LANG_KEY,
-            default = PREF_AUDIO_LANG_DEFAULT,
-            title = "Preferred audio language",
-            summary = "%s",
-            entries = PREF_AUDIO_LANG_ENTRIES.toList(),
-            entryValues = PREF_AUDIO_LANG_VALUES.toList(),
+        screen.addPreference(
+            ListPreference(screen.context).apply {
+                key = PREF_SUBTITLE_LANG_KEY
+                title = "Subtitle language"
+                entries = PREF_SUBTITLE_LANG_ENTRIES
+                entryValues = PREF_SUBTITLE_LANG_VALUES
+                setDefaultValue(PREF_SUBTITLE_LANG_DEFAULT)
+                summary = "%s"
+            },
+        )
+        screen.addPreference(
+            ListPreference(screen.context).apply {
+                key = PREF_AUDIO_LANG_KEY
+                title = "Preferred audio language"
+                entries = PREF_AUDIO_LANG_ENTRIES
+                entryValues = PREF_AUDIO_LANG_VALUES
+                setDefaultValue(PREF_AUDIO_LANG_DEFAULT)
+                summary = "%s"
+            },
         )
     }
 
@@ -399,7 +469,8 @@ class InBox :
             if (author.isNotBlank()) append("\n").append(author)
         }
         return SAnime.create().apply {
-            url = InnerTube.Target(kind, id).encode()
+            // Real watch URLs: the client's WebView button then opens the actual page.
+            url = if (kind == InnerTube.Kind.VIDEO) InnerTube.watchUrl(id) else InnerTube.Target(kind, id).encode()
             title = this@toSAnime.title
             author = this@toSAnime.author
             thumbnail_url = this@toSAnime.thumbnail.asAbsoluteUrl()
@@ -429,6 +500,9 @@ class InBox :
 
         private const val PREF_DASH_KEY = "pref_dash"
         private const val PREF_DASH_DEFAULT = true
+
+        private const val PREF_PAGE_DASH_KEY = "pref_page_dash"
+        private const val PREF_PAGE_DASH_DEFAULT = true
 
         private const val PREF_VERIFY_KEY = "pref_verify"
         private const val PREF_VERIFY_DEFAULT = true
