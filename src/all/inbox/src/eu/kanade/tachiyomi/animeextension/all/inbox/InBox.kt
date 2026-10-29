@@ -3,7 +3,10 @@ package eu.kanade.tachiyomi.animeextension.all.inbox
 import android.content.Intent
 import android.net.Uri
 import android.util.Log
+import androidx.preference.EditTextPreference
+import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -14,10 +17,7 @@ import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
-import keiyoushi.utils.getListPreference
 import keiyoushi.utils.getPreferencesLazy
-import keiyoushi.utils.getSwitchPreference
-import keiyoushi.utils.getTextPreference
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
@@ -264,9 +264,7 @@ class InBox :
     // ============================ Settings =============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        val context = screen.context
-
-        val poTokenPref = androidx.preference.EditTextPreference(screen.context).apply {
+        val poTokenPref = EditTextPreference(screen.context).apply {
             key = PREF_PO_TOKEN_KEY
             title = "PoToken (auto)"
             summary = "Auto-fetched from watch page if empty"
@@ -274,7 +272,7 @@ class InBox :
         }
         screen.addPreference(poTokenPref)
 
-        val clientPref = androidx.preference.ListPreference(screen.context).apply {
+        val clientPref = ListPreference(screen.context).apply {
             key = PREF_CLIENT_KEY
             title = "Preferred server/client"
             entries = PREF_CLIENT_ENTRIES
@@ -284,7 +282,7 @@ class InBox :
         }
         screen.addPreference(clientPref)
 
-        val qualityPref = androidx.preference.ListPreference(screen.context).apply {
+        val qualityPref = ListPreference(screen.context).apply {
             key = PREF_QUALITY_KEY
             title = "Preferred quality"
             entries = PREF_QUALITY_ENTRIES
@@ -294,28 +292,28 @@ class InBox :
         }
         screen.addPreference(qualityPref)
 
-        val muxedPref = androidx.preference.SwitchPreferenceCompat(screen.context).apply {
+        val muxedPref = SwitchPreferenceCompat(screen.context).apply {
             key = PREF_MUXED_KEY
             title = "Show muxed streams (video + audio)"
             setDefaultValue(PREF_MUXED_DEFAULT)
         }
         screen.addPreference(muxedPref)
 
-        val dashPref = androidx.preference.SwitchPreferenceCompat(screen.context).apply {
+        val dashPref = SwitchPreferenceCompat(screen.context).apply {
             key = PREF_DASH_KEY
             title = "Show DASH (separate video + audio)"
             setDefaultValue(PREF_DASH_DEFAULT)
         }
         screen.addPreference(dashPref)
 
-        val subsPref = androidx.preference.SwitchPreferenceCompat(screen.context).apply {
+        val subsPref = SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SUBTITLES_KEY
             title = "Fetch subtitles/CC"
             setDefaultValue(PREF_SUBTITLES_DEFAULT)
         }
         screen.addPreference(subsPref)
 
-        val subLangPref = androidx.preference.ListPreference(screen.context).apply {
+        val subLangPref = ListPreference(screen.context).apply {
             key = PREF_SUBTITLE_LANG_KEY
             title = "Subtitle language"
             entries = PREF_SUBTITLE_LANG_ENTRIES
@@ -325,7 +323,7 @@ class InBox :
         }
         screen.addPreference(subLangPref)
 
-        val audioLangPref = androidx.preference.ListPreference(screen.context).apply {
+        val audioLangPref = ListPreference(screen.context).apply {
             key = PREF_AUDIO_LANG_KEY
             title = "Preferred audio language"
             entries = PREF_AUDIO_LANG_ENTRIES
