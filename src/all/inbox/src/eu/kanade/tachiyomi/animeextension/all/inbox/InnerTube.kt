@@ -412,7 +412,7 @@ internal class InnerTube(
         preferredQuality: String,
         preferredClient: String,
         verifyStreams: Boolean,
-        pagePlayer: ((String) -> String?)? = null,
+        pagePlayer: ((String) -> PageStreams?)? = null,
     ): List<Video> {
         val videoId = response.request.header(HEADER_VIDEO_ID)
             ?: extractVideoId(response.request.url.toString())
@@ -491,12 +491,20 @@ internal class InnerTube(
             throw Exception("INbox: no playable stream. ${failures.joinToString(" | ")}")
         }
 
-        // The page route: YouTube's own player response, whose DASH links carry `pot`.
+        // The page route. First choice: the links the page's player requested itself,
+        // which already carry `pot` and the descrambled `n` parameter.
         val page = runCatching { pagePlayer.invoke(videoId) }.getOrNull()
-        if (page != null) {
+        val captured = page?.let { capturedDash(it, preferredQuality) }.orEmpty()
+        if (captured.isNotEmpty()) {
+            Log.d(TAG, "Resolved ${captured.size} DASH stream(s) from the page player")
+            return captured + muxed
+        }
+        // Second choice: the page's player response.
+        val pageResponse = page?.response
+        if (pageResponse != null) {
             val dash = runCatching {
                 buildVideos(
-                    json = JSON.parseToJsonElement(page).jsonObject,
+                    json = JSON.parseToJsonElement(pageResponse).jsonObject,
                     spec = WEB,
                     includeDash = true,
                     includeMuxed = false,
@@ -532,6 +540,98 @@ internal class InnerTube(
         if (nativeDash.isNotEmpty()) return nativeDash + muxed
         if (muxed.isNotEmpty()) return muxed
         throw Exception("INbox: no playable stream. ${failures.joinToString(" | ")}")
+    }
+
+    /** Builds a DASH entry from the links the page player used. */
+    private fun capturedDash(streams: PageStreams, preferredQuality: String): List<Video> {
+        if (!streams.hasPlayableDash) return emptyList()
+        val video = streams.videos
+            .sortedByDescending { it.height }
+            .firstOrNull { passesQuality(it.height, preferredQuality) }
+            ?: return emptyList()
+        val audio = streams.audios.first()
+        return listOf(
+            Video(
+                video.url,
+                "DASH ${video.label} • ${audio.label}",
+                video.url,
+                streamHeaders(WEB),
+                audioTracks = listOf(Track(audio.url, audio.label)),
+            ),
+        )
+    }
+
+    /** Compact report for the in-app DASH test. */
+    fun diagnose(videoId: String, pagePlayer: ((String) -> PageStreams?)?): String = buildString {
+        appendLine("ID: $videoId")
+
+        runCatching {
+            val body = client.newCall(playerRequest(videoId, ANDROID)).execute()
+                .use { it.body.string() }
+            val json = JSON.parseToJsonElement(body).jsonObject
+            val status = json.obj("playabilityStatus")?.str("status") ?: "?"
+            val formats = json.obj("streamingData")?.arr("adaptiveFormats").orEmpty()
+                .mapNotNull { it as? JsonObject }
+            val videoUrls = formats
+                .filter { it.str("mimeType").orEmpty().startsWith("video/") }
+                .mapNotNull { it.str("url") }
+            val audioUrls = formats
+                .filter { it.str("mimeType").orEmpty().startsWith("audio/") }
+                .mapNotNull { it.str("url") }
+            appendLine("Androide: $status, ${videoUrls.size} video, ${audioUrls.size} audio")
+            appendLine("  video n=${countParam(videoUrls, "n")} pot=${countParam(videoUrls, "pot")} -> ${videoUrls.firstOrNull()?.let { probeCode(it) } ?: "-"}")
+            appendLine("  audio n=${countParam(audioUrls, "n")} pot=${countParam(audioUrls, "pot")} -> ${audioUrls.firstOrNull()?.let { probeCode(it) } ?: "-"}")
+        }.onFailure { appendLine("Androide: error ${it.message}") }
+
+        runCatching {
+            val page = pagePlayer?.invoke(videoId)
+            if (page == null) {
+                appendLine("Pagina: nada")
+            } else {
+                val video = page.videos.firstOrNull()
+                val audio = page.audios.firstOrNull()
+                appendLine(
+                    "Pagina: video=${video?.label ?: "no"} audio=${audio?.label ?: "no"} " +
+                        "respuesta=${if (page.response != null) "si" else "no"}",
+                )
+                if (video != null) {
+                    appendLine("  video n=${paramValue(video.url, "n") != null} pot=${paramValue(video.url, "pot") != null} -> ${probeCode(video.url)}")
+                }
+                if (audio != null) {
+                    appendLine("  audio n=${paramValue(audio.url, "n") != null} pot=${paramValue(audio.url, "pot") != null} -> ${probeCode(audio.url)}")
+                }
+                if (video == null) {
+                    page.response?.let { raw ->
+                        val url = runCatching {
+                            JSON.parseToJsonElement(raw).jsonObject
+                                .obj("streamingData")?.arr("adaptiveFormats").orEmpty()
+                                .mapNotNull { it as? JsonObject }
+                                .firstOrNull { it.str("mimeType").orEmpty().startsWith("video/") }
+                                ?.str("url")
+                        }.getOrNull()
+                        if (url != null) {
+                            appendLine("  respuesta n=${paramValue(url, "n") != null} pot=${paramValue(url, "pot") != null} -> ${probeCode(url)}")
+                        }
+                    }
+                }
+            }
+        }.onFailure { appendLine("Pagina: error ${it.message}") }
+    }
+
+    private fun countParam(urls: List<String>, name: String): Int = urls.count { paramValue(it, name) != null }
+
+    private fun paramValue(url: String, name: String): String? = Regex("[?&]$name=([^&]*)").find(url)?.groupValues?.get(1)
+
+    private fun probeCode(url: String): String = try {
+        val request = Request.Builder()
+            .url(url)
+            .headers(streamHeaders(WEB))
+            .header("Range", "bytes=0-1")
+            .get()
+            .build()
+        probeClient.newCall(request).execute().use { "HTTP ${it.code}" }
+    } catch (e: Exception) {
+        "error ${e.message}"
     }
 
     /** Last resort when the watch page could not be read: DASH straight from InnerTube. */

@@ -1,6 +1,11 @@
 package eu.kanade.tachiyomi.animeextension.all.inbox
 
+import android.app.AlertDialog
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.widget.Toast
+import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -337,7 +342,7 @@ class InBox :
             preferredQuality = preferredQuality,
             preferredClient = preferredClient,
             verifyStreams = verifyStreams,
-            pagePlayer = if (pageDash) { id -> pagePlayer.playerResponse(id) } else null,
+            pagePlayer = if (pageDash) { id -> pagePlayer.streams(id) } else null,
         )
         Log.d(TAG, "Resolved ${videos.size} videos")
         return videos
@@ -422,15 +427,54 @@ class InBox :
             },
         )
         screen.addPreference(
-            ListPreference(screen.context).apply {
-                key = PREF_AUDIO_LANG_KEY
-                title = "Preferred audio language"
-                entries = PREF_AUDIO_LANG_ENTRIES
-                entryValues = PREF_AUDIO_LANG_VALUES
-                setDefaultValue(PREF_AUDIO_LANG_DEFAULT)
+            EditTextPreference(screen.context).apply {
+                key = PREF_DIAG_KEY
+                title = "DASH test: video ID or URL"
                 summary = "%s"
+                setDefaultValue("")
             },
         )
+        screen.addPreference(
+            SwitchPreferenceCompat(screen.context).apply {
+                key = PREF_DIAG_RUN_KEY
+                title = "Run the DASH test"
+                summary = "Shows what the app and the hidden page get for that video"
+                setDefaultValue(false)
+                setOnPreferenceClickListener {
+                    runDashTest(screen.context)
+                    // Consume the click so the switch itself never flips.
+                    true
+                }
+            },
+        )
+    }
+
+    private fun runDashTest(context: android.content.Context) {
+        val raw = preferences.getString(PREF_DIAG_KEY, "").orEmpty().trim()
+        val videoId = extractVideoId(raw).orEmpty().ifBlank { raw }
+        if (videoId.isBlank()) {
+            AlertDialog.Builder(context)
+                .setMessage("Escribe un ID o una URL de YouTube primero.")
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+        Thread {
+            val report = innerTube.diagnose(videoId) { id -> pagePlayer.streams(id) }
+            Log.d("INbox", "DASH test\n$report")
+            Handler(Looper.getMainLooper()).post {
+                runCatching {
+                    AlertDialog.Builder(context)
+                        .setTitle("DASH")
+                        .setMessage(report)
+                        .setPositiveButton("OK", null)
+                        .show()
+                }.onFailure {
+                    // Some hosts hand the preference screen a context without a window.
+                    Toast.makeText(context, report, Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
     }
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
@@ -509,6 +553,9 @@ class InBox :
 
         private const val PREF_SUBTITLES_KEY = "pref_subs"
         private const val PREF_SUBTITLES_DEFAULT = true
+
+        private const val PREF_DIAG_KEY = "pref_diag_video"
+        private const val PREF_DIAG_RUN_KEY = "pref_diag_run"
 
         private const val PREF_SUBTITLE_LANG_KEY = "pref_sub_lang"
         private const val PREF_SUBTITLE_LANG_DEFAULT = "auto"
