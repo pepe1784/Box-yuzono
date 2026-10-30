@@ -460,7 +460,15 @@ class InBox :
             return
         }
         Thread {
-            val report = innerTube.diagnose(videoId) { id -> pagePlayer.streams(id) }
+            val report = innerTube.diagnose(
+                videoId = videoId,
+                includeDash = includeDash,
+                includeMuxed = includeMuxed,
+                preferredAudioLang = preferredAudioLang,
+                preferredQuality = preferredQuality,
+                preferredClient = preferredClient,
+                pagePlayer = if (pageDash) { id -> pagePlayer.streams(id) } else null,
+            )
             Log.d("INbox", "DASH test\n$report")
             Handler(Looper.getMainLooper()).post {
                 runCatching {

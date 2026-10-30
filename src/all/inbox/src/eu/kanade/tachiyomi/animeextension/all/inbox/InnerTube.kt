@@ -562,74 +562,112 @@ internal class InnerTube(
     }
 
     /** Compact report for the in-app DASH test. */
-    fun diagnose(videoId: String, pagePlayer: ((String) -> PageStreams?)?): String = buildString {
+    fun diagnose(
+        videoId: String,
+        includeDash: Boolean,
+        includeMuxed: Boolean,
+        preferredAudioLang: String,
+        preferredQuality: String,
+        preferredClient: String,
+        pagePlayer: ((String) -> PageStreams?)?,
+    ): String = buildString {
         appendLine("ID: $videoId")
+        val order = playerOrder(preferredClient)
+        appendLine("Orden: ${order.joinToString(", ") { it.name }}")
 
-        runCatching {
-            val body = client.newCall(playerRequest(videoId, ANDROID)).execute()
-                .use { it.body.string() }
-            val json = JSON.parseToJsonElement(body).jsonObject
-            val status = json.obj("playabilityStatus")?.str("status") ?: "?"
-            val formats = json.obj("streamingData")?.arr("adaptiveFormats").orEmpty()
-                .mapNotNull { it as? JsonObject }
-            val videoUrls = formats
-                .filter { it.str("mimeType").orEmpty().startsWith("video/") }
-                .mapNotNull { it.str("url") }
-            val audioUrls = formats
-                .filter { it.str("mimeType").orEmpty().startsWith("audio/") }
-                .mapNotNull { it.str("url") }
-            appendLine("Androide: $status, ${videoUrls.size} video, ${audioUrls.size} audio")
-            appendLine("  video n=${countParam(videoUrls, "n")} pot=${countParam(videoUrls, "pot")} -> ${videoUrls.firstOrNull()?.let { probeCode(it) } ?: "-"}")
-            appendLine("  audio n=${countParam(audioUrls, "n")} pot=${countParam(audioUrls, "pot")} -> ${audioUrls.firstOrNull()?.let { probeCode(it) } ?: "-"}")
-        }.onFailure { appendLine("Androide: error ${it.message}") }
+        val videos = runCatching {
+            val response = client.newCall(playerRequest(videoId, order.first())).execute()
+            resolvePlayer(
+                response = response,
+                includeDash = includeDash,
+                includeMuxed = includeMuxed,
+                fetchSubtitles = false,
+                preferredAudioLang = preferredAudioLang,
+                preferredSubtitleLang = "",
+                preferredQuality = preferredQuality,
+                preferredClient = preferredClient,
+                // Show every candidate: the point is to see what the player would get.
+                verifyStreams = false,
+                pagePlayer = pagePlayer,
+            )
+        }.getOrElse {
+            appendLine("Lista: error ${it.message}")
+            emptyList()
+        }
 
-        runCatching {
-            val page = pagePlayer?.invoke(videoId)
-            if (page == null) {
-                appendLine("Pagina: nada")
-            } else {
-                val video = page.videos.firstOrNull()
-                val audio = page.audios.firstOrNull()
-                appendLine(
-                    "Pagina: video=${video?.label ?: "no"} audio=${audio?.label ?: "no"} " +
-                        "respuesta=${if (page.response != null) "si" else "no"}",
-                )
-                if (video != null) {
-                    appendLine("  video n=${paramValue(video.url, "n") != null} pot=${paramValue(video.url, "pot") != null} -> ${probeCode(video.url)}")
-                }
-                if (audio != null) {
-                    appendLine("  audio n=${paramValue(audio.url, "n") != null} pot=${paramValue(audio.url, "pot") != null} -> ${probeCode(audio.url)}")
-                }
-                if (video == null) {
-                    page.response?.let { raw ->
-                        val url = runCatching {
-                            JSON.parseToJsonElement(raw).jsonObject
-                                .obj("streamingData")?.arr("adaptiveFormats").orEmpty()
-                                .mapNotNull { it as? JsonObject }
-                                .firstOrNull { it.str("mimeType").orEmpty().startsWith("video/") }
-                                ?.str("url")
-                        }.getOrNull()
-                        if (url != null) {
-                            appendLine("  respuesta n=${paramValue(url, "n") != null} pot=${paramValue(url, "pot") != null} -> ${probeCode(url)}")
-                        }
-                    }
-                }
+        appendLine("Lista que recibe el reproductor: ${videos.size}")
+        val shown = if (videos.size > 5) videos.take(4) + videos.last() else videos
+        shown.forEachIndexed { index, video ->
+            val url = video.videoUrl ?: return@forEachIndexed
+            appendLine("${index + 1}. ${video.quality} (${flags(url)})")
+            appendLine("   video: ${probeCode(url)} / sin cabeceras: ${bareCode(url)}")
+            video.audioTracks.firstOrNull()?.let {
+                appendLine("   audio: ${probeCode(it.url)} / sin cabeceras: ${bareCode(it.url)}")
             }
-        }.onFailure { appendLine("Pagina: error ${it.message}") }
+        }
+        videos.firstOrNull { it.audioTracks.isNotEmpty() && it.videoUrl != null }?.let {
+            appendLine("Dos lecturas seguidas: ${twoStep(it.videoUrl!!)}")
+        }
+
+        // Which client's DASH links survive a plain request? That is the one the
+        // player can use no matter what headers it sends.
+        appendLine("Por cliente:")
+        for (spec in order) {
+            val line = runCatching {
+                val body = client.newCall(playerRequest(videoId, spec)).execute()
+                    .use { it.body.string() }
+                val json = JSON.parseToJsonElement(body).jsonObject
+                val state = json.obj("playabilityStatus")?.str("status") ?: "?"
+                if (state != "OK") return@runCatching state
+                val formats = buildVideos(
+                    json = json,
+                    spec = spec,
+                    includeDash = true,
+                    includeMuxed = false,
+                    fetchSubtitles = false,
+                    preferredAudioLang = "",
+                    preferredSubtitleLang = "",
+                    preferredQuality = preferredQuality,
+                )
+                val first = formats.firstOrNull() ?: return@runCatching "sin formatos"
+                val url = first.videoUrl ?: return@runCatching "sin url"
+                "${probeCode(url)} / sin cabeceras: ${bareCode(url)}"
+            }.getOrElse { "error ${it.message}" }
+            appendLine("  ${spec.name}: $line")
+        }
     }
 
-    private fun countParam(urls: List<String>, name: String): Int = urls.count { paramValue(it, name) != null }
+    private fun flags(url: String): String {
+        val n = if (paramValue(url, "n") != null) "n" else "-"
+        val pot = if (paramValue(url, "pot") != null) "pot" else "-"
+        return "$n $pot"
+    }
 
     private fun paramValue(url: String, name: String): String? = Regex("[?&]$name=([^&]*)").find(url)?.groupValues?.get(1)
 
-    private fun probeCode(url: String): String = try {
-        val request = Request.Builder()
-            .url(url)
-            .headers(streamHeaders(WEB))
-            .header("Range", "bytes=0-1")
-            .get()
-            .build()
-        probeClient.newCall(request).execute().use { "HTTP ${it.code}" }
+    private fun probeCode(url: String): String = probe(url, withHeaders = true, range = "bytes=0-1")
+
+    private fun bareCode(url: String): String = probe(url, withHeaders = false, range = "bytes=0-1")
+
+    private fun twoStep(url: String): String {
+        val first = probe(url, withHeaders = false, range = "bytes=0-524287", readBody = true)
+        // A later offset, like a seek in the middle of the video.
+        val second = probe(url, withHeaders = false, range = "bytes=5000000-5524287", readBody = true)
+        return "$first / $second"
+    }
+
+    private fun probe(
+        url: String,
+        withHeaders: Boolean,
+        range: String,
+        readBody: Boolean = false,
+    ): String = try {
+        val builder = Request.Builder().url(url).header("Range", range).get()
+        if (withHeaders) builder.headers(streamHeaders(ANDROID))
+        probeClient.newCall(builder.build()).execute().use { response ->
+            val size = if (readBody) response.body.bytes().size else 0
+            if (readBody) "HTTP ${response.code} ${size}b" else "HTTP ${response.code}"
+        }
     } catch (e: Exception) {
         "error ${e.message}"
     }
@@ -645,6 +683,7 @@ internal class InnerTube(
         verifyStreams: Boolean,
         failures: MutableList<String>,
     ): List<Video> {
+        var withHeadersOnly: List<Video> = emptyList()
         for (spec in order) {
             val body = try {
                 client.newCall(playerRequest(videoId, spec)).execute()
@@ -669,10 +708,30 @@ internal class InnerTube(
             }.getOrNull().orEmpty()
             if (videos.isEmpty()) continue
             val playable = if (verifyStreams) filterPlayable(videos, spec) else videos
-            if (playable.isNotEmpty()) return playable
-            failures += "${spec.name} DASH: ${videos.size} format(s) rejected"
+            if (playable.isEmpty()) {
+                failures += "${spec.name} DASH: ${videos.size} format(s) rejected"
+                continue
+            }
+            // A URL that only answers when the app's own headers are sent is useless:
+            // the player is the one doing the request, with its own user agent. Keep
+            // looking for a client whose links work on their own.
+            val firstUrl = playable.firstOrNull { it.videoUrl != null }?.videoUrl
+            if (verifyStreams && firstUrl != null && !bareProbe(firstUrl)) {
+                if (withHeadersOnly.isEmpty()) withHeadersOnly = playable
+                failures += "${spec.name} DASH: only answers with the app headers"
+                continue
+            }
+            return playable
         }
-        return emptyList()
+        return withHeadersOnly
+    }
+
+    /** Asks for one byte without the app's headers, the way a plain player would. */
+    private fun bareProbe(url: String): Boolean = try {
+        val request = Request.Builder().url(url).header("Range", "bytes=0-1").get().build()
+        probeClient.newCall(request).execute().use { it.code in 200..299 || it.code >= 500 }
+    } catch (e: Exception) {
+        true
     }
 
     private fun buildVideos(
