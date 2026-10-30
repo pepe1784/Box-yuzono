@@ -56,7 +56,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v5 · 14.19"
+        private const val DIAG_VERSION = "v6 · 14.20"
 
         private const val CHROME_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -865,6 +865,14 @@ internal class InnerTube(
                             subtitleTracks = subtitles,
                         )
                     }
+                }
+
+                // Temporary probes: is the video link itself playable, and is the audio link?
+                val topDashUrl = videos.lastOrNull { it.audioTracks.isNotEmpty() }?.videoUrl
+                if (topDashUrl != null) {
+                    videos += Video(topDashUrl, "PRUEBA solo video", topDashUrl, playbackHeaders)
+                    val audio = filteredAudios.first()
+                    videos += Video(audio.url, "PRUEBA solo audio", audio.url, playbackHeaders)
                 }
             }
         }
