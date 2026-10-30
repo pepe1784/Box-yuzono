@@ -55,6 +55,12 @@ internal class InnerTube(
         private val JSON = Json { ignoreUnknownKeys = true }
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
+        /** Bumped on every diagnostic change so the report says which build it came from. */
+        private const val DIAG_VERSION = "v5 · 14.19"
+
+        private const val CHROME_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
         val WEB = ClientSpec(
             id = "1",
             name = "WEB",
@@ -144,7 +150,10 @@ internal class InnerTube(
      */
     private val playbackHeaders: Headers = Headers.Builder()
         .add("User-Agent", WEB.userAgent)
+        .add("Accept", "*/*")
         .add("Accept-Language", "en-US,en;q=0.9")
+        .add("Origin", "https://www.youtube.com")
+        .add("Referer", "https://www.youtube.com/")
         .build()
 
     // ============================== Requests ==============================
@@ -584,6 +593,7 @@ internal class InnerTube(
         pagePlayer: ((String) -> PageStreams?)?,
     ): String = buildString {
         appendLine("ID: $videoId")
+        appendLine("Prueba $DIAG_VERSION")
         val order = playerOrder(preferredClient)
         appendLine("Orden: ${order.joinToString(", ") { it.name }}")
 
@@ -619,6 +629,23 @@ internal class InnerTube(
         }
         videos.firstOrNull { it.audioTracks.isNotEmpty() && it.videoUrl != null }?.let {
             appendLine("Dos lecturas seguidas: ${twoStep(it.videoUrl!!)}")
+            appendLine("Cabeceras que recibe el reproductor: ${it.headers?.get("User-Agent")}")
+            appendLine("Matriz de cabeceras:")
+            val variants = listOf(
+                "nada" to Headers.Builder().build(),
+                "firefox" to Headers.Builder().add("User-Agent", WEB.userAgent).build(),
+                "chrome" to Headers.Builder().add("User-Agent", CHROME_UA).build(),
+                "android" to Headers.Builder().add("User-Agent", ANDROID.userAgent).build(),
+                "web completo" to streamHeaders(WEB),
+                "firefox+origin" to Headers.Builder()
+                    .add("User-Agent", WEB.userAgent)
+                    .add("Origin", "https://www.youtube.com")
+                    .add("Referer", "https://www.youtube.com/")
+                    .build(),
+            )
+            for ((name, headers) in variants) {
+                appendLine("  $name: ${probeWith(it.videoUrl!!, headers, snippet = name == "android")}")
+            }
         }
 
         // Which client's DASH links survive a plain request? That is the one the
@@ -673,12 +700,24 @@ internal class InnerTube(
         withHeaders: Boolean,
         range: String,
         readBody: Boolean = false,
+    ): String = probeWith(url, if (withHeaders) playbackHeaders else Headers.Builder().build(), readBody, range)
+
+    private fun probeWith(
+        url: String,
+        headers: Headers,
+        snippet: Boolean = false,
+        range: String = "bytes=0-1",
     ): String = try {
-        val builder = Request.Builder().url(url).header("Range", range).get()
-        if (withHeaders) builder.headers(playbackHeaders)
-        probeClient.newCall(builder.build()).execute().use { response ->
-            val size = if (readBody) response.body.bytes().size else 0
-            if (readBody) "HTTP ${response.code} ${size}b" else "HTTP ${response.code}"
+        val request = Request.Builder().url(url).headers(headers).header("Range", range).get().build()
+        probeClient.newCall(request).execute().use { response ->
+            when {
+                snippet && response.code !in 200..299 -> {
+                    val text = runCatching { response.body.string() }.getOrNull().orEmpty()
+                    "HTTP ${response.code} ${text.replace('\n', ' ').take(160)}"
+                }
+                snippet -> "HTTP ${response.code} ${response.body.bytes().size}b"
+                else -> "HTTP ${response.code}"
+            }
         }
     } catch (e: Exception) {
         "error ${e.message}"
