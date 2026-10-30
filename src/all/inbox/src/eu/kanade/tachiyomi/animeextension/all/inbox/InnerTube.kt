@@ -135,6 +135,18 @@ internal class InnerTube(
             .build()
     }
 
+    /**
+     * Headers for the DASH links handed to the player.
+     *
+     * googlevideo answers 403 to these links when the request carries the Android
+     * client's user agent (it then wants the poToken), but serves them with 206 for a
+     * plain browser agent. Muxed formats work either way, so only DASH is affected.
+     */
+    private val playbackHeaders: Headers = Headers.Builder()
+        .add("User-Agent", WEB.userAgent)
+        .add("Accept-Language", "en-US,en;q=0.9")
+        .build()
+
     // ============================== Requests ==============================
 
     fun searchRequest(query: String, params: String = PARAMS_VIDEOS): Request {
@@ -474,7 +486,7 @@ internal class InnerTube(
                 continue
             }
 
-            val playable = if (verifyStreams) filterPlayable(videos, spec) else videos
+            val playable = if (verifyStreams) filterPlayable(videos) else videos
             if (playable.isNotEmpty()) {
                 if (!usePageForDash) {
                     Log.d(TAG, "Resolved ${playable.size} streams with ${spec.name} (${videos.size} candidates)")
@@ -555,7 +567,7 @@ internal class InnerTube(
                 video.url,
                 "DASH ${video.label} • ${audio.label}",
                 video.url,
-                streamHeaders(WEB),
+                playbackHeaders,
                 audioTracks = listOf(Track(audio.url, audio.label)),
             ),
         )
@@ -663,7 +675,7 @@ internal class InnerTube(
         readBody: Boolean = false,
     ): String = try {
         val builder = Request.Builder().url(url).header("Range", range).get()
-        if (withHeaders) builder.headers(streamHeaders(ANDROID))
+        if (withHeaders) builder.headers(playbackHeaders)
         probeClient.newCall(builder.build()).execute().use { response ->
             val size = if (readBody) response.body.bytes().size else 0
             if (readBody) "HTTP ${response.code} ${size}b" else "HTTP ${response.code}"
@@ -707,7 +719,7 @@ internal class InnerTube(
                 )
             }.getOrNull().orEmpty()
             if (videos.isEmpty()) continue
-            val playable = if (verifyStreams) filterPlayable(videos, spec) else videos
+            val playable = if (verifyStreams) filterPlayable(videos) else videos
             if (playable.isEmpty()) {
                 failures += "${spec.name} DASH: ${videos.size} format(s) rejected"
                 continue
@@ -809,7 +821,7 @@ internal class InnerTube(
                             rep.url,
                             "DASH ${rep.height}p • ${audio.display}",
                             rep.url,
-                            headers,
+                            playbackHeaders,
                             audioTracks = listOf(Track(audio.url, audio.display)),
                             subtitleTracks = subtitles,
                         )
@@ -826,20 +838,20 @@ internal class InnerTube(
      * region, IP family or the `n` throttling parameter. Probing a single byte tells us which
      * formats the device can actually play, so the player never receives a dead URL.
      */
-    private fun filterPlayable(videos: List<Video>, spec: ClientSpec): List<Video> {
+    private fun filterPlayable(videos: List<Video>): List<Video> {
         val cache = mutableMapOf<String, Boolean>()
-        fun playable(url: String): Boolean = cache.getOrPut(url) { probe(url, spec) }
+        fun playable(url: String): Boolean = cache.getOrPut(url) { probe(url) }
         return videos.filter { video ->
             val videoUrl = video.videoUrl
             videoUrl != null && playable(videoUrl) && video.audioTracks.all { playable(it.url) }
         }
     }
 
-    private fun probe(url: String, spec: ClientSpec): Boolean {
+    private fun probe(url: String): Boolean {
         val request = try {
             Request.Builder()
                 .url(url)
-                .headers(streamHeaders(spec))
+                .headers(playbackHeaders)
                 .header("Range", "bytes=0-1")
                 .get()
                 .build()
