@@ -56,7 +56,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v6 · 14.20"
+        private const val DIAG_VERSION = "v7 · 14.21"
 
         private const val CHROME_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -107,13 +107,50 @@ internal class InnerTube(
             },
         )
 
-        val PLAYER_CLIENTS = listOf(ANDROID, ANDROID_VR, IOS)
+        val TVHTML5 = ClientSpec(
+            id = "7",
+            name = "TVHTML5",
+            version = "7.20250312.16.00",
+            userAgent = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.0-gold (unlike Gecko) v8/8.9.255.20-gold starboard/evergreen-amd64 JavaScript/1.0",
+        )
 
-        fun playerOrder(preferred: String): List<ClientSpec> = when (preferred) {
-            "ANDROID" -> listOf(ANDROID, ANDROID_VR, IOS)
-            "ANDROID_VR" -> listOf(ANDROID_VR, ANDROID, IOS)
-            "IOS" -> listOf(IOS, ANDROID, ANDROID_VR)
-            else -> listOf(ANDROID, ANDROID_VR, IOS)
+        val TV_EMBEDDED = ClientSpec(
+            id = "85",
+            name = "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            version = "2.0",
+            userAgent = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.0-gold (unlike Gecko) v8/8.9.255.20-gold starboard/evergreen-amd64 JavaScript/1.0",
+            embedUrl = "https://www.youtube.com/",
+        )
+
+        val WEB_EMBEDDED = ClientSpec(
+            id = "56",
+            name = "WEB_EMBEDDED_PLAYER",
+            version = "1.20250312.01.00",
+            userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            embedUrl = "https://www.youtube.com/",
+        )
+
+        val MWEB = ClientSpec(
+            id = "2",
+            name = "MWEB",
+            version = "2.20250312.04.00",
+            userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1",
+        )
+
+        val PLAYER_CLIENTS = listOf(
+            ANDROID,
+            IOS,
+            ANDROID_VR,
+            TVHTML5,
+            TV_EMBEDDED,
+            WEB_EMBEDDED,
+            MWEB,
+            WEB,
+        )
+
+        fun playerOrder(preferred: String): List<ClientSpec> {
+            val first = PLAYER_CLIENTS.firstOrNull { it.name == preferred } ?: ANDROID
+            return listOf(first) + PLAYER_CLIENTS.filter { it !== first }
         }
     }
 
@@ -648,9 +685,9 @@ internal class InnerTube(
             }
         }
 
-        // Which client's DASH links survive a plain request? That is the one the
-        // player can use no matter what headers it sends.
-        appendLine("Por cliente:")
+        // Which client offers links that keep working past the first chunk? That is the
+        // real problem: the start of the file is served, later ranges are refused.
+        appendLine("Por cliente (inicio / salto al minuto 5 / muxed):")
         for (spec in order) {
             val line = runCatching {
                 val body = client.newCall(playerRequest(videoId, spec)).execute()
@@ -658,19 +695,23 @@ internal class InnerTube(
                 val json = JSON.parseToJsonElement(body).jsonObject
                 val state = json.obj("playabilityStatus")?.str("status") ?: "?"
                 if (state != "OK") return@runCatching state
-                val formats = buildVideos(
-                    json = json,
-                    spec = spec,
-                    includeDash = true,
-                    includeMuxed = false,
-                    fetchSubtitles = false,
-                    preferredAudioLang = "",
-                    preferredSubtitleLang = "",
-                    preferredQuality = preferredQuality,
-                )
-                val first = formats.firstOrNull() ?: return@runCatching "sin formatos"
-                val url = first.videoUrl ?: return@runCatching "sin url"
-                "${probeCode(url)} / sin cabeceras: ${bareCode(url)}"
+                val streamingData = json.obj("streamingData") ?: return@runCatching "sin streamingData"
+                val adaptive = streamingData.arr("adaptiveFormats").orEmpty()
+                    .mapNotNull { it as? JsonObject }
+                val video = adaptive.firstOrNull {
+                    it.str("mimeType").orEmpty().startsWith("video/") && it.str("url") != null
+                }?.str("url")
+                val muxedFormats = streamingData.arr("formats").orEmpty()
+                    .mapNotNull { it as? JsonObject }
+                val muxedHeights = muxedFormats
+                    .mapNotNull { parseInt(it.str("height")) }
+                    .distinct()
+                    .sortedDescending()
+                val muxed = muxedFormats.firstOrNull { it.str("url") != null }?.str("url")
+                val head = video?.let { probeWith(it, playbackHeaders, range = "bytes=0-1") } ?: "sin video"
+                val jump = video?.let { probeWith(it, playbackHeaders, range = "bytes=5000000-5002047") } ?: "-"
+                val muxedCode = muxed?.let { probeWith(it, playbackHeaders, range = "bytes=5000000-5002047") } ?: "-"
+                "inicio $head, salto $jump, muxed salto $muxedCode, muxed ${muxedHeights.joinToString("/") { "${it}p" }}"
             }.getOrElse { "error ${it.message}" }
             appendLine("  ${spec.name}: $line")
         }
@@ -866,14 +907,6 @@ internal class InnerTube(
                         )
                     }
                 }
-
-                // Temporary probes: is the video link itself playable, and is the audio link?
-                val topDashUrl = videos.lastOrNull { it.audioTracks.isNotEmpty() }?.videoUrl
-                if (topDashUrl != null) {
-                    videos += Video(topDashUrl, "PRUEBA solo video", topDashUrl, playbackHeaders)
-                    val audio = filteredAudios.first()
-                    videos += Video(audio.url, "PRUEBA solo audio", audio.url, playbackHeaders)
-                }
             }
         }
 
@@ -981,6 +1014,9 @@ internal class InnerTube(
                 spec.extra.forEach { (key, value) -> put(key, value) }
             },
         )
+        spec.embedUrl?.let { url ->
+            put("thirdParty", buildJsonObject { put("embedUrl", url) })
+        }
         put("user", buildJsonObject { put("lockedSafetyMode", false) })
         put("request", buildJsonObject { put("useSsl", true) })
     }
@@ -1024,6 +1060,8 @@ internal data class ClientSpec(
     val version: String,
     val userAgent: String,
     val extra: JsonObject = JsonObject(emptyMap()),
+    /** Set for the embedded players: YouTube wants the page they are embedded in. */
+    val embedUrl: String? = null,
 )
 
 private data class VideoRep(val url: String, val height: Int, val bitrate: Int)

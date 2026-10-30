@@ -539,8 +539,28 @@ class InBox :
 
         private const val PREF_CLIENT_KEY = "pref_client"
         private const val PREF_CLIENT_DEFAULT = "auto"
-        private val PREF_CLIENT_ENTRIES = arrayOf("Auto (ANDROID first)", "ANDROID", "ANDROID_VR", "IOS")
-        private val PREF_CLIENT_VALUES = arrayOf("auto", "ANDROID", "ANDROID_VR", "IOS")
+        private val PREF_CLIENT_ENTRIES = arrayOf(
+            "Auto (ANDROID first)",
+            "ANDROID",
+            "IOS",
+            "ANDROID_VR",
+            "TVHTML5",
+            "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            "WEB_EMBEDDED_PLAYER",
+            "MWEB",
+            "WEB",
+        )
+        private val PREF_CLIENT_VALUES = arrayOf(
+            "auto",
+            "ANDROID",
+            "IOS",
+            "ANDROID_VR",
+            "TVHTML5",
+            "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            "WEB_EMBEDDED_PLAYER",
+            "MWEB",
+            "WEB",
+        )
 
         private const val PREF_QUALITY_KEY = "pref_quality"
         private const val PREF_QUALITY_DEFAULT = "auto"
