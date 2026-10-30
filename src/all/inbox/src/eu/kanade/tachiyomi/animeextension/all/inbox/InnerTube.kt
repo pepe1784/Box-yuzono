@@ -56,10 +56,11 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v7 · 14.21"
+        private const val DIAG_VERSION = "v8 · 14.22"
 
-        private const val CHROME_UA =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        /** User agent for the media requests, used by the relay too. */
+        const val PLAYBACK_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
         val WEB = ClientSpec(
             id = "1",
@@ -186,12 +187,69 @@ internal class InnerTube(
      * plain browser agent. Muxed formats work either way, so only DASH is affected.
      */
     private val playbackHeaders: Headers = Headers.Builder()
-        .add("User-Agent", WEB.userAgent)
+        .add("User-Agent", PLAYBACK_UA)
         .add("Accept", "*/*")
         .add("Accept-Language", "en-US,en;q=0.9")
         .add("Origin", "https://www.youtube.com")
         .add("Referer", "https://www.youtube.com/")
         .build()
+
+    /** Cache of relay urls, so one entry per stream is created. */
+    private val relayUrls = mutableMapOf<String, String>()
+
+    init {
+        // The relay asks for a new signed link whenever googlevideo starts refusing one.
+        StreamRelay.resolver = { videoId, itag, clientName -> freshUrl(videoId, itag, clientName) }
+    }
+
+    // ============================== Relay ===============================
+
+    /**
+     * Asks InnerTube for a fresh googlevideo link for [itag]. Called by the relay when
+     * the link it was using runs out of quota (HTTP 403/410).
+     */
+    fun freshUrl(videoId: String, itag: String, clientName: String): String? {
+        val primary = PLAYER_CLIENTS.firstOrNull { it.name == clientName } ?: ANDROID
+        // The same itag exists in every client, so a couple of tries is enough.
+        val candidates = listOf(primary, IOS, ANDROID).distinctBy { it.name }
+        for (spec in candidates) {
+            val url = runCatching { urlFor(videoId, spec, itag) }.getOrNull()
+            if (!url.isNullOrBlank()) return url
+        }
+        return null
+    }
+
+    private fun urlFor(videoId: String, spec: ClientSpec, itag: String): String? {
+        val body = client.newCall(playerRequest(videoId, spec)).execute().use { it.body.string() }
+        val json = JSON.parseToJsonElement(body).jsonObject
+        if (json.obj("playabilityStatus")?.str("status") != "OK") return null
+        val streamingData = json.obj("streamingData") ?: return null
+        val formats = streamingData.arr("adaptiveFormats").orEmpty() + streamingData.arr("formats").orEmpty()
+        return formats.mapNotNull { it as? JsonObject }
+            .firstOrNull { parseInt(it.str("itag"))?.toString() == itag }
+            ?.str("url")
+    }
+
+    /** Pubic url for the player: the local relay whenever it is available. */
+    private fun relayed(
+        videoId: String,
+        spec: ClientSpec,
+        itag: Int?,
+        url: String,
+        length: Long,
+        contentType: String,
+    ): String {
+        if (itag == null) return url
+        val key = "$videoId|$itag|${spec.name}"
+        synchronized(relayUrls) {
+            relayUrls[key]?.let { return it }
+            val relayed = runCatching {
+                StreamRelay.register(videoId, itag.toString(), spec.name, url, length, contentType)
+            }.getOrDefault(url)
+            relayUrls[key] = relayed
+            return relayed
+        }
+    }
 
     // ============================== Requests ==============================
 
@@ -516,6 +574,7 @@ internal class InnerTube(
                 buildVideos(
                     json = json,
                     spec = spec,
+                    videoId = videoId,
                     includeDash = includeDash && !usePageForDash,
                     includeMuxed = includeMuxed || usePageForDash,
                     fetchSubtitles = fetchSubtitles,
@@ -564,6 +623,7 @@ internal class InnerTube(
                 buildVideos(
                     json = JSON.parseToJsonElement(pageResponse).jsonObject,
                     spec = WEB,
+                    videoId = videoId,
                     includeDash = true,
                     includeMuxed = false,
                     fetchSubtitles = fetchSubtitles,
@@ -658,36 +718,29 @@ internal class InnerTube(
         val shown = if (videos.size > 5) videos.take(4) + videos.last() else videos
         shown.forEachIndexed { index, video ->
             val url = video.videoUrl ?: return@forEachIndexed
-            appendLine("${index + 1}. ${video.quality} (${flags(url)})")
-            appendLine("   video: ${probeCode(url)} / sin cabeceras: ${bareCode(url)}")
-            video.audioTracks.firstOrNull()?.let {
-                appendLine("   audio: ${probeCode(it.url)} / sin cabeceras: ${bareCode(it.url)}")
-            }
-        }
-        videos.firstOrNull { it.audioTracks.isNotEmpty() && it.videoUrl != null }?.let {
-            appendLine("Dos lecturas seguidas: ${twoStep(it.videoUrl!!)}")
-            appendLine("Cabeceras que recibe el reproductor: ${it.headers?.get("User-Agent")}")
-            appendLine("Matriz de cabeceras:")
-            val variants = listOf(
-                "nada" to Headers.Builder().build(),
-                "firefox" to Headers.Builder().add("User-Agent", WEB.userAgent).build(),
-                "chrome" to Headers.Builder().add("User-Agent", CHROME_UA).build(),
-                "android" to Headers.Builder().add("User-Agent", ANDROID.userAgent).build(),
-                "web completo" to streamHeaders(WEB),
-                "firefox+origin" to Headers.Builder()
-                    .add("User-Agent", WEB.userAgent)
-                    .add("Origin", "https://www.youtube.com")
-                    .add("Referer", "https://www.youtube.com/")
-                    .build(),
-            )
-            for ((name, headers) in variants) {
-                appendLine("  $name: ${probeWith(it.videoUrl!!, headers, snippet = name == "android")}")
-            }
+            val kind = if (StreamRelay.isRelay(url)) "relé" else flags(url)
+            appendLine("${index + 1}. ${video.quality} ($kind)")
         }
 
-        // Which client offers links that keep working past the first chunk? That is the
-        // real problem: the start of the file is served, later ranges are refused.
-        appendLine("Por cliente (inicio / salto al minuto 5 / muxed):")
+        // What matters now: reading through the relay exactly like the player does,
+        // with one open ended range, well past the point where the link used to die.
+        val dash = videos.firstOrNull { it.audioTracks.isNotEmpty() && it.videoUrl != null }
+        if (dash != null) {
+            appendLine("Por el relé, como el reproductor:")
+            appendLine("  video: ${relayRead(dash.videoUrl!!, 6 * 1024 * 1024)}")
+            dash.audioTracks.firstOrNull()?.let {
+                appendLine("  audio: ${relayRead(it.url, 1024 * 1024)}")
+            }
+        } else {
+            appendLine("Sin DASH: no hay nada que releer")
+        }
+
+        val muxed = videos.firstOrNull { it.audioTracks.isEmpty() && it.videoUrl != null }
+        if (muxed != null) {
+            appendLine("Muxed directo: ${probe(muxed.videoUrl!!, withHeaders = true, range = "bytes=0-1")}")
+        }
+
+        appendLine("Por cliente (estado y muxed):")
         for (spec in order) {
             val line = runCatching {
                 val body = client.newCall(playerRequest(videoId, spec)).execute()
@@ -696,25 +749,56 @@ internal class InnerTube(
                 val state = json.obj("playabilityStatus")?.str("status") ?: "?"
                 if (state != "OK") return@runCatching state
                 val streamingData = json.obj("streamingData") ?: return@runCatching "sin streamingData"
-                val adaptive = streamingData.arr("adaptiveFormats").orEmpty()
+                val muxedHeights = streamingData.arr("formats").orEmpty()
                     .mapNotNull { it as? JsonObject }
-                val video = adaptive.firstOrNull {
-                    it.str("mimeType").orEmpty().startsWith("video/") && it.str("url") != null
-                }?.str("url")
-                val muxedFormats = streamingData.arr("formats").orEmpty()
-                    .mapNotNull { it as? JsonObject }
-                val muxedHeights = muxedFormats
                     .mapNotNull { parseInt(it.str("height")) }
                     .distinct()
                     .sortedDescending()
-                val muxed = muxedFormats.firstOrNull { it.str("url") != null }?.str("url")
-                val head = video?.let { probeWith(it, playbackHeaders, range = "bytes=0-1") } ?: "sin video"
-                val jump = video?.let { probeWith(it, playbackHeaders, range = "bytes=5000000-5002047") } ?: "-"
-                val muxedCode = muxed?.let { probeWith(it, playbackHeaders, range = "bytes=5000000-5002047") } ?: "-"
-                "inicio $head, salto $jump, muxed salto $muxedCode, muxed ${muxedHeights.joinToString("/") { "${it}p" }}"
+                val adaptive = streamingData.arr("adaptiveFormats").orEmpty().size
+                "OK, $adaptive adaptativos, muxed ${muxedHeights.joinToString("/") { "${it}p" }}"
             }.getOrElse { "error ${it.message}" }
             appendLine("  ${spec.name}: $line")
         }
+    }
+
+    /**
+     * Reads [maxBytes] from [url] with a single open ended range, which is what the
+     * player sends when it starts a stream.
+     */
+    private fun relayRead(url: String, maxBytes: Long): String = try {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", PLAYBACK_UA)
+            .header("Range", "bytes=0-")
+            .get()
+            .build()
+        val started = System.currentTimeMillis()
+        probeClient.newBuilder()
+            .callTimeout(120, TimeUnit.SECONDS)
+            .build()
+            .newCall(request)
+            .execute()
+            .use { response ->
+                if (response.code !in 200..299) {
+                    "HTTP ${response.code}"
+                } else {
+                    val stream = response.body.byteStream()
+                    val buffer = ByteArray(64 * 1024)
+                    var total = 0L
+                    while (total < maxBytes) {
+                        val read = stream.read(buffer, 0, minOf(buffer.size.toLong(), maxBytes - total).toInt())
+                        if (read == -1) break
+                        total += read
+                    }
+                    val seconds = (System.currentTimeMillis() - started) / 1000.0
+                    val speed = if (seconds > 0.05) total / 1024.0 / 1024.0 / seconds else 0.0
+                    val time = String.format(Locale.US, "%.1f", seconds)
+                    val rate = String.format(Locale.US, "%.2f", speed)
+                    "HTTP ${response.code}, ${total / 1024}KB en ${time}s ($rate MB/s)"
+                }
+            }
+    } catch (e: Exception) {
+        "error ${e.message}"
     }
 
     private fun flags(url: String): String {
@@ -725,40 +809,20 @@ internal class InnerTube(
 
     private fun paramValue(url: String, name: String): String? = Regex("[?&]$name=([^&]*)").find(url)?.groupValues?.get(1)
 
-    private fun probeCode(url: String): String = probe(url, withHeaders = true, range = "bytes=0-1")
-
-    private fun bareCode(url: String): String = probe(url, withHeaders = false, range = "bytes=0-1")
-
-    private fun twoStep(url: String): String {
-        val first = probe(url, withHeaders = false, range = "bytes=0-524287", readBody = true)
-        // A later offset, like a seek in the middle of the video.
-        val second = probe(url, withHeaders = false, range = "bytes=5000000-5524287", readBody = true)
-        return "$first / $second"
-    }
-
     private fun probe(
         url: String,
         withHeaders: Boolean,
         range: String,
-        readBody: Boolean = false,
-    ): String = probeWith(url, if (withHeaders) playbackHeaders else Headers.Builder().build(), readBody, range)
+    ): String = probeWith(url, if (withHeaders) playbackHeaders else Headers.Builder().build(), range)
 
     private fun probeWith(
         url: String,
         headers: Headers,
-        snippet: Boolean = false,
         range: String = "bytes=0-1",
     ): String = try {
         val request = Request.Builder().url(url).headers(headers).header("Range", range).get().build()
         probeClient.newCall(request).execute().use { response ->
-            when {
-                snippet && response.code !in 200..299 -> {
-                    val text = runCatching { response.body.string() }.getOrNull().orEmpty()
-                    "HTTP ${response.code} ${text.replace('\n', ' ').take(160)}"
-                }
-                snippet -> "HTTP ${response.code} ${response.body.bytes().size}b"
-                else -> "HTTP ${response.code}"
-            }
+            "HTTP ${response.code}"
         }
     } catch (e: Exception) {
         "error ${e.message}"
@@ -790,6 +854,7 @@ internal class InnerTube(
                 buildVideos(
                     json = json,
                     spec = spec,
+                    videoId = videoId,
                     includeDash = true,
                     includeMuxed = false,
                     fetchSubtitles = fetchSubtitles,
@@ -820,6 +885,7 @@ internal class InnerTube(
 
     /** Asks for one byte without the app's headers, the way a plain player would. */
     private fun bareProbe(url: String): Boolean = try {
+        if (StreamRelay.isRelay(url)) return true
         val request = Request.Builder().url(url).header("Range", "bytes=0-1").get().build()
         probeClient.newCall(request).execute().use { it.code in 200..299 || it.code >= 500 }
     } catch (e: Exception) {
@@ -829,6 +895,7 @@ internal class InnerTube(
     private fun buildVideos(
         json: JsonObject,
         spec: ClientSpec,
+        videoId: String,
         includeDash: Boolean,
         includeMuxed: Boolean,
         fetchSubtitles: Boolean,
@@ -876,7 +943,15 @@ internal class InnerTube(
                     ?: format.str("audioQuality")?.takeIf { it.isNotBlank() }
                     ?: if (lang.isNotBlank()) lang else "Audio"
                 val bitrate = parseInt(format.str("bitrate")) ?: 0
-                AudioRep(url, bitrate, lang, display, mime.startsWith("audio/mp4"))
+                AudioRep(
+                    url = url,
+                    bitrate = bitrate,
+                    lang = lang,
+                    display = display,
+                    mp4 = mime.startsWith("audio/mp4"),
+                    itag = parseInt(format.str("itag")),
+                    length = format.str("contentLength")?.toLongOrNull() ?: 0L,
+                )
             }.sortedWith(compareByDescending<AudioRep> { it.bitrate })
                 .distinctBy { it.lang to it.bitrate }
             val filteredAudios = filterAudios(audios, preferredAudioLang)
@@ -891,18 +966,47 @@ internal class InnerTube(
                     if (codec.isNotBlank() && !codec.startsWith("avc1")) return@mapNotNull null
                     val height = parseInt(format.str("height")) ?: return@mapNotNull null
                     if (height > 1080) return@mapNotNull null
-                    VideoRep(url, height, parseInt(format.str("bitrate")) ?: 0)
+                    VideoRep(
+                        url = url,
+                        height = height,
+                        bitrate = parseInt(format.str("bitrate")) ?: 0,
+                        itag = parseInt(format.str("itag")),
+                        length = format.str("contentLength")?.toLongOrNull() ?: 0L,
+                    )
                 }.distinctBy { it.height }.sortedByDescending { it.height }
+
+                // The relay turns the open ended ranges the player asks for into
+                // bounded ones, which is the only way these links keep serving.
+                val audiosRelayed = filteredAudios.associateWith { audio ->
+                    relayed(
+                        videoId = videoId,
+                        spec = spec,
+                        itag = audio.itag,
+                        url = audio.url,
+                        length = audio.length,
+                        contentType = if (audio.mp4) "audio/mp4" else "audio/webm",
+                    )
+                }
 
                 for (rep in videoReps) {
                     if (!passesQuality(rep.height, preferredQuality)) continue
+                    val videoUrl = relayed(
+                        videoId = videoId,
+                        spec = spec,
+                        itag = rep.itag,
+                        url = rep.url,
+                        length = rep.length,
+                        contentType = "video/mp4",
+                    )
+                    val headers = if (StreamRelay.isRelay(videoUrl)) null else playbackHeaders
                     for (audio in filteredAudios) {
+                        val audioUrl = audiosRelayed[audio] ?: audio.url
                         videos += Video(
-                            rep.url,
+                            videoUrl,
                             "DASH ${rep.height}p • ${audio.display}",
-                            rep.url,
-                            playbackHeaders,
-                            audioTracks = listOf(Track(audio.url, audio.display)),
+                            videoUrl,
+                            headers,
+                            audioTracks = listOf(Track(audioUrl, audio.display)),
                             subtitleTracks = subtitles,
                         )
                     }
@@ -920,7 +1024,10 @@ internal class InnerTube(
      */
     private fun filterPlayable(videos: List<Video>): List<Video> {
         val cache = mutableMapOf<String, Boolean>()
-        fun playable(url: String): Boolean = cache.getOrPut(url) { probe(url) }
+
+        // The relay answers locally: it is not the link that has to be checked, the
+        // relay itself retries with a fresh one when googlevideo refuses.
+        fun playable(url: String): Boolean = StreamRelay.isRelay(url) || cache.getOrPut(url) { probe(url) }
         return videos.filter { video ->
             val videoUrl = video.videoUrl
             videoUrl != null && playable(videoUrl) && video.audioTracks.all { playable(it.url) }
@@ -1064,7 +1171,7 @@ internal data class ClientSpec(
     val embedUrl: String? = null,
 )
 
-private data class VideoRep(val url: String, val height: Int, val bitrate: Int)
+private data class VideoRep(val url: String, val height: Int, val bitrate: Int, val itag: Int?, val length: Long)
 private data class MuxedRep(val height: Int, val bitrate: Int, val label: String, val url: String)
 private data class AudioRep(
     val url: String,
@@ -1072,6 +1179,8 @@ private data class AudioRep(
     val lang: String,
     val display: String,
     val mp4: Boolean,
+    val itag: Int?,
+    val length: Long,
 )
 
 internal fun extractVideoId(text: String): String? {

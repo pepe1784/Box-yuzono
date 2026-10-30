@@ -393,9 +393,9 @@ class InBox :
         screen.addPreference(
             SwitchPreferenceCompat(screen.context).apply {
                 key = PREF_PAGE_DASH_KEY
-                title = "Get DASH from the video page (background)"
-                summary = "Loads the watch page in a hidden WebView so the links come with " +
-                    "the poToken and do not answer 403. Nothing is shown on screen."
+                title = "Try the video page first (experimental)"
+                summary = "Loads the watch page in a hidden WebView looking for links with a " +
+                    "poToken. Usually slower and often empty; the local relay is used otherwise."
                 setDefaultValue(PREF_PAGE_DASH_DEFAULT)
             },
         )
@@ -574,7 +574,7 @@ class InBox :
         private const val PREF_DASH_DEFAULT = true
 
         private const val PREF_PAGE_DASH_KEY = "pref_page_dash"
-        private const val PREF_PAGE_DASH_DEFAULT = true
+        private const val PREF_PAGE_DASH_DEFAULT = false
 
         private const val PREF_VERIFY_KEY = "pref_verify"
         private const val PREF_VERIFY_DEFAULT = true
