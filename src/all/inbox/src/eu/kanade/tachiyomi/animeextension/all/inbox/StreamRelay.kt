@@ -67,21 +67,25 @@ internal object StreamRelay {
         .retryOnConnectionFailure(true)
         .build()
 
-    /** Set by InnerTube: (videoId, itag, clientName) -> a freshly signed googlevideo url. */
+    /**
+     * Set by InnerTube: (videoId, itag, xtags, clientName) -> a freshly signed googlevideo url.
+     *
+     * `xtags` matters: one itag is served in several languages (original, dubbed, drc), so
+     * asking for "itag 140" alone can return a different language than the one playing.
+     */
     @Volatile
-    var resolver: ((String, String, String) -> String?)? = null
+    var resolver: ((String, String, String, String) -> String?)? = null
 
     private data class Entry(
         val videoId: String,
         val itag: String,
+        val xTags: String,
         val clientName: String,
         val contentType: String,
         val length: Long,
         @Volatile var url: String,
         @Volatile var lastRefresh: Long,
     )
-
-    private val refreshLock = Any()
 
     /**
      * Starts the server (once) and returns its port, or 0 when it could not listen.
@@ -118,6 +122,7 @@ internal object StreamRelay {
     fun register(
         videoId: String,
         itag: String,
+        xTags: String,
         clientName: String,
         url: String,
         length: Long,
@@ -127,7 +132,16 @@ internal object StreamRelay {
         if (listenPort == 0) return url
         if (entries.size >= MAX_ENTRIES) entries.clear()
         val token = "${sequence.incrementAndGet()}-$itag-${clientName.hashCode().toUInt().toString(16)}"
-        entries[token] = Entry(videoId, itag, clientName, contentType, length, url, System.currentTimeMillis())
+        entries[token] = Entry(
+            videoId = videoId,
+            itag = itag,
+            xTags = xTags,
+            clientName = clientName,
+            contentType = contentType,
+            length = length,
+            url = url,
+            lastRefresh = System.currentTimeMillis(),
+        )
         return "http://127.0.0.1:$listenPort/s/$token"
     }
 
@@ -264,17 +278,21 @@ internal object StreamRelay {
     }
 
     private fun refresh(entry: Entry) {
-        synchronized(refreshLock) {
+        // One lock per stream: video and audio must not wait for each other, that
+        // stall is heard as the sound stopping while the picture keeps going.
+        synchronized(entry) {
             val wait = MIN_REFRESH_MS - (System.currentTimeMillis() - entry.lastRefresh)
             if (wait > 0) {
                 runCatching { Thread.sleep(wait) }
             }
             val fresh = runCatching {
-                resolver?.invoke(entry.videoId, entry.itag, entry.clientName)
+                resolver?.invoke(entry.videoId, entry.itag, entry.xTags, entry.clientName)
             }.getOrNull()
             if (!fresh.isNullOrBlank()) {
                 entry.url = fresh
-                Log.d(TAG, "fresh link for itag ${entry.itag}")
+                Log.d(TAG, "fresh link for itag ${entry.itag} (${entry.xTags})")
+            } else {
+                Log.w(TAG, "no fresh link for itag ${entry.itag} (${entry.xTags})")
             }
             entry.lastRefresh = System.currentTimeMillis()
         }

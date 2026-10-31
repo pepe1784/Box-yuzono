@@ -391,6 +391,16 @@ class InBox :
             },
         )
         screen.addPreference(
+            ListPreference(screen.context).apply {
+                key = PREF_AUDIO_LANG_KEY
+                title = "Audio language"
+                entries = PREF_AUDIO_LANG_ENTRIES
+                entryValues = PREF_AUDIO_LANG_VALUES
+                setDefaultValue(PREF_AUDIO_LANG_DEFAULT)
+                summary = "%s"
+            },
+        )
+        screen.addPreference(
             SwitchPreferenceCompat(screen.context).apply {
                 key = PREF_PAGE_DASH_KEY
                 title = "Try the video page first (experimental)"

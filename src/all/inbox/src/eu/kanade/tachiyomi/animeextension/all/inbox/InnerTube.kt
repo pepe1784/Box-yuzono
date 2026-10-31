@@ -56,7 +56,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v8 · 14.22"
+        private const val DIAG_VERSION = "v9 · 14.23"
 
         /** User agent for the media requests, used by the relay too. */
         const val PLAYBACK_UA =
@@ -199,34 +199,40 @@ internal class InnerTube(
 
     init {
         // The relay asks for a new signed link whenever googlevideo starts refusing one.
-        StreamRelay.resolver = { videoId, itag, clientName -> freshUrl(videoId, itag, clientName) }
+        StreamRelay.resolver = { videoId, itag, xTags, clientName ->
+            freshUrl(videoId, itag, xTags, clientName)
+        }
     }
 
     // ============================== Relay ===============================
 
     /**
-     * Asks InnerTube for a fresh googlevideo link for [itag]. Called by the relay when
-     * the link it was using runs out of quota (HTTP 403/410).
+     * Asks InnerTube for a fresh googlevideo link for one exact stream. Called by the
+     * relay when the link it was using runs out of quota (HTTP 403/410).
+     *
+     * The match is on itag **and** xtags: the same itag carries the original audio, the
+     * dubbed one and the volume-normalised one, and swapping between them mid-playback
+     * is what made the sound disappear.
      */
-    fun freshUrl(videoId: String, itag: String, clientName: String): String? {
+    fun freshUrl(videoId: String, itag: String, xTags: String, clientName: String): String? {
         val primary = PLAYER_CLIENTS.firstOrNull { it.name == clientName } ?: ANDROID
         // The same itag exists in every client, so a couple of tries is enough.
         val candidates = listOf(primary, IOS, ANDROID).distinctBy { it.name }
         for (spec in candidates) {
-            val url = runCatching { urlFor(videoId, spec, itag) }.getOrNull()
+            val url = runCatching { urlFor(videoId, spec, itag, xTags) }.getOrNull()
             if (!url.isNullOrBlank()) return url
         }
         return null
     }
 
-    private fun urlFor(videoId: String, spec: ClientSpec, itag: String): String? {
+    private fun urlFor(videoId: String, spec: ClientSpec, itag: String, xTags: String): String? {
         val body = client.newCall(playerRequest(videoId, spec)).execute().use { it.body.string() }
         val json = JSON.parseToJsonElement(body).jsonObject
         if (json.obj("playabilityStatus")?.str("status") != "OK") return null
         val streamingData = json.obj("streamingData") ?: return null
         val formats = streamingData.arr("adaptiveFormats").orEmpty() + streamingData.arr("formats").orEmpty()
         return formats.mapNotNull { it as? JsonObject }
-            .firstOrNull { parseInt(it.str("itag"))?.toString() == itag }
+            .firstOrNull { parseInt(it.str("itag"))?.toString() == itag && xTagsOf(it.str("url")) == xTags }
             ?.str("url")
     }
 
@@ -235,16 +241,17 @@ internal class InnerTube(
         videoId: String,
         spec: ClientSpec,
         itag: Int?,
+        xTags: String,
         url: String,
         length: Long,
         contentType: String,
     ): String {
         if (itag == null) return url
-        val key = "$videoId|$itag|${spec.name}"
+        val key = "$videoId|$itag|$xTags|${spec.name}"
         synchronized(relayUrls) {
             relayUrls[key]?.let { return it }
             val relayed = runCatching {
-                StreamRelay.register(videoId, itag.toString(), spec.name, url, length, contentType)
+                StreamRelay.register(videoId, itag.toString(), xTags, spec.name, url, length, contentType)
             }.getOrDefault(url)
             relayUrls[key] = relayed
             return relayed
@@ -719,7 +726,11 @@ internal class InnerTube(
         shown.forEachIndexed { index, video ->
             val url = video.videoUrl ?: return@forEachIndexed
             val kind = if (StreamRelay.isRelay(url)) "relé" else flags(url)
+            val audio = video.audioTracks.joinToString(" / ") { it.lang }.ifBlank { "ninguno" }
+            val subs = video.subtitleTracks.joinToString(" / ") { it.lang }.ifBlank { "ninguno" }
             appendLine("${index + 1}. ${video.quality} ($kind)")
+            appendLine("   audio: $audio")
+            appendLine("   subtítulos: $subs")
         }
 
         // What matters now: reading through the relay exactly like the player does,
@@ -729,7 +740,7 @@ internal class InnerTube(
             appendLine("Por el relé, como el reproductor:")
             appendLine("  video: ${relayRead(dash.videoUrl!!, 6 * 1024 * 1024)}")
             dash.audioTracks.firstOrNull()?.let {
-                appendLine("  audio: ${relayRead(it.url, 1024 * 1024)}")
+                appendLine("  audio «${it.lang}»: ${relayRead(it.url, 1024 * 1024)}")
             }
         } else {
             appendLine("Sin DASH: no hay nada que releer")
@@ -938,22 +949,39 @@ internal class InnerTube(
                 val mime = format.str("mimeType").orEmpty()
                 if (!mime.startsWith("audio/mp4") && !mime.startsWith("audio/webm")) return@mapNotNull null
                 val track = format.obj("audioTrack")
-                val lang = track?.str("languageCode").orEmpty().lowercase(Locale.US)
-                val display = track?.str("displayName")?.takeIf { it.isNotBlank() }
+                val xTags = xTagsOf(url)
+                val rawName = track?.str("displayName")?.takeIf { it.isNotBlank() }
                     ?: format.str("audioQuality")?.takeIf { it.isNotBlank() }
-                    ?: if (lang.isNotBlank()) lang else "Audio"
-                val bitrate = parseInt(format.str("bitrate")) ?: 0
+                        .orEmpty()
+                val original = xTags.contains("acont=original") || rawName.contains("original", ignoreCase = true)
+                val drc = xTags.contains("drc=")
+                val lang = audioLanguage(xTags, rawName)
                 AudioRep(
                     url = url,
-                    bitrate = bitrate,
+                    bitrate = parseInt(format.str("bitrate")) ?: 0,
                     lang = lang,
-                    display = display,
+                    label = audioLabel(rawName, lang, original, drc, xTags),
                     mp4 = mime.startsWith("audio/mp4"),
                     itag = parseInt(format.str("itag")),
                     length = format.str("contentLength")?.toLongOrNull() ?: 0L,
+                    xTags = xTags,
+                    original = original,
                 )
-            }.sortedWith(compareByDescending<AudioRep> { it.bitrate })
-                .distinctBy { it.lang to it.bitrate }
+            }
+                // One itag is served in several languages and encodings: keep the best
+                // copy of each language (mp4 first, without volume normalisation), so the
+                // list of tracks is "original" and "dubbed" instead of a dozen twins.
+                .sortedWith(
+                    compareByDescending<AudioRep> { it.mp4 }
+                        .thenBy { it.xTags.contains("drc=") }
+                        .thenByDescending { it.bitrate },
+                )
+                .distinctBy { "${it.lang}|${it.original}" }
+                .sortedWith(
+                    compareByDescending<AudioRep> { it.original }
+                        .thenByDescending { it.mp4 }
+                        .thenByDescending { it.bitrate },
+                )
             val filteredAudios = filterAudios(audios, preferredAudioLang)
 
             if (filteredAudios.isNotEmpty()) {
@@ -977,39 +1005,42 @@ internal class InnerTube(
 
                 // The relay turns the open ended ranges the player asks for into
                 // bounded ones, which is the only way these links keep serving.
-                val audiosRelayed = filteredAudios.associateWith { audio ->
-                    relayed(
+                val audioTracks = filteredAudios.map { audio ->
+                    val audioUrl = relayed(
                         videoId = videoId,
                         spec = spec,
                         itag = audio.itag,
+                        xTags = audio.xTags,
                         url = audio.url,
                         length = audio.length,
                         contentType = if (audio.mp4) "audio/mp4" else "audio/webm",
                     )
+                    Track(audioUrl, audio.label)
                 }
 
+                // One entry per quality: the audio languages travel as tracks of the
+                // same video, which is what the player maps. Before this there was one
+                // entry per quality *and* language, so DASH repeated itself.
                 for (rep in videoReps) {
                     if (!passesQuality(rep.height, preferredQuality)) continue
                     val videoUrl = relayed(
                         videoId = videoId,
                         spec = spec,
                         itag = rep.itag,
+                        xTags = "",
                         url = rep.url,
                         length = rep.length,
                         contentType = "video/mp4",
                     )
                     val headers = if (StreamRelay.isRelay(videoUrl)) null else playbackHeaders
-                    for (audio in filteredAudios) {
-                        val audioUrl = audiosRelayed[audio] ?: audio.url
-                        videos += Video(
-                            videoUrl,
-                            "DASH ${rep.height}p • ${audio.display}",
-                            videoUrl,
-                            headers,
-                            audioTracks = listOf(Track(audioUrl, audio.display)),
-                            subtitleTracks = subtitles,
-                        )
-                    }
+                    videos += Video(
+                        videoUrl,
+                        "DASH ${rep.height}p",
+                        videoUrl,
+                        headers,
+                        audioTracks = audioTracks,
+                        subtitleTracks = subtitles,
+                    )
                 }
             }
         }
@@ -1058,29 +1089,37 @@ internal class InnerTube(
         }
     }
 
-    private fun extractSubtitles(json: JsonObject): List<Track> {
+    private fun extractSubtitles(json: JsonObject): List<SubtitleRep> {
         val tracks = json.obj("captions")
             ?.obj("playerCaptionsTracklistRenderer")
             ?.arr("captionTracks") ?: return emptyList()
         return tracks.mapNotNull { element ->
             val track = element as? JsonObject ?: return@mapNotNull null
             val baseUrl = track.str("baseUrl") ?: return@mapNotNull null
-            val lang = track.str("languageCode").orEmpty()
+            val code = track.str("languageCode").orEmpty().lowercase(Locale.US)
             val kind = track.str("kind").orEmpty()
-            val name = track.obj("name").text()
-                ?: if (lang.isNotBlank()) lang else "Subtitles"
+            val name = track.obj("name")?.text()?.takeIf { it.isNotBlank() }
+                ?: languageName(code).ifBlank { code }
             val label = if (kind.contains("asr", ignoreCase = true)) "$name (auto)" else name
             val url = if (baseUrl.contains("&fmt=") || baseUrl.contains("?fmt=")) baseUrl else "$baseUrl&fmt=vtt"
-            Track(url, label)
+            SubtitleRep(url, code, label)
         }
     }
 
-    private fun filterSubtitles(tracks: List<Track>, preferredSubtitleLang: String): List<Track> {
+    /**
+     * The language picked in the settings is a code ("es", "en"...), and the caption
+     * tracks carry one, so this maps properly instead of handing the player the first
+     * track of whatever came back.
+     */
+    private fun filterSubtitles(tracks: List<SubtitleRep>, preferredSubtitleLang: String): List<Track> {
         if (tracks.isEmpty()) return emptyList()
-        if (preferredSubtitleLang == "all") return tracks.distinctBy { it.url }
-        if (preferredSubtitleLang == "auto") return tracks.take(1)
-        val filtered = tracks.filter { it.lang.lowercase(Locale.US).startsWith(preferredSubtitleLang) }
-        return (if (filtered.isNotEmpty()) filtered else tracks.take(1)).distinctBy { it.url }
+        if (preferredSubtitleLang == "all") return tracks.distinctBy { it.url }.map { Track(it.url, it.name) }
+        val chosen = if (preferredSubtitleLang == "auto") {
+            tracks.take(1)
+        } else {
+            tracks.filter { it.code.startsWith(preferredSubtitleLang) }.ifEmpty { tracks.take(1) }
+        }
+        return chosen.distinctBy { it.url }.map { Track(it.url, it.name) }
     }
 
     private fun passesQuality(height: Int, preferredQuality: String): Boolean {
@@ -1095,20 +1134,75 @@ internal class InnerTube(
     }
 
     private fun filterAudios(audios: List<AudioRep>, preferredAudioLang: String): List<AudioRep> {
-        val ordered = audios.sortedWith(
-            compareByDescending<AudioRep> { it.mp4 }.thenByDescending { it.bitrate },
-        )
-        if (preferredAudioLang == "all") return ordered
-        val filtered = ordered.filter { audio ->
-            when (preferredAudioLang) {
-                "es" -> audio.lang.startsWith("es")
-                "en" -> audio.lang.startsWith("en")
-                "ja" -> audio.lang.startsWith("ja")
-                else -> true
-            }
-        }
-        return if (filtered.isNotEmpty()) filtered else ordered
+        // "original" is already the head of the list, so nothing to reorder.
+        if (audios.isEmpty() || preferredAudioLang == "all" || preferredAudioLang == "original") return audios
+        val preferred = audios.filter { it.lang.startsWith(preferredAudioLang) }
+        // The chosen language goes first (that is the one the player starts with) and
+        // the rest stay available as tracks instead of being thrown away.
+        return if (preferred.isEmpty()) audios else preferred + audios.filterNot { it.lang.startsWith(preferredAudioLang) }
     }
+
+    // ============================ Languages =============================
+
+    private val languageNames = mapOf(
+        "spanish" to ("es" to "Español"),
+        "english" to ("en" to "Inglés"),
+        "portuguese" to ("pt" to "Portugués"),
+        "japanese" to ("ja" to "Japonés"),
+        "french" to ("fr" to "Francés"),
+        "german" to ("de" to "Alemán"),
+        "italian" to ("it" to "Italiano"),
+        "russian" to ("ru" to "Ruso"),
+        "hindi" to ("hi" to "Hindi"),
+        "korean" to ("ko" to "Coreano"),
+        "chinese" to ("zh" to "Chino"),
+        "arabic" to ("ar" to "Árabe"),
+        "turkish" to ("tr" to "Turco"),
+        "indonesian" to ("id" to "Indonesio"),
+        "polish" to ("pl" to "Polaco"),
+        "thai" to ("th" to "Tailandés"),
+        "vietnamese" to ("vi" to "Vietnamita"),
+        "ukrainian" to ("uk" to "Ucraniano"),
+    )
+
+    private fun languageEntry(text: String): Pair<String, String>? {
+        val lower = text.lowercase(Locale.US)
+        return languageNames.entries.firstOrNull { lower.contains(it.key) }?.value
+    }
+
+    private fun languageName(code: String): String {
+        val prefix = code.take(2).lowercase(Locale.US)
+        return languageNames.values.firstOrNull { it.first == prefix }?.second.orEmpty()
+    }
+
+    /**
+     * The player response leaves `languageCode` empty and hides the language inside the
+     * xtags of the url ("...acont=original:lang=es-US"), which is why the language
+     * setting used to match nothing.
+     */
+    private fun audioLanguage(xTags: String, rawName: String): String {
+        Regex("lang=([A-Za-z-]+)").find(xTags)?.groupValues?.get(1)?.let {
+            return it.lowercase(Locale.US)
+        }
+        return languageEntry(rawName)?.first.orEmpty()
+    }
+
+    private fun audioLabel(rawName: String, lang: String, original: Boolean, drc: Boolean, xTags: String): String {
+        val entry = languageEntry(rawName)
+        val base = when {
+            entry != null -> {
+                val region = Regex("\\(([A-Za-z]{2})\\)").find(rawName)?.groupValues?.get(1)
+                if (region != null) "${entry.second} ($region)" else entry.second
+            }
+            else -> rawName.substringBefore(" original", rawName).trim()
+                .ifBlank { languageName(lang).ifBlank { "Audio" } }
+        }
+        if (!xTags.contains("acont=")) return base
+        val kind = if (original) "original" else "doblado"
+        return if (drc) "$base · $kind · volumen" else "$base · $kind"
+    }
+
+    private fun xTagsOf(url: String?): String = paramValue(url.orEmpty(), "xtags").orEmpty()
 
     private fun context(spec: ClientSpec): JsonObject = buildJsonObject {
         put(
@@ -1177,11 +1271,15 @@ private data class AudioRep(
     val url: String,
     val bitrate: Int,
     val lang: String,
-    val display: String,
+    val label: String,
     val mp4: Boolean,
     val itag: Int?,
     val length: Long,
+    val xTags: String,
+    val original: Boolean,
 )
+
+private data class SubtitleRep(val url: String, val code: String, val name: String)
 
 internal fun extractVideoId(text: String): String? {
     val trimmed = text.trim()
