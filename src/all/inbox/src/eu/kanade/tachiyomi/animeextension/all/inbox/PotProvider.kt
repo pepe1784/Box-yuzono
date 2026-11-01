@@ -43,6 +43,7 @@ internal object PotProvider {
 
     private const val WAIT_SECONDS = 30L
     private const val CACHE_MS = 60 * 60 * 1000L
+    private const val FAILURE_COOLDOWN_MS = 10 * 60 * 1000L
 
     private val context: Application by injectLazy()
     private val handler by lazy { Handler(Looper.getMainLooper()) }
@@ -56,6 +57,10 @@ internal object PotProvider {
     @Volatile
     private var cachedAt: Long = 0L
 
+    /** When the last attempt failed: no point paying 30 s per chunk to fail again. */
+    @Volatile
+    private var failedAt: Long = 0L
+
     /** Starts minting in the background so the first chunk already carries the token. */
     fun prewarm(videoId: String) {
         if (valid(videoId)) return
@@ -65,6 +70,9 @@ internal object PotProvider {
     /** The token for this video, or null when BotGuard is not available right now. */
     fun token(videoId: String): String? {
         if (valid(videoId)) return cached
+        // A failed mint costs half a minute; when it fails the relay has to keep
+        // working without a token instead of stalling every chunk.
+        if (System.currentTimeMillis() - failedAt < FAILURE_COOLDOWN_MS) return null
         return mint(videoId)
     }
 
@@ -152,6 +160,7 @@ internal object PotProvider {
                 cachedAt = System.currentTimeMillis()
                 Log.d(TAG, "pot ready in ${System.currentTimeMillis() - started}ms (${value.length} chars)")
             } else {
+                failedAt = System.currentTimeMillis()
                 Log.w(TAG, "no pot (finished=$finished): ${result.get()?.take(120) ?: "nothing"}")
             }
             return value
