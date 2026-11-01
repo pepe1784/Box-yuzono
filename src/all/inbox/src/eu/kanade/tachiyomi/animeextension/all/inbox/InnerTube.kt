@@ -56,7 +56,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v9 · 14.23"
+        private const val DIAG_VERSION = "v10 · 14.24"
 
         /** User agent for the media requests, used by the relay too. */
         const val PLAYBACK_UA =
@@ -694,6 +694,8 @@ internal class InnerTube(
         preferredAudioLang: String,
         preferredQuality: String,
         preferredClient: String,
+        fetchSubtitles: Boolean,
+        preferredSubtitleLang: String,
         pagePlayer: ((String) -> PageStreams?)?,
     ): String = buildString {
         appendLine("ID: $videoId")
@@ -707,9 +709,9 @@ internal class InnerTube(
                 response = response,
                 includeDash = includeDash,
                 includeMuxed = includeMuxed,
-                fetchSubtitles = false,
+                fetchSubtitles = fetchSubtitles,
                 preferredAudioLang = preferredAudioLang,
-                preferredSubtitleLang = "",
+                preferredSubtitleLang = preferredSubtitleLang,
                 preferredQuality = preferredQuality,
                 preferredClient = preferredClient,
                 // Show every candidate: the point is to see what the player would get.
@@ -750,6 +752,8 @@ internal class InnerTube(
         if (muxed != null) {
             appendLine("Muxed directo: ${probe(muxed.videoUrl!!, withHeaders = true, range = "bytes=0-1")}")
         }
+
+        appendLine("poToken: ${PotProvider.peek(videoId)?.let { "sí (${it.length} caracteres)" } ?: "no"}")
 
         appendLine("Por cliente (estado y muxed):")
         for (spec in order) {
@@ -966,19 +970,21 @@ internal class InnerTube(
                     length = format.str("contentLength")?.toLongOrNull() ?: 0L,
                     xTags = xTags,
                     original = original,
+                    drc = drc,
                 )
             }
-                // One itag is served in several languages and encodings: keep the best
-                // copy of each language (mp4 first, without volume normalisation), so the
-                // list of tracks is "original" and "dubbed" instead of a dozen twins.
+                // One itag is served in several languages and encodings, but the low
+                // bitrate copies die after a single chunk, so for each language keep the
+                // best copy (mp4 first, highest bitrate). The two original mixes YouTube
+                // offers (normal and volume normalised) stay, they are different tracks.
                 .sortedWith(
                     compareByDescending<AudioRep> { it.mp4 }
-                        .thenBy { it.xTags.contains("drc=") }
                         .thenByDescending { it.bitrate },
                 )
-                .distinctBy { "${it.lang}|${it.original}" }
+                .distinctBy { "${it.lang}|${it.original}|${it.drc}" }
                 .sortedWith(
                     compareByDescending<AudioRep> { it.original }
+                        .thenBy { it.drc }
                         .thenByDescending { it.mp4 }
                         .thenByDescending { it.bitrate },
                 )
@@ -1098,28 +1104,29 @@ internal class InnerTube(
             val baseUrl = track.str("baseUrl") ?: return@mapNotNull null
             val code = track.str("languageCode").orEmpty().lowercase(Locale.US)
             val kind = track.str("kind").orEmpty()
-            val name = track.obj("name")?.text()?.takeIf { it.isNotBlank() }
-                ?: languageName(code).ifBlank { code }
-            val label = if (kind.contains("asr", ignoreCase = true)) "$name (auto)" else name
+            val auto = kind.contains("asr", ignoreCase = true)
+            // "English (auto-generated)" is long and repeats the language, the name of
+            // the language plus the (auto) mark says the same in less space.
+            val language = languageName(code).ifBlank { track.obj("name")?.text().orEmpty().ifBlank { code } }
+            val label = if (auto) "$language (auto)" else language
             val url = if (baseUrl.contains("&fmt=") || baseUrl.contains("?fmt=")) baseUrl else "$baseUrl&fmt=vtt"
-            SubtitleRep(url, code, label)
+            SubtitleRep(url, code, label, auto)
         }
     }
 
     /**
      * The language picked in the settings is a code ("es", "en"...), and the caption
      * tracks carry one, so this maps properly instead of handing the player the first
-     * track of whatever came back.
+     * track of whatever came back. "Auto" used to keep a single track, which is how the
+     * auto generated subtitles ended up missing.
      */
     private fun filterSubtitles(tracks: List<SubtitleRep>, preferredSubtitleLang: String): List<Track> {
         if (tracks.isEmpty()) return emptyList()
-        if (preferredSubtitleLang == "all") return tracks.distinctBy { it.url }.map { Track(it.url, it.name) }
-        val chosen = if (preferredSubtitleLang == "auto") {
-            tracks.take(1)
-        } else {
-            tracks.filter { it.code.startsWith(preferredSubtitleLang) }.ifEmpty { tracks.take(1) }
+        val chosen = when (preferredSubtitleLang) {
+            "all", "auto", "" -> tracks
+            else -> tracks.filter { it.code.startsWith(preferredSubtitleLang) }.ifEmpty { tracks }
         }
-        return chosen.distinctBy { it.url }.map { Track(it.url, it.name) }
+        return chosen.distinctBy { "${it.code}|${it.auto}" }.map { Track(it.url, it.name) }
     }
 
     private fun passesQuality(height: Int, preferredQuality: String): Boolean {
@@ -1202,7 +1209,16 @@ internal class InnerTube(
         return if (drc) "$base · $kind · volumen" else "$base · $kind"
     }
 
-    private fun xTagsOf(url: String?): String = paramValue(url.orEmpty(), "xtags").orEmpty()
+    /**
+     * The url carries the audio identity in `xtags`, percent encoded
+     * (`acont%3Doriginal%3Alang%3Des-US`), so it has to be decoded before it can be
+     * read: that is where the language and the original/dubbed flag live.
+     */
+    private fun xTagsOf(url: String?): String {
+        val raw = paramValue(url.orEmpty(), "xtags").orEmpty()
+        if (raw.isEmpty() || !raw.contains("%")) return raw
+        return runCatching { java.net.URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
+    }
 
     private fun context(spec: ClientSpec): JsonObject = buildJsonObject {
         put(
@@ -1277,9 +1293,10 @@ private data class AudioRep(
     val length: Long,
     val xTags: String,
     val original: Boolean,
+    val drc: Boolean,
 )
 
-private data class SubtitleRep(val url: String, val code: String, val name: String)
+private data class SubtitleRep(val url: String, val code: String, val name: String, val auto: Boolean)
 
 internal fun extractVideoId(text: String): String? {
     val trimmed = text.trim()

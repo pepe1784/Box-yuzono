@@ -36,8 +36,11 @@ internal object StreamRelay {
     /** Bounded request size: big enough to be fast, small enough to survive the quota. */
     private const val CHUNK = 1024 * 1024L
 
-    /** How many fresh links to try for a single chunk before giving up. */
-    private const val MAX_RETRIES = 5
+    /** How many fresh links to try for a single chunk before slowing down. */
+    private const val GRACE_RETRIES = 4
+
+    /** How long the relay keeps a player waiting for a link that will not serve. */
+    private const val GIVE_UP_MS = 5 * 60 * 1000L
 
     /** Minimum time between two player requests, so a stubborn link does not hammer InnerTube. */
     private const val MIN_REFRESH_MS = 1000L
@@ -142,6 +145,9 @@ internal object StreamRelay {
             url = url,
             lastRefresh = System.currentTimeMillis(),
         )
+        // Minting the token takes a second or two; start it now so the first read
+        // already goes out with it and the link is not half used by the time it lands.
+        runCatching { PotProvider.prewarm(videoId) }
         return "http://127.0.0.1:$listenPort/s/$token"
     }
 
@@ -204,6 +210,10 @@ internal object StreamRelay {
         val buffer = ByteArray(64 * 1024)
         var position = start
         var retries = 0
+        // A link that stops serving is normal. Giving up on it is not: YouTube throttles
+        // for a while and then answers again, so the relay waits it out instead of
+        // closing the stream (which is the player freezing for good).
+        var stalledSince = System.currentTimeMillis()
         while (end < 0 || position <= end) {
             val chunkEnd = if (end < 0) position + CHUNK - 1 else minOf(position + CHUNK - 1, end)
             val response = try {
@@ -213,8 +223,13 @@ internal object StreamRelay {
             }
             if (response == null || response.code !in 200..299 || (response.code == 200 && position > 0)) {
                 response?.close()
-                if (retries++ >= MAX_RETRIES) {
-                    Log.w(TAG, "giving up at byte $position (${entry.videoId}/${entry.itag})")
+                retries++
+                if (retries > GRACE_RETRIES) {
+                    val wait = minOf(1500L shl minOf(retries - GRACE_RETRIES, 3), 12_000L)
+                    runCatching { Thread.sleep(wait) }
+                }
+                if (System.currentTimeMillis() - stalledSince > GIVE_UP_MS) {
+                    Log.w(TAG, "giving up at byte $position after ${GIVE_UP_MS / 1000}s (${entry.videoId}/${entry.itag})")
                     return
                 }
                 Log.d(TAG, "HTTP ${response?.code} at $position, asking for a fresh link")
@@ -252,10 +267,17 @@ internal object StreamRelay {
             if (written > 0) {
                 position += written
                 retries = 0
+                stalledSince = System.currentTimeMillis()
                 if (upstreamCut) Log.d(TAG, "upstream cut at $position, continuing with a fresh link")
                 continue
             }
-            if (retries++ >= MAX_RETRIES) {
+            // The response was fine but empty: same treatment, wait and try again.
+            retries++
+            if (retries > GRACE_RETRIES) {
+                val wait = minOf(1500L shl minOf(retries - GRACE_RETRIES, 3), 12_000L)
+                runCatching { Thread.sleep(wait) }
+            }
+            if (System.currentTimeMillis() - stalledSince > GIVE_UP_MS) {
                 Log.w(TAG, "no data at byte $position, giving up (${entry.videoId}/${entry.itag})")
                 return
             }
@@ -264,8 +286,14 @@ internal object StreamRelay {
     }
 
     private fun fetch(entry: Entry, start: Long, end: Long): okhttp3.Response {
+        val pot = runCatching { PotProvider.token(entry.videoId) }.getOrNull()
+        val url = if (pot.isNullOrBlank()) {
+            entry.url
+        } else {
+            entry.url + "&pot=" + java.net.URLEncoder.encode(pot, "UTF-8")
+        }
         val request = Request.Builder()
-            .url(entry.url)
+            .url(url)
             .header("User-Agent", InnerTube.PLAYBACK_UA)
             .header("Accept", "*/*")
             .header("Accept-Language", "en-US,en;q=0.9")

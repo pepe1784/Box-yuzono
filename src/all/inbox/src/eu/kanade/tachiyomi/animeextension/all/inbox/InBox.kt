@@ -477,6 +477,8 @@ class InBox :
                 preferredAudioLang = preferredAudioLang,
                 preferredQuality = preferredQuality,
                 preferredClient = preferredClient,
+                fetchSubtitles = fetchSubtitles,
+                preferredSubtitleLang = preferredSubtitleLang,
                 pagePlayer = if (pageDash) { id -> pagePlayer.streams(id) } else null,
             )
             Log.d("INbox", "DASH test\n$report")
