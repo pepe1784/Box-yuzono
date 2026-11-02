@@ -56,7 +56,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v10 · 14.24"
+        private const val DIAG_VERSION = "v11 · 14.25"
 
         /** User agent for the media requests, used by the relay too. */
         const val PLAYBACK_UA =
@@ -753,6 +753,8 @@ internal class InnerTube(
             appendLine("Muxed directo: ${probe(muxed.videoUrl!!, withHeaders = true, range = "bytes=0-1")}")
         }
 
+        appendLine("Corte de YouTube (enlace nuevo, mitad del archivo): ${windowLine(videoId, order.first())}")
+
         appendLine("poToken: ${PotProvider.peek(videoId)?.let { "sí (${it.length} caracteres)" } ?: "no"}")
 
         appendLine("Por cliente (estado y muxed):")
@@ -773,6 +775,35 @@ internal class InnerTube(
                 "OK, $adaptive adaptativos, muxed ${muxedHeights.joinToString("/") { "${it}p" }}"
             }.getOrElse { "error ${it.message}" }
             appendLine("  ${spec.name}: $line")
+        }
+    }
+
+    /**
+     * Proof, on the device itself, of the limit that kills DASH: a *freshly signed*
+     * adaptive link also answers 403 when asked for the middle of the file. Measured
+     * on several videos: one link only ever serves its first ~58 seconds, in every
+     * client, with or without poToken. The muxed link is probed the same way to show
+     * the difference (it answers 206).
+     */
+    private fun windowLine(videoId: String, spec: ClientSpec): String {
+        fun deep(format: JsonObject?): String {
+            val url = format?.str("url")
+            val length = format?.str("contentLength")?.toLongOrNull() ?: 0L
+            if (url.isNullOrBlank()) return "sin enlace"
+            if (length <= 0) return "sin tamaño"
+            val start = length / 2
+            return probe(url, withHeaders = true, range = "bytes=$start-${start + 1}")
+        }
+        return try {
+            val body = client.newCall(playerRequest(videoId, spec)).execute().use { it.body.string() }
+            val streaming = JSON.parseToJsonElement(body).jsonObject.obj("streamingData")
+            val formats = streaming?.arr("adaptiveFormats").orEmpty().mapNotNull { it as? JsonObject }
+            val video = formats.filter { it.str("mimeType").orEmpty().startsWith("video/mp4") }
+                .maxByOrNull { parseInt(it.str("height")) ?: 0 }
+            val muxed = streaming?.arr("formats").orEmpty().mapNotNull { it as? JsonObject }.firstOrNull()
+            "video ${deep(video)} · muxed ${deep(muxed)}"
+        } catch (e: Exception) {
+            "error ${e.message}"
         }
     }
 
@@ -941,7 +972,7 @@ internal class InnerTube(
 
             for (rep in muxed) {
                 if (!passesQuality(rep.height, preferredQuality)) continue
-                videos += Video(rep.url, "Muxed ${rep.label}", rep.url, headers, subtitleTracks = subtitles)
+                videos += Video(rep.url, "Muxed ${rep.label} · completo", rep.url, headers, subtitleTracks = subtitles)
             }
         }
 
@@ -1027,6 +1058,8 @@ internal class InnerTube(
                 // One entry per quality: the audio languages travel as tracks of the
                 // same video, which is what the player maps. Before this there was one
                 // entry per quality *and* language, so DASH repeated itself.
+                // The label says "1 min" because YouTube only serves the first ~58
+                // seconds of any adaptive link now; the muxed entry plays it all.
                 for (rep in videoReps) {
                     if (!passesQuality(rep.height, preferredQuality)) continue
                     val videoUrl = relayed(
@@ -1041,7 +1074,7 @@ internal class InnerTube(
                     val headers = if (StreamRelay.isRelay(videoUrl)) null else playbackHeaders
                     videos += Video(
                         videoUrl,
-                        "DASH ${rep.height}p",
+                        "DASH ${rep.height}p · 1 min",
                         videoUrl,
                         headers,
                         audioTracks = audioTracks,

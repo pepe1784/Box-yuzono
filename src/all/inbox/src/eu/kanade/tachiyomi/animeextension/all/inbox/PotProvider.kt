@@ -14,6 +14,7 @@ import uy.kohesive.injekt.injectLazy
 import java.io.ByteArrayInputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -61,19 +62,30 @@ internal object PotProvider {
     @Volatile
     private var failedAt: Long = 0L
 
-    /** Starts minting in the background so the first chunk already carries the token. */
-    fun prewarm(videoId: String) {
-        if (valid(videoId)) return
-        Thread({ token(videoId) }, "inbox-pot").apply { isDaemon = true }.start()
-    }
+    /** True while a WebView is being set up. Only one at a time. */
+    private val minting = AtomicBoolean(false)
 
-    /** The token for this video, or null when BotGuard is not available right now. */
-    fun token(videoId: String): String? {
-        if (valid(videoId)) return cached
+    /**
+     * Asks for a token in the background. Nothing ever waits for it: setting up a
+     * WebView takes a second or two, and the player must not pay that when it opens
+     * a stream (that delay was visible as "it takes ages to start").
+     */
+    fun request(videoId: String) {
+        if (valid(videoId)) return
         // A failed mint costs half a minute; when it fails the relay has to keep
         // working without a token instead of stalling every chunk.
-        if (System.currentTimeMillis() - failedAt < FAILURE_COOLDOWN_MS) return null
-        return mint(videoId)
+        if (System.currentTimeMillis() - failedAt < FAILURE_COOLDOWN_MS) return
+        if (!minting.compareAndSet(false, true)) return
+        Thread(
+            {
+                try {
+                    mint(videoId)
+                } finally {
+                    minting.set(false)
+                }
+            },
+            "inbox-pot",
+        ).apply { isDaemon = true }.start()
     }
 
     /** Whatever is cached, without asking for a new one (for the diagnostic screen). */

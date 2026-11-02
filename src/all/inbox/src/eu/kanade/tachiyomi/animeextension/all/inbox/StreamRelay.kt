@@ -22,8 +22,10 @@ import kotlin.concurrent.thread
  * YouTube only serves a DASH link for a while and only in bounded pieces: an
  * open ended request (`Range: bytes=0-`), which is exactly what a player sends
  * when it starts a stream, is answered with 403, and after a couple of megabytes
- * the link starts refusing everything. A progressive (muxed) link has no such
- * limit, which is why only the 360p entry used to play.
+ * the link starts refusing everything. Measured in 2026: **one adaptive link only
+ * ever serves its first ~58 seconds of media**, in any client, with or without a
+ * poToken (a token stretches it from ~4 s to those ~58 s). A progressive (muxed)
+ * link has no such limit, which is why only the 360p entry plays a whole episode.
  *
  * The relay asks googlevideo for bounded chunks, keeps one long response open to
  * the player, and when a link is exhausted it asks InnerTube for a fresh one and
@@ -37,10 +39,17 @@ internal object StreamRelay {
     private const val CHUNK = 1024 * 1024L
 
     /** How many fresh links to try for a single chunk before slowing down. */
-    private const val GRACE_RETRIES = 4
+    private const val GRACE_RETRIES = 3
 
-    /** How long the relay keeps a player waiting for a link that will not serve. */
-    private const val GIVE_UP_MS = 5 * 60 * 1000L
+    /**
+     * How long the relay keeps a player waiting for a link that will not serve.
+     *
+     * Measured limit: an adaptive link only ever serves its first ~58 seconds, no
+     * matter how often it is refreshed. Waiting minutes for it (the previous 5
+     * minutes) is what left the player "loading" forever, so the relay closes the
+     * stream instead and the player can report the failure and be reopened.
+     */
+    private const val GIVE_UP_MS = 90 * 1000L
 
     /** Minimum time between two player requests, so a stubborn link does not hammer InnerTube. */
     private const val MIN_REFRESH_MS = 1000L
@@ -145,9 +154,6 @@ internal object StreamRelay {
             url = url,
             lastRefresh = System.currentTimeMillis(),
         )
-        // Minting the token takes a second or two; start it now so the first read
-        // already goes out with it and the link is not half used by the time it lands.
-        runCatching { PotProvider.prewarm(videoId) }
         return "http://127.0.0.1:$listenPort/s/$token"
     }
 
@@ -233,6 +239,7 @@ internal object StreamRelay {
                     return
                 }
                 Log.d(TAG, "HTTP ${response?.code} at $position, asking for a fresh link")
+                runCatching { PotProvider.request(entry.videoId) }
                 refresh(entry)
                 continue
             }
@@ -281,12 +288,16 @@ internal object StreamRelay {
                 Log.w(TAG, "no data at byte $position, giving up (${entry.videoId}/${entry.itag})")
                 return
             }
+            runCatching { PotProvider.request(entry.videoId) }
             refresh(entry)
         }
     }
 
     private fun fetch(entry: Entry, start: Long, end: Long): okhttp3.Response {
-        val pot = runCatching { PotProvider.token(entry.videoId) }.getOrNull()
+        // Never wait for the token here: setting up a WebView to mint it takes a
+        // second or two, and that delay would be paid before the picture appears.
+        // `refresh` asks for it in the background instead.
+        val pot = runCatching { PotProvider.peek(entry.videoId) }.getOrNull()
         val url = if (pot.isNullOrBlank()) {
             entry.url
         } else {
