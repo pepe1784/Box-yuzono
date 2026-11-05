@@ -56,7 +56,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v11 · 14.25"
+        private const val DIAG_VERSION = "v12 · 14.26"
 
         /** User agent for the media requests, used by the relay too. */
         const val PLAYBACK_UA =
@@ -200,7 +200,7 @@ internal class InnerTube(
     init {
         // The relay asks for a new signed link whenever googlevideo starts refusing one.
         StreamRelay.resolver = { videoId, itag, xTags, clientName ->
-            freshUrl(videoId, itag, xTags, clientName)
+            freshSource(videoId, itag, xTags, clientName)
         }
     }
 
@@ -214,26 +214,74 @@ internal class InnerTube(
      * dubbed one and the volume-normalised one, and swapping between them mid-playback
      * is what made the sound disappear.
      */
-    fun freshUrl(videoId: String, itag: String, xTags: String, clientName: String): String? {
+    private fun freshSource(videoId: String, itag: String, xTags: String, clientName: String): RelaySource? {
         val primary = PLAYER_CLIENTS.firstOrNull { it.name == clientName } ?: ANDROID
         // The same itag exists in every client, so a couple of tries is enough.
         val candidates = listOf(primary, IOS, ANDROID).distinctBy { it.name }
         for (spec in candidates) {
-            val url = runCatching { urlFor(videoId, spec, itag, xTags) }.getOrNull()
-            if (!url.isNullOrBlank()) return url
+            val source = runCatching { sourceFor(videoId, spec, itag, xTags) }.getOrNull()
+            if (source != null) return source
         }
         return null
     }
 
-    private fun urlFor(videoId: String, spec: ClientSpec, itag: String, xTags: String): String? {
+    private fun sourceFor(videoId: String, spec: ClientSpec, itag: String, xTags: String): RelaySource? {
         val body = client.newCall(playerRequest(videoId, spec)).execute().use { it.body.string() }
         val json = JSON.parseToJsonElement(body).jsonObject
         if (json.obj("playabilityStatus")?.str("status") != "OK") return null
         val streamingData = json.obj("streamingData") ?: return null
         val formats = streamingData.arr("adaptiveFormats").orEmpty() + streamingData.arr("formats").orEmpty()
-        return formats.mapNotNull { it as? JsonObject }
+        val format = formats.mapNotNull { it as? JsonObject }
             .firstOrNull { parseInt(it.str("itag"))?.toString() == itag && xTagsOf(it.str("url")) == xTags }
-            ?.str("url")
+            ?: return null
+        val url = format.str("url") ?: return null
+        return RelaySource(url, sabrSpec(json, streamingData, spec, format))
+    }
+
+    /**
+     * The SABR session for one format, when the player response carries one.
+     *
+     * `serverAbrStreamingUrl` is what the YouTube apps stream from: it is not limited
+     * to the first minute, and every segment it sends states the byte range it occupies
+     * in the file, which is what lets the relay serve a normal mp4 the player can seek.
+     */
+    private fun sabrSpec(
+        json: JsonObject,
+        streamingData: JsonObject,
+        spec: ClientSpec,
+        format: JsonObject,
+    ): SabrSpec? {
+        val abrUrl = streamingData.str("serverAbrStreamingUrl")?.takeIf { it.isNotBlank() } ?: return null
+        val config = json.obj("playerConfig")
+            ?.obj("mediaCommonConfig")
+            ?.obj("mediaUstreamerRequestConfig")
+            ?.str("videoPlaybackUstreamerConfig")
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
+        val itag = parseInt(format.str("itag")) ?: return null
+        val index = format.obj("indexRange")
+        return SabrSpec(
+            abrUrl = abrUrl,
+            ustreamerConfig = config,
+            itag = itag,
+            lastModified = format.str("lastModified").orEmpty(),
+            xTags = xTagsOf(format.str("url")),
+            audioTrackId = format.obj("audioTrack")?.str("id"),
+            isAudio = format.str("mimeType").orEmpty().startsWith("audio/"),
+            height = parseInt(format.str("height")) ?: 0,
+            clientId = spec.id.toIntOrNull() ?: 3,
+            clientVersion = spec.version,
+            osName = spec.extra.str("osName"),
+            osVersion = spec.extra.str("osVersion"),
+            deviceMake = spec.extra.str("deviceMake"),
+            deviceModel = spec.extra.str("deviceModel"),
+            userAgent = spec.userAgent,
+            initEnd = format.obj("initRange")?.str("end")?.toLongOrNull() ?: 0L,
+            indexStart = index?.str("start")?.toLongOrNull() ?: 0L,
+            indexEnd = index?.str("end")?.toLongOrNull() ?: 0L,
+            length = format.str("contentLength")?.toLongOrNull() ?: 0L,
+            durationMs = (json.obj("videoDetails")?.str("lengthSeconds")?.toLongOrNull() ?: 0L) * 1000L,
+        )
     }
 
     /** Pubic url for the player: the local relay whenever it is available. */
@@ -245,13 +293,14 @@ internal class InnerTube(
         url: String,
         length: Long,
         contentType: String,
+        sabr: SabrSpec? = null,
     ): String {
         if (itag == null) return url
         val key = "$videoId|$itag|$xTags|${spec.name}"
         synchronized(relayUrls) {
             relayUrls[key]?.let { return it }
             val relayed = runCatching {
-                StreamRelay.register(videoId, itag.toString(), xTags, spec.name, url, length, contentType)
+                StreamRelay.register(videoId, itag.toString(), xTags, spec.name, url, length, contentType, sabr)
             }.getOrDefault(url)
             relayUrls[key] = relayed
             return relayed
@@ -740,9 +789,11 @@ internal class InnerTube(
         val dash = videos.firstOrNull { it.audioTracks.isNotEmpty() && it.videoUrl != null }
         if (dash != null) {
             appendLine("Por el relé, como el reproductor:")
+            appendLine("  servicio: ${StreamRelay.describe(dash.videoUrl!!)}")
             appendLine("  video: ${relayRead(dash.videoUrl!!, 6 * 1024 * 1024)}")
             dash.audioTracks.firstOrNull()?.let {
                 appendLine("  audio «${it.lang}»: ${relayRead(it.url, 1024 * 1024)}")
+                appendLine("  servicio audio: ${StreamRelay.describe(it.url)}")
             }
         } else {
             appendLine("Sin DASH: no hay nada que releer")
@@ -1002,6 +1053,7 @@ internal class InnerTube(
                     xTags = xTags,
                     original = original,
                     drc = drc,
+                    sabr = sabrSpec(json, streamingData, spec, format),
                 )
             }
                 // One itag is served in several languages and encodings, but the low
@@ -1037,11 +1089,14 @@ internal class InnerTube(
                         bitrate = parseInt(format.str("bitrate")) ?: 0,
                         itag = parseInt(format.str("itag")),
                         length = format.str("contentLength")?.toLongOrNull() ?: 0L,
+                        sabr = sabrSpec(json, streamingData, spec, format),
                     )
                 }.distinctBy { it.height }.sortedByDescending { it.height }
 
                 // The relay turns the open ended ranges the player asks for into
                 // bounded ones, which is the only way these links keep serving.
+                // The relay rebuilds each of these streams from SABR (the endpoint the
+                // YouTube apps use), so DASH is not limited to the first minute any more.
                 val audioTracks = filteredAudios.map { audio ->
                     val audioUrl = relayed(
                         videoId = videoId,
@@ -1051,6 +1106,7 @@ internal class InnerTube(
                         url = audio.url,
                         length = audio.length,
                         contentType = if (audio.mp4) "audio/mp4" else "audio/webm",
+                        sabr = audio.sabr,
                     )
                     Track(audioUrl, audio.label)
                 }
@@ -1058,8 +1114,6 @@ internal class InnerTube(
                 // One entry per quality: the audio languages travel as tracks of the
                 // same video, which is what the player maps. Before this there was one
                 // entry per quality *and* language, so DASH repeated itself.
-                // The label says "1 min" because YouTube only serves the first ~58
-                // seconds of any adaptive link now; the muxed entry plays it all.
                 for (rep in videoReps) {
                     if (!passesQuality(rep.height, preferredQuality)) continue
                     val videoUrl = relayed(
@@ -1070,11 +1124,12 @@ internal class InnerTube(
                         url = rep.url,
                         length = rep.length,
                         contentType = "video/mp4",
+                        sabr = rep.sabr,
                     )
                     val headers = if (StreamRelay.isRelay(videoUrl)) null else playbackHeaders
                     videos += Video(
                         videoUrl,
-                        "DASH ${rep.height}p · 1 min",
+                        "DASH ${rep.height}p · completo",
                         videoUrl,
                         headers,
                         audioTracks = audioTracks,
@@ -1314,7 +1369,15 @@ internal data class ClientSpec(
     val embedUrl: String? = null,
 )
 
-private data class VideoRep(val url: String, val height: Int, val bitrate: Int, val itag: Int?, val length: Long)
+private data class VideoRep(
+    val url: String,
+    val height: Int,
+    val bitrate: Int,
+    val itag: Int?,
+    val length: Long,
+    val sabr: SabrSpec?,
+)
+
 private data class MuxedRep(val height: Int, val bitrate: Int, val label: String, val url: String)
 private data class AudioRep(
     val url: String,
@@ -1327,6 +1390,7 @@ private data class AudioRep(
     val xTags: String,
     val original: Boolean,
     val drc: Boolean,
+    val sabr: SabrSpec?,
 )
 
 private data class SubtitleRep(val url: String, val code: String, val name: String, val auto: Boolean)
