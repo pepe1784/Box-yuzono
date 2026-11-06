@@ -56,7 +56,14 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v12 · 14.26"
+        private const val DIAG_VERSION = "v13 · 14.27"
+
+        /**
+         * How long the list waits for the poToken before settling for a tokenless
+         * client. The token is what keeps a stream alive past the minute, so it is
+         * worth a moment, but not a visible hang.
+         */
+        private const val POT_WAIT_MS = 3000L
 
         /** User agent for the media requests, used by the relay too. */
         const val PLAYBACK_UA =
@@ -149,9 +156,16 @@ internal class InnerTube(
             WEB,
         )
 
-        fun playerOrder(preferred: String): List<ClientSpec> {
+        fun playerOrder(preferred: String, attested: Boolean = false): List<ClientSpec> {
             val first = PLAYER_CLIENTS.firstOrNull { it.name == preferred } ?: ANDROID
-            return listOf(first) + PLAYER_CLIENTS.filter { it !== first }
+            val base = listOf(first) + PLAYER_CLIENTS.filter { it !== first }
+            if (!attested) return base
+            // The token that can be minted here is the one the web player asks for, and
+            // YouTube only honours it when the session says it is that same web client.
+            // Asking a mobile client with it is what made SABR answer "rejected" and cut
+            // the picture at the minute. MWEB is the web client that keeps answering on
+            // phones, so it goes first whenever a token is available.
+            return listOf(MWEB) + base.filter { it !== MWEB }
         }
     }
 
@@ -204,7 +218,18 @@ internal class InnerTube(
         }
     }
 
-    // ============================== Relay ===============================
+    /**
+     * The order of clients to ask, which depends on whether the poToken is ready.
+     *
+     * Both the request that opens the video and its parse need the same answer: the
+     * first one is the client whose response is used as-is, and the SABR session is
+     * built from *that* client's response. Waiting for the token here is what lets the
+     * list start with a web client, which is the one the token is valid for.
+     */
+    fun orderFor(videoId: String, preferred: String): List<ClientSpec> {
+        val attested = PotProvider.await(videoId, POT_WAIT_MS) != null
+        return playerOrder(preferred, attested)
+    }
 
     /**
      * Asks InnerTube for a fresh googlevideo link for one exact stream. Called by the
@@ -216,9 +241,12 @@ internal class InnerTube(
      */
     private fun freshSource(videoId: String, itag: String, xTags: String, clientName: String): RelaySource? {
         val primary = PLAYER_CLIENTS.firstOrNull { it.name == clientName } ?: ANDROID
-        // The same itag exists in every client, so a couple of tries is enough.
-        val candidates = listOf(primary, IOS, ANDROID).distinctBy { it.name }
-        for (spec in candidates) {
+        // The same itag exists in every client, so a couple of tries is enough. With a
+        // token in hand the web client goes first: it is the one whose session the token
+        // belongs to, and the one that can keep serving after the minute.
+        val attested = runCatching { PotProvider.peek(videoId) }.getOrNull() != null
+        val candidates = (if (attested) listOf(MWEB) else emptyList()) + listOf(primary, IOS, ANDROID)
+        for (spec in candidates.distinctBy { it.name }) {
             val source = runCatching { sourceFor(videoId, spec, itag, xTags) }.getOrNull()
             if (source != null) return source
         }
@@ -340,6 +368,9 @@ internal class InnerTube(
     }
 
     fun playerRequest(videoId: String, spec: ClientSpec): Request {
+        // The web clients refuse to hand out anything without it, and the mobile ones
+        // ignore it, so it travels whenever it has been minted.
+        val pot = runCatching { PotProvider.peek(videoId) }.getOrNull()
         val body = buildJsonObject {
             put("context", context(spec))
             put("videoId", videoId)
@@ -356,6 +387,14 @@ internal class InnerTube(
                     )
                 },
             )
+            if (!pot.isNullOrBlank()) {
+                put(
+                    "serviceIntegrityDimensions",
+                    buildJsonObject {
+                        put("poToken", pot)
+                    },
+                )
+            }
         }
         return post("$API_URL/player?prettyPrint=false", body, apiHeaders(spec))
             .newBuilder()
@@ -590,7 +629,16 @@ internal class InnerTube(
             ?: extractVideoId(response.request.url.toString())
             ?: throw Exception("INbox: request without a video id")
 
-        val order = playerOrder(preferredClient)
+        // The only token that can be minted here is a web one, and it is what decides
+        // whether the stream survives past the first minute. The client order already
+        // reflects that (see [orderFor]).
+        val token = runCatching { PotProvider.peek(videoId) }.getOrNull()
+        // The response that came in was signed for one exact client, and its links and
+        // SABR session belong to it: that client has to be the one used first, whatever
+        // the order says now.
+        val fromResponse = response.request.header(HEADER_CLIENT)
+        val order = playerOrder(preferredClient, attested = token != null)
+            .sortedWith(compareBy { if (fromResponse != null && it.name == fromResponse) 0 else 1 })
         val failures = mutableListOf<String>()
         // With the page route on, the app-side player is only asked for muxed
         // streams: its DASH links are the tokenless ones that answer 403.
@@ -749,7 +797,7 @@ internal class InnerTube(
     ): String = buildString {
         appendLine("ID: $videoId")
         appendLine("Prueba $DIAG_VERSION")
-        val order = playerOrder(preferredClient)
+        val order = playerOrder(preferredClient, attested = PotProvider.peek(videoId) != null)
         appendLine("Orden: ${order.joinToString(", ") { it.name }}")
 
         val videos = runCatching {
@@ -806,7 +854,8 @@ internal class InnerTube(
 
         appendLine("Corte de YouTube (enlace nuevo, mitad del archivo): ${windowLine(videoId, order.first())}")
 
-        appendLine("poToken: ${PotProvider.peek(videoId)?.let { "sí (${it.length} caracteres)" } ?: "no"}")
+        val pot = runCatching { PotProvider.peek(videoId) }.getOrNull()
+        appendLine("poToken: ${pot?.let { "sí (${it.length} caracteres)" } ?: "no"}")
 
         appendLine("Por cliente (estado y muxed):")
         for (spec in order) {

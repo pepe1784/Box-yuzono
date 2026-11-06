@@ -328,7 +328,7 @@ class InBox :
 
     override fun videoListRequest(episode: SEpisode): Request {
         val videoId = extractVideoId(episode.url) ?: episode.url
-        return innerTube.playerRequest(videoId, InnerTube.playerOrder(preferredClient).first())
+        return innerTube.playerRequest(videoId, innerTube.orderFor(videoId, preferredClient).first())
     }
 
     override fun videoListParse(response: Response): List<Video> {

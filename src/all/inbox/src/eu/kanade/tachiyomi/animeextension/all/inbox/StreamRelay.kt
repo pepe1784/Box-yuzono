@@ -191,9 +191,9 @@ internal object StreamRelay {
     fun describe(url: String): String {
         val token = url.substringAfter("/s/", "").substringBefore('?').substringBefore('#')
         val entry = entries[token] ?: return "sin entrada"
-        val spec = entry.sabr ?: return "solo rangos"
-        return "SABR itag=${spec.itag} cabecera=0..${spec.headEnd} tamaño=${spec.length} " +
-            "audio=${spec.isAudio} índice=${spec.indexStart}..${spec.indexEnd}"
+        val spec = entry.sabr ?: return "solo rangos (${entry.clientName})"
+        return "SABR itag=${spec.itag} cliente=${spec.clientId} cabecera=0..${spec.headEnd} " +
+            "tamaño=${spec.length} audio=${spec.isAudio} índice=${spec.indexStart}..${spec.indexEnd}"
     }
 
     // ================================ server ================================
@@ -555,13 +555,41 @@ internal object StreamRelay {
             }.getOrNull()
             if (fresh != null && fresh.url.isNotBlank()) {
                 entry.url = fresh.url
-                if (fresh.sabr != null) entry.sabr = fresh.sabr
+                adopt(entry, fresh.sabr)
                 Log.d(TAG, "fresh link for itag ${entry.itag} (${entry.xTags})")
             } else {
                 Log.w(TAG, "no fresh link for itag ${entry.itag} (${entry.xTags})")
             }
             entry.lastRefresh = System.currentTimeMillis()
         }
+    }
+
+    /**
+     * Takes the SABR session of a fresh link, but only when it describes the same file.
+     *
+     * A refresh can arrive from another client (that is the whole point: the web one
+     * is the one that accepts the token), and two clients do not always hand out the
+     * same bytes for the same itag. Adopting a session whose ranges belong to another
+     * file would splice two videos together, so the layout has to match.
+     */
+    private fun adopt(entry: Entry, fresh: SabrSpec?) {
+        if (fresh == null) return
+        val current = entry.sabr
+        val sameFile = current == null || (
+            current.length == fresh.length &&
+                (current.lastModified == fresh.lastModified || fresh.lastModified.isBlank())
+            )
+        if (!sameFile) {
+            Log.w(TAG, "ignoring SABR from client ${fresh.clientId}: different layout for itag ${entry.itag}")
+            return
+        }
+        if (current?.clientId != fresh.clientId) {
+            // New session, new sidx: the cached one belongs to the old client.
+            entry.index = null
+            // A client that never worked must not blacklist the one that just arrived.
+            entry.sabrOff = false
+        }
+        entry.sabr = fresh
     }
 
     private fun readHead(input: InputStream): String? {

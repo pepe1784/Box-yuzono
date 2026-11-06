@@ -91,6 +91,26 @@ internal object PotProvider {
     /** Whatever is cached, without asking for a new one (for the diagnostic screen). */
     fun peek(videoId: String): String? = if (valid(videoId)) cached else null
 
+    /**
+     * Asks for a token and waits at most [timeoutMs] for it.
+     *
+     * Listing the streams is the moment where the token changes the answer: the
+     * client that accepts it is a web one, and that is only worth a request when the
+     * token is there. A couple of seconds here are cheaper than a stream that dies
+     * at minute one, but the player still must not hang: after the timeout the list
+     * is built exactly as before, without a token.
+     */
+    fun await(videoId: String, timeoutMs: Long): String? {
+        peek(videoId)?.let { return it }
+        request(videoId)
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            peek(videoId)?.let { return it }
+            runCatching { Thread.sleep(100) }
+        }
+        return peek(videoId)
+    }
+
     private fun valid(videoId: String): Boolean {
         val value = cached ?: return false
         return cachedFor == videoId && System.currentTimeMillis() - cachedAt < CACHE_MS && value.length > 80
