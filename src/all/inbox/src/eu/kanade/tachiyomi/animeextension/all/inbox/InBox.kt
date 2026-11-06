@@ -98,7 +98,10 @@ class InBox :
         set("Accept", "application/json")
         set("Accept-Language", "en-US,en;q=0.9")
         set("X-YouTube-Client-Name", spec.id)
-        set("X-YouTube-Client-Version", spec.version)
+        set("X-YouTube-Client-Version", InnerTube.versionFor(spec))
+        // Goes with the poToken: the token belongs to that visitor and YouTube checks
+        // both at once on the web clients.
+        InnerTube.visitor().let { if (it != null) set("X-Goog-Visitor-Id", it) }
         set("Origin", InnerTube.BASE_URL)
         set("Referer", "${InnerTube.BASE_URL}/")
         add("Cookie", CONSENT_COOKIE)
