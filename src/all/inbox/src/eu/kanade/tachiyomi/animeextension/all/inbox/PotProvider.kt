@@ -5,6 +5,7 @@ import android.app.Application
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -28,7 +29,14 @@ import java.util.concurrent.atomic.AtomicReference
  * The token is computed by YouTube's own BotGuard interpreter. The trick that makes
  * it usable here is [FRAME_URL]: the WebView is pointed at a youtube.com address and
  * the request is answered locally, so the page has the real origin (Google's CORS
- * allows it) but no content policy of its own, which `new Function(...)` needs.
+ * allows it) but no content policy of its own, which the interpreter needs.
+ *
+ * Since 2026 the attestation service no longer hands out a challenge that works: the
+ * one the player itself uses comes in the homepage (`ytAtN`) and the proof is minted
+ * for **that page's visitor**. So the token is no longer per video: one visitor and
+ * one token are reused for an hour, and every player request announces the same
+ * visitor (see `InnerTube.context`). A token minted for another visitor, or sent
+ * with a mobile client, is what YouTube answered with "rejected" at the minute.
  */
 internal object PotProvider {
     private const val TAG = "INboxPot"
@@ -39,11 +47,10 @@ internal object PotProvider {
     /** Origin matters: it is what makes the calls to Google cross origin *allowed*. */
     private const val FRAME_URL = "https://www.youtube.com/inbox-pot"
 
-    /** The portada is asked as a desktop Chrome: that is the page that carries `ytAtN`. */
     private const val USER_AGENT =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
+    /** The homepage plus the interpreter do not fit in less than this on a phone. */
     private const val WAIT_SECONDS = 45L
     private const val CACHE_MS = 60 * 60 * 1000L
     private const val FAILURE_COOLDOWN_MS = 10 * 60 * 1000L
@@ -54,24 +61,24 @@ internal object PotProvider {
     @Volatile
     private var cached: String? = null
 
-    /**
-     * The visitor the token is bound to. The web token is not per video: it is a proof
-     * for *this* visitor, and YouTube only honours it when the request carries the same
-     * `visitorData`. Both travel together, hence both are cached.
-     */
+    /** Visitor the cached token was minted for; the player request must repeat it. */
     @Volatile
     private var cachedVisitor: String? = null
 
-    /** The `INNERTUBE_CLIENT_VERSION` of the page that minted the token. */
+    /** Page version it was minted with: the player request must announce that one. */
     @Volatile
     private var cachedVersion: String? = null
 
     @Volatile
     private var cachedAt: Long = 0L
 
-    /** When the last attempt failed: no point paying 30 s per chunk to fail again. */
+    /** When the last attempt failed: no point paying 45 s per chunk to fail again. */
     @Volatile
     private var failedAt: Long = 0L
+
+    /** Why the last attempt failed, shown in the diagnostic screen. */
+    @Volatile
+    private var error: String? = null
 
     /** True while a WebView is being set up. Only one at a time. */
     private val minting = AtomicBoolean(false)
@@ -81,16 +88,21 @@ internal object PotProvider {
      * WebView takes a second or two, and the player must not pay that when it opens
      * a stream (that delay was visible as "it takes ages to start").
      */
-    fun request(videoId: String) {
+    fun request(videoId: String) = start()
+
+    /** Warms the token up as soon as the extension loads. */
+    fun prewarm() = start()
+
+    private fun start() {
         if (valid()) return
-        // A failed mint costs half a minute; when it fails the relay has to keep
-        // working without a token instead of stalling every chunk.
+        // A failed mint costs the better part of a minute; when it fails the relay has
+        // to keep working without a token instead of stalling every chunk.
         if (System.currentTimeMillis() - failedAt < FAILURE_COOLDOWN_MS) return
         if (!minting.compareAndSet(false, true)) return
         Thread(
             {
                 try {
-                    mint(videoId)
+                    mint()
                 } finally {
                     minting.set(false)
                 }
@@ -100,14 +112,16 @@ internal object PotProvider {
     }
 
     /** Whatever is cached, without asking for a new one (for the diagnostic screen). */
-    @Suppress("UNUSED_PARAMETER")
     fun peek(videoId: String): String? = if (valid()) cached else null
 
-    /** The visitor the cached token belongs to, or null when there is no usable token. */
+    /** Visitor the cached token belongs to; null while there is no token. */
     fun visitor(): String? = if (valid()) cachedVisitor else null
 
-    /** Client version of the page that minted the token, so the request looks the same. */
+    /** Version of the page that minted it, which is the one to announce. */
     fun webVersion(): String? = if (valid()) cachedVersion else null
+
+    /** Last failure in plain words, for the diagnostic screen. */
+    fun lastError(): String? = error
 
     /**
      * Asks for a token and waits at most [timeoutMs] for it.
@@ -120,7 +134,7 @@ internal object PotProvider {
      */
     fun await(videoId: String, timeoutMs: Long): String? {
         peek(videoId)?.let { return it }
-        request(videoId)
+        start()
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             peek(videoId)?.let { return it }
@@ -135,7 +149,7 @@ internal object PotProvider {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun mint(videoId: String): String? {
+    private fun mint(): String? {
         // Only one WebView at a time: two relays asking together would fight over the
         // same cached slot and both pay the setup cost.
         synchronized(this) {
@@ -147,6 +161,13 @@ internal object PotProvider {
 
             handler.post {
                 runCatching {
+                    // A fresh WebView may land on the consent interstitial (the homepage
+                    // then has no `ytAtN`), so the same consent cookie the api requests
+                    // carry is planted first.
+                    runCatching {
+                        CookieManager.getInstance().setAcceptCookie(true)
+                        CookieManager.getInstance().setCookie("https://www.youtube.com", CONSENT)
+                    }
                     val page = WebView(context)
                     view.set(page)
                     with(page.settings) {
@@ -188,6 +209,7 @@ internal object PotProvider {
                     handler.postDelayed({ view.get()?.let { inject(it, latch) } }, 2500)
                 }.onFailure {
                     Log.w(TAG, "WebView setup failed: ${it.message}")
+                    error = "WebView: ${it.message}"
                     latch.countDown()
                 }
             }
@@ -203,29 +225,49 @@ internal object PotProvider {
                 }
             }
 
-            // The script answers "visitante|versiÃ³n|token". The token is long: the
-            // visitor data travels inside it, so a few hundred characters are normal.
-            val parts = result.get()?.split('|')?.takeIf { it.size == 3 }
-            val visitor = parts?.get(0)?.takeIf { it.length > 20 }
-            val version = parts?.get(1)?.takeIf { it.startsWith("2.") }
-            val value = parts?.get(2)?.takeIf { it.length in 80..4000 }
-            if (visitor != null && version != null && value != null) {
-                cachedVisitor = visitor
-                cachedVersion = version
-                cached = value
-                cachedAt = System.currentTimeMillis()
-                Log.d(
-                    TAG,
-                    "pot ready in ${System.currentTimeMillis() - started}ms " +
-                        "(${value.length} chars, visitor ${visitor.take(12)}â€¦, $version)",
-                )
-            } else {
-                failedAt = System.currentTimeMillis()
-                Log.w(TAG, "no pot (finished=$finished): ${result.get()?.take(160) ?: "nothing"}")
-            }
-            return cached?.takeIf { valid() }
+            val raw = result.get()
+            return accept(raw, finished, started)
         }
     }
+
+    /**
+     * Takes `visitante|versión|token` apart and stores it. Anything else (an `ERR:`
+     * line, a half written answer, the timeout) is a failure with its own message.
+     */
+    private fun accept(raw: String?, finished: Boolean, started: Long): String? {
+        if (raw == null) {
+            error = if (finished) "respuesta vacía" else "sin respuesta en ${WAIT_SECONDS}s"
+            failedAt = System.currentTimeMillis()
+            Log.w(TAG, "no pot: $error")
+            return null
+        }
+        if (raw.startsWith("ERR:")) {
+            error = raw.removePrefix("ERR:").take(90)
+            failedAt = System.currentTimeMillis()
+            Log.w(TAG, "no pot: $error")
+            return null
+        }
+        val parts = raw.split('|', limit = 3)
+        val visitor = parts.getOrNull(0).orEmpty()
+        val version = parts.getOrNull(1).orEmpty()
+        val token = parts.getOrNull(2).orEmpty()
+        if (visitor.length < 8 || !version.startsWith("2.") || token.length !in 80..1500) {
+            error = "forma inesperada (${raw.length} caracteres)"
+            failedAt = System.currentTimeMillis()
+            Log.w(TAG, "no pot: $error")
+            return null
+        }
+        cached = token
+        cachedVisitor = visitor
+        cachedVersion = version
+        cachedAt = System.currentTimeMillis()
+        error = null
+        Log.d(TAG, "pot ready in ${System.currentTimeMillis() - started}ms (${token.length} chars, $version)")
+        return token
+    }
+
+    private const val CONSENT =
+        "SOCS=CAESEwgDEgk0ODE3Nzk3NTQaAmVuIAEaBgiA_K-fBg; Path=/; Domain=.youtube.com"
 
     private const val FRAME_HTML = "<!DOCTYPE html><html><head><meta charset='utf-8'>" +
         "<title>pot</title></head><body><script>window.__started=false;</script></body></html>"
@@ -242,7 +284,7 @@ internal object PotProvider {
     /**
      * The flow the web player runs (2026). The challenge is no longer asked to the
      * attestation service: tokens minted from it are rejected. It is taken from the
-     * portada's own `ytAtN` payload, with its `ytcfg` injected so BotGuard sees the
+     * homepage's own `ytAtN` payload, with its `ytcfg` injected so BotGuard sees the
      * page's EVENT_ID, and the proof is minted for that page's visitor, which is what
      * makes the token valid for the player request that carries the same visitor.
      *
@@ -266,7 +308,7 @@ internal object PotProvider {
                 var config = configOf(html);
                 var visitor = config && config.VISITOR_DATA;
                 var version = config && config.INNERTUBE_CLIENT_VERSION;
-                if (!visitor) throw new Error('sin visitante');
+                if (!visitor) throw new Error('sin visitante (' + html.length + ')');
                 if (!version) throw new Error('sin version');
                 window.yt = { config_: config };
                 var challenge = challengeOf(html);

@@ -56,7 +56,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v13 Â· 14.27"
+        private const val DIAG_VERSION = "v13 · 14.29"
 
         /**
          * How long the list waits for the poToken before settling for a tokenless
@@ -224,13 +224,13 @@ internal class InnerTube(
     private val relayUrls = mutableMapOf<String, String>()
 
     init {
-        // Minting takes a few seconds and is not per video, so it starts as soon as the
-        // source is opened instead of when the player asks for the streams.
-        runCatching { PotProvider.request("") }
         // The relay asks for a new signed link whenever googlevideo starts refusing one.
         StreamRelay.resolver = { videoId, itag, xTags, clientName ->
             freshSource(videoId, itag, xTags, clientName)
         }
+        // Mint the token while the person is still choosing what to watch, so the first
+        // video already opens a web session instead of spending its first seconds here.
+        runCatching { PotProvider.prewarm() }
     }
 
     /**
@@ -567,7 +567,7 @@ internal class InnerTube(
                     .mapNotNull { (it as? JsonObject)?.obj("text").text()?.takeIf(String::isNotBlank) }
             }
         val author = parts.firstOrNull().orEmpty()
-        val info = parts.drop(1).filterNot { it.equals("Playlist", true) }.joinToString(" Â· ")
+        val info = parts.drop(1).filterNot { it.equals("Playlist", true) }.joinToString(" · ")
         val thumbnail = lockup.obj("contentImage").let { image ->
             image?.obj("thumbnailViewModel")?.thumbUrl()
                 ?: image?.obj("collectionThumbnailViewModel")?.obj("primaryThumbnail")
@@ -790,7 +790,7 @@ internal class InnerTube(
         return listOf(
             Video(
                 video.url,
-                "DASH ${video.label} â€¢ ${audio.label}",
+                "DASH ${video.label} • ${audio.label}",
                 video.url,
                 playbackHeaders,
                 audioTracks = listOf(Track(audio.url, audio.label)),
@@ -839,23 +839,23 @@ internal class InnerTube(
         val shown = if (videos.size > 5) videos.take(4) + videos.last() else videos
         shown.forEachIndexed { index, video ->
             val url = video.videoUrl ?: return@forEachIndexed
-            val kind = if (StreamRelay.isRelay(url)) "relÃ©" else flags(url)
+            val kind = if (StreamRelay.isRelay(url)) "relé" else flags(url)
             val audio = video.audioTracks.joinToString(" / ") { it.lang }.ifBlank { "ninguno" }
             val subs = video.subtitleTracks.joinToString(" / ") { it.lang }.ifBlank { "ninguno" }
             appendLine("${index + 1}. ${video.quality} ($kind)")
             appendLine("   audio: $audio")
-            appendLine("   subtÃ­tulos: $subs")
+            appendLine("   subtítulos: $subs")
         }
 
         // What matters now: reading through the relay exactly like the player does,
         // with one open ended range, well past the point where the link used to die.
         val dash = videos.firstOrNull { it.audioTracks.isNotEmpty() && it.videoUrl != null }
         if (dash != null) {
-            appendLine("Por el relÃ©, como el reproductor:")
+            appendLine("Por el relé, como el reproductor:")
             appendLine("  servicio: ${StreamRelay.describe(dash.videoUrl!!)}")
             appendLine("  video: ${relayRead(dash.videoUrl!!, 6 * 1024 * 1024)}")
             dash.audioTracks.firstOrNull()?.let {
-                appendLine("  audio Â«${it.lang}Â»: ${relayRead(it.url, 1024 * 1024)}")
+                appendLine("  audio «${it.lang}»: ${relayRead(it.url, 1024 * 1024)}")
                 appendLine("  servicio audio: ${StreamRelay.describe(it.url)}")
             }
         } else {
@@ -870,7 +870,13 @@ internal class InnerTube(
         appendLine("Corte de YouTube (enlace nuevo, mitad del archivo): ${windowLine(videoId, order.first())}")
 
         val pot = runCatching { PotProvider.peek(videoId) }.getOrNull()
-        appendLine("poToken: ${pot?.let { "sÃ­ (${it.length} caracteres, visitante ${visitor()?.take(12) ?: "?"}â€¦, ${webVersion() ?: "?"})" } ?: "no"}")
+        appendLine(
+            "poToken: " + if (pot == null) {
+                "no" + runCatching { PotProvider.lastError() }.getOrNull()?.let { " ($it)" }.orEmpty()
+            } else {
+                "sí (${pot.length} caracteres, visitante ${visitor()?.take(12) ?: "?"}…, ${webVersion() ?: "?"})"
+            },
+        )
 
         appendLine("Por cliente (estado y muxed):")
         for (spec in order) {
@@ -905,7 +911,7 @@ internal class InnerTube(
             val url = format?.str("url")
             val length = format?.str("contentLength")?.toLongOrNull() ?: 0L
             if (url.isNullOrBlank()) return "sin enlace"
-            if (length <= 0) return "sin tamaÃ±o"
+            if (length <= 0) return "sin tamaño"
             val start = length / 2
             return probe(url, withHeaders = true, range = "bytes=$start-${start + 1}")
         }
@@ -916,7 +922,7 @@ internal class InnerTube(
             val video = formats.filter { it.str("mimeType").orEmpty().startsWith("video/mp4") }
                 .maxByOrNull { parseInt(it.str("height")) ?: 0 }
             val muxed = streaming?.arr("formats").orEmpty().mapNotNull { it as? JsonObject }.firstOrNull()
-            "video ${deep(video)} Â· muxed ${deep(muxed)}"
+            "video ${deep(video)} · muxed ${deep(muxed)}"
         } catch (e: Exception) {
             "error ${e.message}"
         }
@@ -1087,7 +1093,7 @@ internal class InnerTube(
 
             for (rep in muxed) {
                 if (!passesQuality(rep.height, preferredQuality)) continue
-                videos += Video(rep.url, "Muxed ${rep.label} Â· completo", rep.url, headers, subtitleTracks = subtitles)
+                videos += Video(rep.url, "Muxed ${rep.label} · completo", rep.url, headers, subtitleTracks = subtitles)
             }
         }
 
@@ -1193,7 +1199,7 @@ internal class InnerTube(
                     val headers = if (StreamRelay.isRelay(videoUrl)) null else playbackHeaders
                     videos += Video(
                         videoUrl,
-                        "DASH ${rep.height}p Â· completo",
+                        "DASH ${rep.height}p · completo",
                         videoUrl,
                         headers,
                         audioTracks = audioTracks,
@@ -1304,22 +1310,22 @@ internal class InnerTube(
     // ============================ Languages =============================
 
     private val languageNames = mapOf(
-        "spanish" to ("es" to "EspaÃ±ol"),
-        "english" to ("en" to "InglÃ©s"),
-        "portuguese" to ("pt" to "PortuguÃ©s"),
-        "japanese" to ("ja" to "JaponÃ©s"),
-        "french" to ("fr" to "FrancÃ©s"),
-        "german" to ("de" to "AlemÃ¡n"),
+        "spanish" to ("es" to "Español"),
+        "english" to ("en" to "Inglés"),
+        "portuguese" to ("pt" to "Portugués"),
+        "japanese" to ("ja" to "Japonés"),
+        "french" to ("fr" to "Francés"),
+        "german" to ("de" to "Alemán"),
         "italian" to ("it" to "Italiano"),
         "russian" to ("ru" to "Ruso"),
         "hindi" to ("hi" to "Hindi"),
         "korean" to ("ko" to "Coreano"),
         "chinese" to ("zh" to "Chino"),
-        "arabic" to ("ar" to "Ãrabe"),
+        "arabic" to ("ar" to "Árabe"),
         "turkish" to ("tr" to "Turco"),
         "indonesian" to ("id" to "Indonesio"),
         "polish" to ("pl" to "Polaco"),
-        "thai" to ("th" to "TailandÃ©s"),
+        "thai" to ("th" to "Tailandés"),
         "vietnamese" to ("vi" to "Vietnamita"),
         "ukrainian" to ("uk" to "Ucraniano"),
     )
@@ -1358,7 +1364,7 @@ internal class InnerTube(
         }
         if (!xTags.contains("acont=")) return base
         val kind = if (original) "original" else "doblado"
-        return if (drc) "$base Â· $kind Â· volumen" else "$base Â· $kind"
+        return if (drc) "$base · $kind · volumen" else "$base · $kind"
     }
 
     /**
@@ -1380,9 +1386,9 @@ internal class InnerTube(
                 put("clientVersion", versionFor(spec))
                 put("hl", "en")
                 put("gl", "US")
-                // The proof is minted for one visitor: the request must name the same
-                // one or YouTube treats the token as somebody else's.
-                if (spec.web) visitor()?.let { put("visitorData", it) }
+                // The token was minted for the homepage's visitor: a player request
+                // that announces another one gets it ignored (and the stream cut).
+                visitor()?.let { put("visitorData", it) }
                 spec.extra.forEach { (key, value) -> put(key, value) }
             },
         )
@@ -1421,7 +1427,7 @@ internal class InnerTube(
         return null
     }
 
-    private fun joinInfo(vararg parts: String?): String = parts.filterNot { it.isNullOrBlank() }.joinToString(" Â· ")
+    private fun joinInfo(vararg parts: String?): String = parts.filterNot { it.isNullOrBlank() }.joinToString(" · ")
 }
 
 // ============================== Model ==============================
@@ -1435,8 +1441,8 @@ internal data class ClientSpec(
     /** Set for the embedded players: YouTube wants the page they are embedded in. */
     val embedUrl: String? = null,
 ) {
-    /** The clients that live in a web page: the ones the minted token is valid for. */
-    val web: Boolean get() = name == "MWEB" || name == "WEB"
+    /** The clients that share the page version and the visitor of the minted token. */
+    val web: Boolean get() = name == "WEB" || name == "MWEB"
 }
 
 private data class VideoRep(
