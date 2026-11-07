@@ -56,7 +56,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v13 · 14.32"
+        private const val DIAG_VERSION = "v13 · 14.33"
 
         /**
          * How long the list waits for the poToken before settling for a tokenless
@@ -159,13 +159,11 @@ internal class InnerTube(
         fun playerOrder(preferred: String, attested: Boolean = false): List<ClientSpec> {
             val first = PLAYER_CLIENTS.firstOrNull { it.name == preferred } ?: ANDROID
             val base = listOf(first) + PLAYER_CLIENTS.filter { it !== first }
-            if (!attested) return base
-            // The token that can be minted here is the one the web player asks for, and
-            // YouTube only honours it when the session says it is that same web client
-            // and carries the visitor it was minted for. Asking a mobile client with it
-            // is what made SABR answer "rejected" and cut the picture at the minute.
-            // MWEB goes first (it keeps answering on phones) and plain WEB right after.
-            return listOf(MWEB, WEB) + base.filter { it !== MWEB && it !== WEB }
+            // The web clients answer OK once the token exists, but their media servers
+            // are the ones that refuse this network (403 on the links, silence on the
+            // SABR endpoint), so the transport stays on the app clients and the web
+            // ones are only the fallback that comes later in the list.
+            return base
         }
 
         /**
@@ -243,6 +241,10 @@ internal class InnerTube(
      */
     fun orderFor(videoId: String, preferred: String): List<ClientSpec> {
         val attested = PotProvider.await(videoId, POT_WAIT_MS) != null
+        // The session itself needs the proof bound to this video; minting it costs a
+        // few milliseconds once the page is loaded, so it is asked for from here and
+        // the relay finds it ready by the time it opens the stream.
+        if (attested) runCatching { PotProvider.bindSoon(videoId) }
         return playerOrder(preferred, attested)
     }
 
@@ -256,11 +258,10 @@ internal class InnerTube(
      */
     private fun freshSource(videoId: String, itag: String, xTags: String, clientName: String): RelaySource? {
         val primary = PLAYER_CLIENTS.firstOrNull { it.name == clientName } ?: ANDROID
-        // The same itag exists in every client, so a couple of tries is enough. With a
-        // token in hand the web client goes first: it is the one whose session the token
-        // belongs to, and the one that can keep serving after the minute.
-        val attested = runCatching { PotProvider.peek(videoId) }.getOrNull() != null
-        val candidates = (if (attested) listOf(MWEB) else emptyList()) + listOf(primary, IOS, ANDROID)
+        // The same itag exists in every client, so a couple of tries is enough. The
+        // web clients are left out on purpose: their links and their SABR endpoint are
+        // refused from here, and a fresh web link would replace a session that works.
+        val candidates = listOf(primary, IOS, ANDROID)
         for (spec in candidates.distinctBy { it.name }) {
             val source = runCatching { sourceFor(videoId, spec, itag, xTags) }.getOrNull()
             if (source != null) return source
@@ -882,6 +883,15 @@ internal class InnerTube(
                 "no" + runCatching { PotProvider.lastError() }.getOrNull()?.let { " ($it)" }.orEmpty()
             } else {
                 "sí (${pot.length} caracteres, visitante ${visitor()?.take(12) ?: "?"}…, ${webVersion() ?: "?"}, sts ${PotProvider.signatureTimestamp() ?: "?"})"
+            },
+        )
+        // The one the app session sends: it is a different proof, bound to the video.
+        val videoPot = runCatching { PotProvider.bindWait(videoId, 6000) }.getOrNull()
+        appendLine(
+            "poToken de vídeo: " + if (videoPot == null) {
+                "no" + runCatching { PotProvider.lastError() }.getOrNull()?.let { " ($it)" }.orEmpty()
+            } else {
+                "${videoPot.length} caracteres"
             },
         )
 

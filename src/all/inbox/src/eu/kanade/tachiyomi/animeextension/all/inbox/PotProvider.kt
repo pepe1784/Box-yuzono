@@ -10,8 +10,10 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import org.json.JSONObject
 import uy.kohesive.injekt.injectLazy
 import java.io.ByteArrayInputStream
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -90,6 +92,25 @@ internal object PotProvider {
     private val minting = AtomicBoolean(false)
 
     /**
+     * The page that holds the minting function. The expensive half of the work (the
+     * BotGuard interpreter, the snapshot, `GenerateIT`) happens once; from there every
+     * extra proof costs a few milliseconds, so the view is kept alive instead of
+     * thrown away after the first token.
+     */
+    @Volatile
+    private var minterView: WebView? = null
+
+    /**
+     * Tokens bound to a video id, which is what the app clients' SABR session wants.
+     * The visitor-bound one only buys a web session, and the web servers are the ones
+     * this network refuses to serve.
+     */
+    private val bound = ConcurrentHashMap<String, String>()
+
+    /** Bindings being minted right now, so two relays do not ask twice. */
+    private val pending = ConcurrentHashMap<String, CountDownLatch>()
+
+    /**
      * Asks for a token in the background. Nothing ever waits for it: setting up a
      * WebView takes a second or two, and the player must not pay that when it opens
      * a stream (that delay was visible as "it takes ages to start").
@@ -119,6 +140,40 @@ internal object PotProvider {
 
     /** Whatever is cached, without asking for a new one (for the diagnostic screen). */
     fun peek(videoId: String): String? = if (valid()) cached else null
+
+    /** Token bound to one video, if it was already minted. Never blocks. */
+    fun bind(videoId: String): String? = bound[videoId]
+
+    /**
+     * Asks for the token of [videoId] in the background. The app clients' session is
+     * the one that has to carry it, and it is a different token from the visitor one:
+     * YouTube binds the proof to the video for those clients.
+     */
+    fun bindSoon(videoId: String) {
+        if (videoId.isBlank() || bound.containsKey(videoId)) return
+        val view = minterView ?: return
+        if (pending.putIfAbsent(videoId, CountDownLatch(1)) != null) return
+        handler.post {
+            runCatching {
+                view.evaluateJavascript("window.__potBind && window.__potBind(${JSONObject.quote(videoId)})", null)
+            }.onFailure {
+                Log.w(TAG, "bind failed: ${it.message}")
+                pending.remove(videoId)?.countDown()
+            }
+        }
+    }
+
+    /** Same as [bindSoon] but waits a moment, for the request that opens the session. */
+    fun bindWait(videoId: String, timeoutMs: Long): String? {
+        bound[videoId]?.let { return it }
+        bindSoon(videoId)
+        val latch = pending[videoId] ?: return bound[videoId]
+        runCatching { latch.await(timeoutMs, TimeUnit.MILLISECONDS) }
+        return bound[videoId]
+    }
+
+    /** How many video-bound tokens are ready, for the diagnostic screen. */
+    fun boundCount(): Int = bound.size
 
     /** Visitor the cached token belongs to; null while there is no token. */
     fun visitor(): String? = if (valid()) cachedVisitor else null
@@ -186,6 +241,16 @@ internal object PotProvider {
                             fun onPot(value: String) {
                                 if (result.compareAndSet(null, value)) latch.countDown()
                             }
+
+                            @JavascriptInterface
+                            fun onBind(binding: String, value: String) {
+                                if (!value.startsWith("ERR:")) {
+                                    bound[binding] = value
+                                } else {
+                                    Log.w(TAG, "no token for $binding: ${value.removePrefix("ERR:")}")
+                                }
+                                pending.remove(binding)?.countDown()
+                            }
                         },
                         "InboxPot",
                     )
@@ -220,18 +285,24 @@ internal object PotProvider {
             }
 
             val finished = latch.await(WAIT_SECONDS, TimeUnit.SECONDS)
+            val raw = result.get()
+            val accepted = accept(raw, finished, started)
             handler.post {
-                view.get()?.let {
+                val page = view.get() ?: return@post
+                if (accepted != null) {
+                    // The interpreter stays loaded: the same page mints a token for any
+                    // video id in a few milliseconds, which is what the app clients need.
+                    minterView = page
+                } else {
+                    minterView = null
                     runCatching {
-                        it.stopLoading()
-                        it.removeJavascriptInterface("InboxPot")
-                        it.destroy()
+                        page.stopLoading()
+                        page.removeJavascriptInterface("InboxPot")
+                        page.destroy()
                     }
                 }
             }
-
-            val raw = result.get()
-            return accept(raw, finished, started)
+            return accepted
         }
     }
 
@@ -299,6 +370,16 @@ internal object PotProvider {
             function done(value) { InboxPot.onPot(value); }
             if (window.__potStarted) return;
             window.__potStarted = true;
+            // Entry point for the extra proofs: same integrity token, another binding.
+            window.__potBind = async function (binding) {
+                try {
+                    if (!window.__potMint) throw new Error('sin minter');
+                    var value = await window.__potMint(new TextEncoder().encode(binding));
+                    InboxPot.onBind(binding, base64url(value));
+                } catch (error) {
+                    InboxPot.onBind(binding, 'ERR:' + (error && error.message ? error.message : error));
+                }
+            };
             var BASE = 'https://jnn-pa.googleapis.com/${'$'}rpc/google.internal.waa.v1.Waa';
             var KEY = '$REQUEST_KEY';
             var HEADERS = {
@@ -389,6 +470,7 @@ internal object PotProvider {
                 var getMint = await waitFor(function () { return signals[0]; }, 3000);
                 if (!getMint) throw new Error('sin firma');
                 var mint = await getMint(toBytes(integrityToken));
+                window.__potMint = mint;
                 var minted = await mint(new TextEncoder().encode(visitor));
                 done(visitor + '|' + version + '|' + (config && config.STS ? config.STS : '') +
                     '|' + base64url(minted));

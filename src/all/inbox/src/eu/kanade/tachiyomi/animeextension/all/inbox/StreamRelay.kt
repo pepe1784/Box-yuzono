@@ -286,6 +286,9 @@ internal object StreamRelay {
         // Minting takes a second or two, so it runs next to the first SABR request
         // instead of in front of it: the session starts with whatever token exists.
         runCatching { PotProvider.request(entry.videoId) }
+        // The session starts attested when the proof bound to this video is ready: it
+        // is what keeps the picture coming after the first minute of an app session.
+        runCatching { PotProvider.bindWait(entry.videoId, 4000) }
         var active = entry.sabr ?: spec
         var stream = SabrStream(active, http) { token(entry) }
         var time = timeFor(entry, active, position)
@@ -317,6 +320,7 @@ internal object StreamRelay {
                 // The server refused the session as unattested: mint a token and start
                 // a new one from the same position, with the link refreshed too.
                 runCatching { PotProvider.request(entry.videoId) }
+                runCatching { PotProvider.bindSoon(entry.videoId) }
                 refresh(entry)
                 runCatching { Thread.sleep(1500) }
             } else if (empty >= 3) {
@@ -334,8 +338,22 @@ internal object StreamRelay {
         return position
     }
 
-    /** The token the relay sends, when one has been minted for this video. */
-    private fun token(entry: Entry): String? = runCatching { PotProvider.peek(entry.videoId) }.getOrNull()
+    /**
+     * The token the relay sends, when one has been minted for this stream.
+     *
+     * The web sessions take the proof bound to the page's visitor, the app ones the
+     * proof bound to the video id; sending the visitor one to an app session is what
+     * YouTube answered with "rejected" at the minute, and its media servers are the
+     * only ones this network actually serves.
+     */
+    private fun token(entry: Entry): String? {
+        val clientId = entry.sabr?.clientId ?: 3
+        return if (clientId == 1 || clientId == 2) {
+            runCatching { PotProvider.peek(entry.videoId) }.getOrNull()
+        } else {
+            runCatching { PotProvider.bind(entry.videoId) }.getOrNull()
+        }
+    }
 
     /**
      * Position in time for a byte of the file, using the `sidx` of the stream.
