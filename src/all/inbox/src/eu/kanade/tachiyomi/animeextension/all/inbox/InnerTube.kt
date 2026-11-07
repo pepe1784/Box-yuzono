@@ -56,7 +56,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v13 · 14.30"
+        private const val DIAG_VERSION = "v13 · 14.31"
 
         /**
          * How long the list waits for the poToken before settling for a tokenless

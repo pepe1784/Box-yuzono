@@ -50,7 +50,7 @@ internal object PotProvider {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
     /** The homepage plus the interpreter do not fit in less than this on a phone. */
-    private const val WAIT_SECONDS = 45L
+    private const val WAIT_SECONDS = 60L
     private const val CACHE_MS = 60 * 60 * 1000L
     private const val FAILURE_COOLDOWN_MS = 10 * 60 * 1000L
 
@@ -323,17 +323,48 @@ internal object PotProvider {
                 }
                 var vm = window[challenge.globalName];
                 if (!vm || !vm.a) throw new Error('sin VM');
+                // The VM finishes setting itself up on a later turn: it hands the
+                // snapshot function to this callback asynchronously, so waiting for
+                // `vm.a` alone left `functions` empty and the mint failed here.
                 var functions = null;
-                await vm.a(challenge.program, function (snapshot) {
-                    functions = { snapshot: snapshot };
-                }, true, undefined, function () {}, [[], []], undefined, false,
-                    [function () {}, function () {}, function () {}, function () {}, function () {}]);
+                var failure = null;
+                var ready = new Promise(function (resolve) {
+                    Promise.resolve()
+                        .then(function () {
+                            return vm.a(challenge.program, function (snapshot, shutdown, passEvent, checkCamera) {
+                                functions = {
+                                    snapshot: snapshot,
+                                    shutdown: shutdown,
+                                    passEvent: passEvent,
+                                    checkCamera: checkCamera
+                                };
+                                resolve();
+                            }, true, undefined, function () {}, [[], []], undefined, false,
+                                [function () {}, function () {}, function () {}, function () {}, function () {}]);
+                        })
+                        .then(function (value) {
+                            // The same call returns the synchronous snapshot as [0].
+                            if (!functions && value && value[0]) {
+                                functions = { snapshot: null, sync: value[0] };
+                            }
+                            resolve();
+                        }, function (error) {
+                            failure = error;
+                            resolve();
+                        });
+                });
+                await Promise.race([ready, wait(8000)]);
+                if (failure) throw failure;
                 if (!functions) throw new Error('sin snapshot');
                 var signals = [];
                 var botguard = await new Promise(function (resolve, reject) {
                     try {
-                        functions.snapshot(function (value) { resolve(value); },
-                            [undefined, undefined, signals, undefined]);
+                        if (functions.snapshot) {
+                            functions.snapshot(function (value) { resolve(value); },
+                                [undefined, undefined, signals, undefined]);
+                        } else {
+                            resolve(functions.sync([undefined, undefined, signals, undefined]));
+                        }
                     } catch (error) { reject(error); }
                 });
                 var generated = await fetch(BASE + '/GenerateIT', {
@@ -342,7 +373,10 @@ internal object PotProvider {
                 var payload = await generated.json();
                 var integrityToken = payload[0];
                 if (!integrityToken) throw new Error('sin integrity token');
-                var mint = await signals[0](toBytes(integrityToken));
+                // The signal may be written a turn after the snapshot resolves.
+                var getMint = await waitFor(function () { return signals[0]; }, 3000);
+                if (!getMint) throw new Error('sin firma');
+                var mint = await getMint(toBytes(integrityToken));
                 var minted = await mint(new TextEncoder().encode(visitor));
                 done(visitor + '|' + version + '|' + base64url(minted));
             } catch (error) {
@@ -366,6 +400,20 @@ internal object PotProvider {
             function visitorOf(config) {
                 if (!config) return null;
                 return config.VISITOR_DATA || config.EOM_VISITOR_DATA || null;
+            }
+
+            function wait(ms) {
+                return new Promise(function (resolve) { setTimeout(resolve, ms); });
+            }
+
+            async function waitFor(value, timeout) {
+                var deadline = Date.now() + timeout;
+                while (Date.now() < deadline) {
+                    var current = value();
+                    if (current) return current;
+                    await wait(100);
+                }
+                return value();
             }
 
             function challengeOf(text) {
