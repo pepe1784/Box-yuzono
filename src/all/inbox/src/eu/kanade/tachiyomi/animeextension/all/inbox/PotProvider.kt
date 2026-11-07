@@ -5,7 +5,6 @@ import android.app.Application
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -161,13 +160,9 @@ internal object PotProvider {
 
             handler.post {
                 runCatching {
-                    // A fresh WebView may land on the consent interstitial (the homepage
-                    // then has no `ytAtN`), so the same consent cookie the api requests
-                    // carry is planted first.
-                    runCatching {
-                        CookieManager.getInstance().setAcceptCookie(true)
-                        CookieManager.getInstance().setCookie("https://www.youtube.com", CONSENT)
-                    }
+                    // No consent cookie here: with it the homepage comes in its
+                    // "already accepted" variant, which carries no VISITOR_DATA and
+                    // made the mint fail with "sin visitante".
                     val page = WebView(context)
                     view.set(page)
                     with(page.settings) {
@@ -266,9 +261,6 @@ internal object PotProvider {
         return token
     }
 
-    private const val CONSENT =
-        "SOCS=CAESEwgDEgk0ODE3Nzk3NTQaAmVuIAEaBgiA_K-fBg; Path=/; Domain=.youtube.com"
-
     private const val FRAME_HTML = "<!DOCTYPE html><html><head><meta charset='utf-8'>" +
         "<title>pot</title></head><body><script>window.__started=false;</script></body></html>"
 
@@ -306,8 +298,18 @@ internal object PotProvider {
                 var html = await (await fetch('https://www.youtube.com/?hl=en&gl=US',
                     { credentials: 'include' })).text();
                 var config = configOf(html);
-                var visitor = config && config.VISITOR_DATA;
+                var visitor = visitorOf(config);
                 var version = config && config.INNERTUBE_CLIENT_VERSION;
+                if (!visitor) {
+                    // Served with cookies the homepage can come in a variant without any
+                    // visitor; asking without them always yields one, and that is the
+                    // visitor the token and the player request will use.
+                    html = await (await fetch('https://www.youtube.com/?hl=en&gl=US',
+                        { credentials: 'omit' })).text();
+                    config = configOf(html);
+                    visitor = visitorOf(config);
+                    version = (config && config.INNERTUBE_CLIENT_VERSION) || version;
+                }
                 if (!visitor) throw new Error('sin visitante (' + html.length + ')');
                 if (!version) throw new Error('sin version');
                 window.yt = { config_: config };
@@ -359,6 +361,11 @@ internal object PotProvider {
                     } catch (ignored) { }
                 }
                 return merged;
+            }
+
+            function visitorOf(config) {
+                if (!config) return null;
+                return config.VISITOR_DATA || config.EOM_VISITOR_DATA || null;
             }
 
             function challengeOf(text) {

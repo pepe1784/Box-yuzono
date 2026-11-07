@@ -56,14 +56,14 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v13 · 14.29"
+        private const val DIAG_VERSION = "v13 · 14.30"
 
         /**
          * How long the list waits for the poToken before settling for a tokenless
          * client. The token is what keeps a stream alive past the minute, so it is
          * worth a moment, but not a visible hang.
          */
-        private const val POT_WAIT_MS = 3000L
+        private const val POT_WAIT_MS = 9000L
 
         /** User agent for the media requests, used by the relay too. */
         const val PLAYBACK_UA =
@@ -812,7 +812,10 @@ internal class InnerTube(
     ): String = buildString {
         appendLine("ID: $videoId")
         appendLine("Prueba $DIAG_VERSION")
-        val order = playerOrder(preferredClient, attested = PotProvider.peek(videoId) != null)
+        // The point of the test is to see what happens with the token, so it waits for
+        // it here instead of reporting the order the app would use without one.
+        val token = runCatching { PotProvider.await(videoId, 20_000) }.getOrNull()
+        val order = playerOrder(preferredClient, attested = token != null)
         appendLine("Orden: ${order.joinToString(", ") { it.name }}")
 
         val videos = runCatching {
@@ -884,8 +887,12 @@ internal class InnerTube(
                 val body = client.newCall(playerRequest(videoId, spec)).execute()
                     .use { it.body.string() }
                 val json = JSON.parseToJsonElement(body).jsonObject
-                val state = json.obj("playabilityStatus")?.str("status") ?: "?"
-                if (state != "OK") return@runCatching state
+                val status = json.obj("playabilityStatus")
+                val state = status?.str("status") ?: "?"
+                if (state != "OK") {
+                    val reason = status?.str("reason").orEmpty().take(60)
+                    return@runCatching if (reason.isBlank()) state else "$state ($reason)"
+                }
                 val streamingData = json.obj("streamingData") ?: return@runCatching "sin streamingData"
                 val muxedHeights = streamingData.arr("formats").orEmpty()
                     .mapNotNull { it as? JsonObject }
