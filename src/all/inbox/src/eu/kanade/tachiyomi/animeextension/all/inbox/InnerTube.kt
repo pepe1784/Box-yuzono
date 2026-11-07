@@ -56,7 +56,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v13 · 14.31"
+        private const val DIAG_VERSION = "v13 · 14.32"
 
         /**
          * How long the list waits for the poToken before settling for a tokenless
@@ -398,6 +398,10 @@ internal class InnerTube(
                         "contentPlaybackContext",
                         buildJsonObject {
                             put("html5Preference", "HTML5_PREF_WANTS")
+                            // Says which player build the request speaks. Without it the
+                            // web clients answer "The page needs to be reloaded." instead
+                            // of the formats, which is what kept the session off-web.
+                            PotProvider.signatureTimestamp()?.let { put("signatureTimestamp", it) }
                         },
                     )
                 },
@@ -877,7 +881,7 @@ internal class InnerTube(
             "poToken: " + if (pot == null) {
                 "no" + runCatching { PotProvider.lastError() }.getOrNull()?.let { " ($it)" }.orEmpty()
             } else {
-                "sí (${pot.length} caracteres, visitante ${visitor()?.take(12) ?: "?"}…, ${webVersion() ?: "?"})"
+                "sí (${pot.length} caracteres, visitante ${visitor()?.take(12) ?: "?"}…, ${webVersion() ?: "?"}, sts ${PotProvider.signatureTimestamp() ?: "?"})"
             },
         )
 

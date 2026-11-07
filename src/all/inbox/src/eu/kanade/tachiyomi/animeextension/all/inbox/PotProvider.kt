@@ -68,6 +68,13 @@ internal object PotProvider {
     @Volatile
     private var cachedVersion: String? = null
 
+    /**
+     * `STS` of the same page: the web clients refuse with "the page needs to be
+     * reloaded" when the player request does not tell which player build it speaks.
+     */
+    @Volatile
+    private var cachedSts: Int? = null
+
     @Volatile
     private var cachedAt: Long = 0L
 
@@ -118,6 +125,9 @@ internal object PotProvider {
 
     /** Version of the page that minted it, which is the one to announce. */
     fun webVersion(): String? = if (valid()) cachedVersion else null
+
+    /** `sts` of that same page, which the player request has to repeat. */
+    fun signatureTimestamp(): Int? = if (valid()) cachedSts else null
 
     /** Last failure in plain words, for the diagnostic screen. */
     fun lastError(): String? = error
@@ -226,7 +236,7 @@ internal object PotProvider {
     }
 
     /**
-     * Takes `visitante|versión|token` apart and stores it. Anything else (an `ERR:`
+     * Takes `visitante|versión|sts|token` apart and stores it. Anything else (an `ERR:`
      * line, a half written answer, the timeout) is a failure with its own message.
      */
     private fun accept(raw: String?, finished: Boolean, started: Long): String? {
@@ -242,10 +252,11 @@ internal object PotProvider {
             Log.w(TAG, "no pot: $error")
             return null
         }
-        val parts = raw.split('|', limit = 3)
+        val parts = raw.split('|', limit = 4)
         val visitor = parts.getOrNull(0).orEmpty()
         val version = parts.getOrNull(1).orEmpty()
-        val token = parts.getOrNull(2).orEmpty()
+        val sts = parts.getOrNull(2).orEmpty().toIntOrNull()
+        val token = parts.getOrNull(3).orEmpty()
         if (visitor.length < 8 || !version.startsWith("2.") || token.length !in 80..1500) {
             error = "forma inesperada (${raw.length} caracteres)"
             failedAt = System.currentTimeMillis()
@@ -255,9 +266,10 @@ internal object PotProvider {
         cached = token
         cachedVisitor = visitor
         cachedVersion = version
+        cachedSts = sts
         cachedAt = System.currentTimeMillis()
         error = null
-        Log.d(TAG, "pot ready in ${System.currentTimeMillis() - started}ms (${token.length} chars, $version)")
+        Log.d(TAG, "pot ready in ${System.currentTimeMillis() - started}ms (${token.length} chars, $version, sts $sts)")
         return token
     }
 
@@ -378,7 +390,8 @@ internal object PotProvider {
                 if (!getMint) throw new Error('sin firma');
                 var mint = await getMint(toBytes(integrityToken));
                 var minted = await mint(new TextEncoder().encode(visitor));
-                done(visitor + '|' + version + '|' + base64url(minted));
+                done(visitor + '|' + version + '|' + (config && config.STS ? config.STS : '') +
+                    '|' + base64url(minted));
             } catch (error) {
                 done('ERR:' + (error && error.message ? error.message : error));
             }
