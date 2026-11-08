@@ -56,7 +56,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v13 · 14.33"
+        private const val DIAG_VERSION = "v13 · 14.34"
 
         /**
          * How long the list waits for the poToken before settling for a tokenless
@@ -862,6 +862,13 @@ internal class InnerTube(
             appendLine("Por el relé, como el reproductor:")
             appendLine("  servicio: ${StreamRelay.describe(dash.videoUrl!!)}")
             appendLine("  video: ${relayRead(dash.videoUrl!!, 6 * 1024 * 1024)}")
+            // The minute is exactly where the old link died, so the interesting read is
+            // the one that starts past the middle of the file, not the first megabytes.
+            val half = StreamRelay.lengthOf(dash.videoUrl!!) / 2
+            if (half > 0) {
+                appendLine("  video a mitad (byte $half): ${relayRead(dash.videoUrl!!, 2 * 1024 * 1024, half)}")
+            }
+            appendLine("  estado SABR: ${StreamRelay.describe(dash.videoUrl!!)}")
             dash.audioTracks.firstOrNull()?.let {
                 appendLine("  audio «${it.lang}»: ${relayRead(it.url, 1024 * 1024)}")
                 appendLine("  servicio audio: ${StreamRelay.describe(it.url)}")
@@ -953,11 +960,11 @@ internal class InnerTube(
      * Reads [maxBytes] from [url] with a single open ended range, which is what the
      * player sends when it starts a stream.
      */
-    private fun relayRead(url: String, maxBytes: Long): String = try {
+    private fun relayRead(url: String, maxBytes: Long, from: Long = 0L): String = try {
         val request = Request.Builder()
             .url(url)
             .header("User-Agent", PLAYBACK_UA)
-            .header("Range", "bytes=0-")
+            .header("Range", "bytes=$from-")
             .get()
             .build()
         val started = System.currentTimeMillis()

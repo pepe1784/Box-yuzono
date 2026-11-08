@@ -99,6 +99,16 @@ internal class SabrStream(
 
     private var requestNumber = 0
 
+    /** Where the session is served from now; the server moves it between hosts. */
+    private var abrUrl: String = spec.abrUrl
+
+    /** Redirect named by the answer being read, if any. */
+    private var pendingRedirect: String? = null
+
+    /** Last host the server moved the session to, for the diagnostic screen. */
+    var lastRedirect: String? = null
+        private set
+
     private val config: ByteArray by lazy {
         runCatching { Base64.decode(spec.ustreamerConfig, Base64.DEFAULT) }.getOrDefault(ByteArray(0))
     }
@@ -111,26 +121,44 @@ internal class SabrStream(
      */
     fun request(timeMs: Long, sink: SabrSink): Long {
         val body = buildBody(timeMs)
-        val url = spec.abrUrl + (if (spec.abrUrl.contains('?')) "&" else "?") + "rn=" + requestNumber++
-        val request = Request.Builder()
-            .url(url)
-            .post(body.toRequestBody(PROTO))
-            .header("Accept", "application/vnd.yt-ump")
-            .header("Accept-Encoding", "identity")
-            .header("User-Agent", spec.userAgent)
-            .build()
+        val payload = body.toRequestBody(PROTO)
         var written = 0L
-        try {
-            http.newCall(request).execute().use { response ->
-                if (response.code !in 200..299) {
-                    lastError = "HTTP ${response.code}"
-                    return 0
+        // A SABR answer can be nothing but a redirect: the server hands another signed
+        // link, on another host, and expects the same request there. It only logged it
+        // before, so the session ended up with nothing to give in the middle of a video.
+        repeat(MAX_REDIRECTS) {
+            val url = abrUrl + (if (abrUrl.contains('?')) "&" else "?") + "rn=" + requestNumber++
+            val request = Request.Builder()
+                .url(url)
+                .post(payload)
+                .header("Accept", "application/vnd.yt-ump")
+                .header("Accept-Encoding", "identity")
+                .header("User-Agent", spec.userAgent)
+                .build()
+            pendingRedirect = null
+            written = 0L
+            try {
+                http.newCall(request).execute().use { response ->
+                    if (response.code !in 200..299) {
+                        lastError = "HTTP ${response.code}"
+                        return 0
+                    }
+                    val raw = response.body.byteStream()
+                    written = readParts(BufferedInputStream(raw, 256 * 1024), sink)
                 }
-                val raw = response.body.byteStream()
-                written = readParts(BufferedInputStream(raw, 256 * 1024), sink)
+            } catch (e: Exception) {
+                lastError = e.message ?: e.javaClass.simpleName
+                return 0
             }
-        } catch (e: Exception) {
-            lastError = e.message ?: e.javaClass.simpleName
+            val next = pendingRedirect
+            if (next.isNullOrBlank()) {
+                if (lastError?.startsWith("redirect") == true) lastError = null
+                return written
+            }
+            abrUrl = next
+            lastRedirect = next
+            Log.d(TAG, "sabr sends to another host: ${next.substringBefore('?').take(70)}")
+            if (written > 0) return written
         }
         return written
     }
@@ -173,6 +201,7 @@ internal class SabrStream(
                 }
                 PART_SABR_REDIRECT -> {
                     val redirect = fieldString(payload, 1)
+                    pendingRedirect = redirect.ifBlank { null }
                     lastError = "redirect $redirect"
                 }
             }
@@ -312,6 +341,9 @@ internal class SabrStream(
     private companion object {
         const val TAG = "INboxSabr"
         const val BANDWIDTH = 2_000_000L
+
+        /** How many hosts the server may move one session to before giving up. */
+        const val MAX_REDIRECTS = 3
 
         const val PART_MEDIA_HEADER = 20
         const val PART_MEDIA = 21

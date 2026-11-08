@@ -120,6 +120,10 @@ internal object StreamRelay {
         @Volatile var index: SabrIndex? = null,
         /** True once SABR proved useless for this stream; the relay stays on ranges. */
         @Volatile var sabrOff: Boolean = false,
+        /** Last stream protection status the server reported: 1 ok, 2 pending, 3 rejected. */
+        @Volatile var protection: Int = 0,
+        /** Last SABR failure in plain words, to see it in the diagnostic screen. */
+        @Volatile var sabrError: String? = null,
     )
 
     /**
@@ -192,8 +196,17 @@ internal object StreamRelay {
         val token = url.substringAfter("/s/", "").substringBefore('?').substringBefore('#')
         val entry = entries[token] ?: return "sin entrada"
         val spec = entry.sabr ?: return "solo rangos (${entry.clientName})"
+        val extra = if (entry.protection != 0) " protección=${entry.protection}" else ""
+        val failure = entry.sabrError?.let { " error=" + it.take(70) }.orEmpty()
         return "SABR itag=${spec.itag} cliente=${spec.clientId} cabecera=0..${spec.headEnd} " +
-            "tamaño=${spec.length} audio=${spec.isAudio} índice=${spec.indexStart}..${spec.indexEnd}"
+            "tamaño=${spec.length} audio=${spec.isAudio} índice=${spec.indexStart}..${spec.indexEnd}" +
+            extra + failure
+    }
+
+    /** Size of the file being relayed, for the diagnostic screen. */
+    fun lengthOf(url: String): Long {
+        val token = url.substringAfter("/s/", "").substringBefore('?').substringBefore('#')
+        return entries[token]?.length ?: 0L
     }
 
     // ================================ server ================================
@@ -297,6 +310,10 @@ internal object StreamRelay {
         while (end < 0 || position <= end) {
             val writer = SabrWriter(active, output, position, end, time)
             stream.request(time, writer)
+            if (stream.protection != 0) {
+                entry.protection = stream.protection
+            }
+            entry.sabrError = stream.lastError
             if (writer.gone) return GONE
             if (writer.written > 0L) {
                 position = writer.position
