@@ -499,7 +499,7 @@ internal object StreamRelay {
                     return position
                 }
                 Log.d(TAG, "HTTP ${response?.code} at $position, asking for a fresh link")
-                runCatching { PotProvider.request(entry.videoId) }
+                if (needsToken(entry)) runCatching { PotProvider.request(entry.videoId) }
                 refresh(entry)
                 continue
             }
@@ -548,7 +548,7 @@ internal object StreamRelay {
                 Log.w(TAG, "no data at byte $position, giving up (${entry.videoId}/${entry.itag})")
                 return position
             }
-            runCatching { PotProvider.request(entry.videoId) }
+            runCatching { if (needsToken(entry)) PotProvider.request(entry.videoId) }
             refresh(entry)
         }
         return position
@@ -558,7 +558,7 @@ internal object StreamRelay {
         // Never wait for the token here: setting up a WebView to mint it takes a
         // second or two, and that delay would be paid before the picture appears.
         // `refresh` asks for it in the background instead.
-        val pot = token(entry)
+        val pot = if (needsToken(entry)) token(entry) else null
         val url = if (pot.isNullOrBlank()) {
             entry.url
         } else {
@@ -576,6 +576,12 @@ internal object StreamRelay {
             .build()
         return http.newCall(request).execute()
     }
+
+    /**
+     * `VISIONOS` links serve the whole file by themselves (no `n`, no poToken), so the
+     * relay does not mint a token for them: it would only cost a WebView round trip.
+     */
+    private fun needsToken(entry: Entry): Boolean = entry.clientName != "VISIONOS"
 
     private fun refresh(entry: Entry) {
         // One lock per stream: video and audio must not wait for each other, that

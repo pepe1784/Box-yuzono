@@ -19,6 +19,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 internal class InnerTube(
     private val client: OkHttpClient,
@@ -56,14 +57,18 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v13 · 14.34"
+        private const val DIAG_VERSION = "v14 · 14.35"
 
         /**
-         * How long the list waits for the poToken before settling for a tokenless
-         * client. The token is what keeps a stream alive past the minute, so it is
-         * worth a moment, but not a visible hang.
+         * The visitor the player requests announce when no token has been minted yet.
+         *
+         * The `VISIONOS` client gives the whole DASH file, but some videos answer
+         * "Sign in to confirm you're not a bot" to a request that arrives without a
+         * visitor. The watch page carries one (`ytcfg`), so it is read once and kept.
          */
-        private const val POT_WAIT_MS = 9000L
+        @Volatile
+        private var pageVisitor: String? = null
+        private val visitorLock = Any()
 
         /** User agent for the media requests, used by the relay too. */
         const val PLAYBACK_UA =
@@ -74,6 +79,26 @@ internal class InnerTube(
             name = "WEB",
             version = "2.20250312.04.00",
             userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+        )
+
+        /**
+         * The visionOS app. It is the only client measured to hand out the **whole**
+         * adaptive file: direct `googlevideo` links with no `n` parameter (nothing to
+         * descramble), no poToken, no `signatureTimestamp`, and range requests that
+         * answer 206 all the way to the last byte. The Android/iOS clients answer
+         * 403 after ~60 s of an adaptive stream, which is the freeze at the minute.
+         */
+        val VISIONOS = ClientSpec(
+            id = "28",
+            name = "VISIONOS",
+            version = "1.02",
+            userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+            extra = buildJsonObject {
+                put("deviceMake", "Apple")
+                put("deviceModel", "RealityDevice17,1")
+                put("osName", "visionOS")
+                put("osVersion", "26.0.0.23M")
+            },
         )
 
         val ANDROID = ClientSpec(
@@ -146,6 +171,7 @@ internal class InnerTube(
         )
 
         val PLAYER_CLIENTS = listOf(
+            VISIONOS,
             ANDROID,
             IOS,
             ANDROID_VR,
@@ -156,14 +182,14 @@ internal class InnerTube(
             WEB,
         )
 
-        fun playerOrder(preferred: String, attested: Boolean = false): List<ClientSpec> {
-            val first = PLAYER_CLIENTS.firstOrNull { it.name == preferred } ?: ANDROID
-            val base = listOf(first) + PLAYER_CLIENTS.filter { it !== first }
-            // The web clients answer OK once the token exists, but their media servers
-            // are the ones that refuse this network (403 on the links, silence on the
-            // SABR endpoint), so the transport stays on the app clients and the web
-            // ones are only the fallback that comes later in the list.
-            return base
+        /**
+         * Order of clients to ask. `VISIONOS` always goes first: it is the one that
+         * returns complete DASH links, so the rest are only a fallback for the odd
+         * video it refuses. The chosen preference keeps its place right behind it.
+         */
+        fun playerOrder(preferred: String): List<ClientSpec> {
+            val first = PLAYER_CLIENTS.firstOrNull { it.name == preferred && it !== VISIONOS } ?: ANDROID
+            return listOf(VISIONOS, first) + PLAYER_CLIENTS.filter { it !== VISIONOS && it !== first }
         }
 
         /**
@@ -229,24 +255,16 @@ internal class InnerTube(
         // Mint the token while the person is still choosing what to watch, so the first
         // video already opens a web session instead of spending its first seconds here.
         runCatching { PotProvider.prewarm() }
+        // The visitor the video requests announce is read from the page; doing it here,
+        // in the background, keeps that request off the path that opens the video.
+        runCatching { thread(isDaemon = true, name = "inbox-visitor") { pageVisitor() } }
     }
 
     /**
-     * The order of clients to ask, which depends on whether the poToken is ready.
-     *
-     * Both the request that opens the video and its parse need the same answer: the
-     * first one is the client whose response is used as-is, and the SABR session is
-     * built from *that* client's response. Waiting for the token here is what lets the
-     * list start with a web client, which is the one the token is valid for.
+     * The order of clients to ask. `VISIONOS` comes first and needs no token, so there
+     * is nothing to wait for here: the list opens as soon as the request answers.
      */
-    fun orderFor(videoId: String, preferred: String): List<ClientSpec> {
-        val attested = PotProvider.await(videoId, POT_WAIT_MS) != null
-        // The session itself needs the proof bound to this video; minting it costs a
-        // few milliseconds once the page is loaded, so it is asked for from here and
-        // the relay finds it ready by the time it opens the stream.
-        if (attested) runCatching { PotProvider.bindSoon(videoId) }
-        return playerOrder(preferred, attested)
-    }
+    fun orderFor(preferred: String): List<ClientSpec> = playerOrder(preferred)
 
     /**
      * Asks InnerTube for a fresh googlevideo link for one exact stream. Called by the
@@ -261,7 +279,7 @@ internal class InnerTube(
         // The same itag exists in every client, so a couple of tries is enough. The
         // web clients are left out on purpose: their links and their SABR endpoint are
         // refused from here, and a fresh web link would replace a session that works.
-        val candidates = listOf(primary, IOS, ANDROID)
+        val candidates = listOf(primary, VISIONOS, IOS, ANDROID)
         for (spec in candidates.distinctBy { it.name }) {
             val source = runCatching { sourceFor(videoId, spec, itag, xTags) }.getOrNull()
             if (source != null) return source
@@ -295,6 +313,9 @@ internal class InnerTube(
         spec: ClientSpec,
         format: JsonObject,
     ): SabrSpec? {
+        // The `VISIONOS` links already serve the whole file, so there is nothing to
+        // rebuild: plain ranges are faster and do not need a token.
+        if (spec.direct) return null
         val abrUrl = streamingData.str("serverAbrStreamingUrl")?.takeIf { it.isNotBlank() } ?: return null
         val config = json.obj("playerConfig")
             ?.obj("mediaCommonConfig")
@@ -384,9 +405,10 @@ internal class InnerTube(
     }
 
     fun playerRequest(videoId: String, spec: ClientSpec): Request {
-        // The web clients refuse to hand out anything without it, and the mobile ones
-        // ignore it, so it travels whenever it has been minted.
-        val pot = runCatching { PotProvider.peek(videoId) }.getOrNull()
+        // The web clients refuse to hand out anything without it, and the app ones
+        // ignore it, so it only travels where it is understood.
+        val pot = if (spec.web) runCatching { PotProvider.peek(videoId) }.getOrNull() else null
+        val sts = if (spec.web) PotProvider.signatureTimestamp() else null
         val body = buildJsonObject {
             put("context", context(spec))
             put("videoId", videoId)
@@ -402,7 +424,7 @@ internal class InnerTube(
                             // Says which player build the request speaks. Without it the
                             // web clients answer "The page needs to be reloaded." instead
                             // of the formats, which is what kept the session off-web.
-                            PotProvider.signatureTimestamp()?.let { put("signatureTimestamp", it) }
+                            sts?.let { put("signatureTimestamp", it) }
                         },
                     )
                 },
@@ -649,25 +671,29 @@ internal class InnerTube(
             ?: extractVideoId(response.request.url.toString())
             ?: throw Exception("INbox: request without a video id")
 
-        // The only token that can be minted here is a web one, and it is what decides
-        // whether the stream survives past the first minute. The client order already
-        // reflects that (see [orderFor]).
-        val token = runCatching { PotProvider.peek(videoId) }.getOrNull()
         // The response that came in was signed for one exact client, and its links and
         // SABR session belong to it: that client has to be the one used first, whatever
-        // the order says now.
+        // the order says now. `VISIONOS` wins anyway: its links are the complete ones.
         val fromResponse = response.request.header(HEADER_CLIENT)
-        val order = playerOrder(preferredClient, attested = token != null)
-            .sortedWith(compareBy { if (fromResponse != null && it.name == fromResponse) 0 else 1 })
+        val order = playerOrder(preferredClient)
+            .sortedWith(
+                compareBy<ClientSpec> {
+                    when (it.name) {
+                        VISIONOS.name -> 0
+                        fromResponse -> 1
+                        else -> 2
+                    }
+                },
+            )
         val failures = mutableListOf<String>()
-        // With the page route on, the app-side player is only asked for muxed
-        // streams: its DASH links are the tokenless ones that answer 403.
-        val usePageForDash = includeDash && pagePlayer != null
-        var muxed: List<Video> = emptyList()
 
-        var body = response.use { it.body.string() }.orEmpty()
+        val givenBody = response.use { it.body.string() }.orEmpty()
+        // The body only serves the loop when it was signed for the client in front of
+        // it; a body from another client would be read as if its links were complete.
+        val reuseBody = fromResponse == order.first().name
+        var body = if (reuseBody) givenBody else ""
         for ((index, spec) in order.withIndex()) {
-            if (index > 0) {
+            if (index > 0 || !reuseBody) {
                 body = try {
                     client.newCall(playerRequest(videoId, spec)).execute()
                         .use { it.body.string() }.orEmpty()
@@ -699,8 +725,8 @@ internal class InnerTube(
                     json = json,
                     spec = spec,
                     videoId = videoId,
-                    includeDash = includeDash && !usePageForDash,
-                    includeMuxed = includeMuxed || usePageForDash,
+                    includeDash = includeDash,
+                    includeMuxed = includeMuxed,
                     fetchSubtitles = fetchSubtitles,
                     preferredAudioLang = preferredAudioLang,
                     preferredSubtitleLang = preferredSubtitleLang,
@@ -717,58 +743,13 @@ internal class InnerTube(
 
             val playable = if (verifyStreams) filterPlayable(videos) else videos
             if (playable.isNotEmpty()) {
-                if (!usePageForDash) {
-                    Log.d(TAG, "Resolved ${playable.size} streams with ${spec.name} (${videos.size} candidates)")
-                    return playable
-                }
-                Log.d(TAG, "Resolved ${playable.size} muxed stream(s) with ${spec.name}")
-                muxed = playable
-                break
+                Log.d(TAG, "Resolved ${playable.size} streams with ${spec.name} (${videos.size} candidates)")
+                return playable
             }
             failures += "${spec.name}: ${videos.size} format(s) rejected (HTTP 4xx, likely blocked)"
         }
 
-        if (!usePageForDash) {
-            throw Exception("INbox: no playable stream. ${failures.joinToString(" | ")}")
-        }
-
-        // The page route. First choice: the links the page's player requested itself,
-        // which already carry `pot` and the descrambled `n` parameter.
-        val page = runCatching { pagePlayer.invoke(videoId) }.getOrNull()
-        val captured = page?.let { capturedDash(it, preferredQuality) }.orEmpty()
-        if (captured.isNotEmpty()) {
-            Log.d(TAG, "Resolved ${captured.size} DASH stream(s) from the page player")
-            return captured + muxed
-        }
-        // Second choice: the page's player response.
-        val pageResponse = page?.response
-        if (pageResponse != null) {
-            val dash = runCatching {
-                buildVideos(
-                    json = JSON.parseToJsonElement(pageResponse).jsonObject,
-                    spec = WEB,
-                    videoId = videoId,
-                    includeDash = true,
-                    includeMuxed = false,
-                    fetchSubtitles = fetchSubtitles,
-                    preferredAudioLang = preferredAudioLang,
-                    preferredSubtitleLang = preferredSubtitleLang,
-                    preferredQuality = preferredQuality,
-                )
-            }.getOrElse {
-                failures += "page: ${it.message}"
-                emptyList()
-            }
-            if (dash.isNotEmpty()) {
-                Log.d(TAG, "Resolved ${dash.size} DASH stream(s) from the watch page")
-                return dash + muxed
-            }
-            if (failures.none { it.startsWith("page:") }) failures += "page: no DASH formats"
-        } else {
-            failures += "page: no player response"
-        }
-
-        // Page route failed: fall back to the tokenless DASH links anyway.
+        // Last resort: the same clients again, keeping every candidate without probing.
         val nativeDash = nativeDash(
             videoId = videoId,
             order = order,
@@ -779,28 +760,8 @@ internal class InnerTube(
             verifyStreams = verifyStreams,
             failures = failures,
         )
-        if (nativeDash.isNotEmpty()) return nativeDash + muxed
-        if (muxed.isNotEmpty()) return muxed
+        if (nativeDash.isNotEmpty()) return nativeDash
         throw Exception("INbox: no playable stream. ${failures.joinToString(" | ")}")
-    }
-
-    /** Builds a DASH entry from the links the page player used. */
-    private fun capturedDash(streams: PageStreams, preferredQuality: String): List<Video> {
-        if (!streams.hasPlayableDash) return emptyList()
-        val video = streams.videos
-            .sortedByDescending { it.height }
-            .firstOrNull { passesQuality(it.height, preferredQuality) }
-            ?: return emptyList()
-        val audio = streams.audios.first()
-        return listOf(
-            Video(
-                video.url,
-                "DASH ${video.label} • ${audio.label}",
-                video.url,
-                playbackHeaders,
-                audioTracks = listOf(Track(audio.url, audio.label)),
-            ),
-        )
     }
 
     /** Compact report for the in-app DASH test. */
@@ -817,11 +778,9 @@ internal class InnerTube(
     ): String = buildString {
         appendLine("ID: $videoId")
         appendLine("Prueba $DIAG_VERSION")
-        // The point of the test is to see what happens with the token, so it waits for
-        // it here instead of reporting the order the app would use without one.
-        val token = runCatching { PotProvider.await(videoId, 20_000) }.getOrNull()
-        val order = playerOrder(preferredClient, attested = token != null)
+        val order = playerOrder(preferredClient)
         appendLine("Orden: ${order.joinToString(", ") { it.name }}")
+        appendLine("Visitante: ${runCatching { visitorId(VISIONOS) }.getOrNull()?.take(24) ?: "no"}")
 
         val videos = runCatching {
             val response = client.newCall(playerRequest(videoId, order.first())).execute()
@@ -868,6 +827,11 @@ internal class InnerTube(
             if (half > 0) {
                 appendLine("  video a mitad (byte $half): ${relayRead(dash.videoUrl!!, 2 * 1024 * 1024, half)}")
             }
+            // And the last bytes: the file has to be readable all the way to its end.
+            val size = StreamRelay.lengthOf(dash.videoUrl!!)
+            if (size > 0) {
+                appendLine("  video al final (byte ${size - 4096}): ${relayRead(dash.videoUrl!!, 4096, size - 4096)}")
+            }
             appendLine("  estado SABR: ${StreamRelay.describe(dash.videoUrl!!)}")
             dash.audioTracks.firstOrNull()?.let {
                 appendLine("  audio «${it.lang}»: ${relayRead(it.url, 1024 * 1024)}")
@@ -882,23 +846,14 @@ internal class InnerTube(
             appendLine("Muxed directo: ${probe(muxed.videoUrl!!, withHeaders = true, range = "bytes=0-1")}")
         }
 
-        appendLine("Corte de YouTube (enlace nuevo, mitad del archivo): ${windowLine(videoId, order.first())}")
+        appendLine("Mitad del archivo (enlace nuevo de ${order.first().name}): ${windowLine(videoId, order.first())}")
 
         val pot = runCatching { PotProvider.peek(videoId) }.getOrNull()
         appendLine(
             "poToken: " + if (pot == null) {
-                "no" + runCatching { PotProvider.lastError() }.getOrNull()?.let { " ($it)" }.orEmpty()
+                "no (no hace falta con VISIONOS)" + runCatching { PotProvider.lastError() }.getOrNull()?.let { " ($it)" }.orEmpty()
             } else {
                 "sí (${pot.length} caracteres, visitante ${visitor()?.take(12) ?: "?"}…, ${webVersion() ?: "?"}, sts ${PotProvider.signatureTimestamp() ?: "?"})"
-            },
-        )
-        // The one the app session sends: it is a different proof, bound to the video.
-        val videoPot = runCatching { PotProvider.bindWait(videoId, 6000) }.getOrNull()
-        appendLine(
-            "poToken de vídeo: " + if (videoPot == null) {
-                "no" + runCatching { PotProvider.lastError() }.getOrNull()?.let { " ($it)" }.orEmpty()
-            } else {
-                "${videoPot.length} caracteres"
             },
         )
 
@@ -1135,7 +1090,8 @@ internal class InnerTube(
                 val track = format.obj("audioTrack")
                 val xTags = xTagsOf(url)
                 val rawName = track?.str("displayName")?.takeIf { it.isNotBlank() }
-                    ?: format.str("audioQuality")?.takeIf { it.isNotBlank() }
+                    ?: format.str("audioQuality")
+                        ?.takeIf { it.isNotBlank() && !it.startsWith("AUDIO_QUALITY") }
                         .orEmpty()
                 val original = xTags.contains("acont=original") || rawName.contains("original", ignoreCase = true)
                 val drc = xTags.contains("drc=")
@@ -1390,8 +1346,15 @@ internal class InnerTube(
             else -> rawName.substringBefore(" original", rawName).trim()
                 .ifBlank { languageName(lang).ifBlank { "Audio" } }
         }
-        if (!xTags.contains("acont=")) return base
-        val kind = if (original) "original" else "doblado"
+        val marked = xTags.contains("acont=") ||
+            rawName.contains("original", ignoreCase = true) ||
+            rawName.contains("dubbed", ignoreCase = true)
+        if (!marked) return base
+        val kind = when {
+            original -> "original"
+            xTags.contains("dubbed-auto") || rawName.contains("auto-dubbed", ignoreCase = true) -> "doblado auto"
+            else -> "doblado"
+        }
         return if (drc) "$base · $kind · volumen" else "$base · $kind"
     }
 
@@ -1416,7 +1379,7 @@ internal class InnerTube(
                 put("gl", "US")
                 // The token was minted for the homepage's visitor: a player request
                 // that announces another one gets it ignored (and the stream cut).
-                visitor()?.let { put("visitorData", it) }
+                visitorId(spec)?.let { put("visitorData", it) }
                 spec.extra.forEach { (key, value) -> put(key, value) }
             },
         )
@@ -1425,6 +1388,44 @@ internal class InnerTube(
         }
         put("user", buildJsonObject { put("lockedSafetyMode", false) })
         put("request", buildJsonObject { put("useSsl", true) })
+    }
+
+    /**
+     * Visitor announced to [spec]. The web clients need the one the token was minted
+     * for; the app ones just need a valid visitor, so the page's is used while there
+     * is no token (it costs one plain request, not a WebView round trip).
+     */
+    private fun visitorId(spec: ClientSpec): String? = visitor() ?: if (spec.web) null else pageVisitor()
+
+    /**
+     * Visitor the watch page hands out in its `ytcfg`.
+     *
+     * Some videos answer "Sign in to confirm you're not a bot" to a player request
+     * without a visitor, so every app client announces the one from here. Read once and
+     * kept for the whole session.
+     */
+    private fun pageVisitor(): String? {
+        pageVisitor?.let { return it }
+        synchronized(visitorLock) {
+            pageVisitor?.let { return it }
+            val value = runCatching {
+                val request = Request.Builder()
+                    .url("$BASE_URL/?hl=en&gl=US")
+                    .header("User-Agent", VISIONOS.userAgent)
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .addHeader("Cookie", CONSENT_COOKIE)
+                    .get()
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return@use null
+                    Regex("\"VISITOR_DATA\":\"([^\"]+)\"").find(response.body.string())
+                        ?.groupValues?.get(1)
+                }
+            }.getOrNull()
+            if (!value.isNullOrBlank()) pageVisitor = value
+            return value
+        }
     }
 
     private fun streamHeaders(spec: ClientSpec): Headers = Headers.Builder()
@@ -1471,6 +1472,9 @@ internal data class ClientSpec(
 ) {
     /** The clients that share the page version and the visitor of the minted token. */
     val web: Boolean get() = name == "WEB" || name == "MWEB"
+
+    /** Clients whose media links already serve the whole file (no SABR to rebuild). */
+    val direct: Boolean get() = name == "VISIONOS"
 }
 
 private data class VideoRep(

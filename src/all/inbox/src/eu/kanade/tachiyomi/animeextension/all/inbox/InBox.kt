@@ -1,6 +1,10 @@
 package eu.kanade.tachiyomi.animeextension.all.inbox
 
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -331,7 +335,7 @@ class InBox :
 
     override fun videoListRequest(episode: SEpisode): Request {
         val videoId = extractVideoId(episode.url) ?: episode.url
-        return innerTube.playerRequest(videoId, innerTube.orderFor(videoId, preferredClient).first())
+        return innerTube.playerRequest(videoId, innerTube.orderFor(preferredClient).first())
     }
 
     override fun videoListParse(response: Response): List<Video> {
@@ -491,6 +495,8 @@ class InBox :
                         .setTitle("DASH")
                         .setMessage(report)
                         .setPositiveButton("OK", null)
+                        .setNeutralButton("Copiar") { _, _ -> copyReport(context, report) }
+                        .setNegativeButton("Compartir") { _, _ -> shareReport(context, report) }
                         .show()
                 }.onFailure {
                     // Some hosts hand the preference screen a context without a window.
@@ -498,6 +504,31 @@ class InBox :
                 }
             }
         }.start()
+    }
+
+    /** Puts the whole test in the clipboard: the report is too long to retype by hand. */
+    private fun copyReport(context: Context, report: String) {
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        if (clipboard == null) {
+            Toast.makeText(context, "No hay portapapeles", Toast.LENGTH_SHORT).show()
+            return
+        }
+        clipboard.setPrimaryClip(ClipData.newPlainText("INbox DASH", report))
+        Toast.makeText(context, "Informe copiado", Toast.LENGTH_SHORT).show()
+    }
+
+    /** Hands the report to any app that takes text (chat, notes, mail). */
+    private fun shareReport(context: Context, report: String) {
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "INbox DASH")
+            putExtra(Intent.EXTRA_TEXT, report)
+        }
+        runCatching {
+            context.startActivity(Intent.createChooser(intent, "Compartir informe"))
+        }.onFailure {
+            Toast.makeText(context, "No se pudo compartir", Toast.LENGTH_SHORT).show()
+        }
     }
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
@@ -555,7 +586,8 @@ class InBox :
         private const val PREF_CLIENT_KEY = "pref_client"
         private const val PREF_CLIENT_DEFAULT = "auto"
         private val PREF_CLIENT_ENTRIES = arrayOf(
-            "Auto (ANDROID first)",
+            "Auto (VISIONOS first)",
+            "VISIONOS",
             "ANDROID",
             "IOS",
             "ANDROID_VR",
@@ -567,6 +599,7 @@ class InBox :
         )
         private val PREF_CLIENT_VALUES = arrayOf(
             "auto",
+            "VISIONOS",
             "ANDROID",
             "IOS",
             "ANDROID_VR",
