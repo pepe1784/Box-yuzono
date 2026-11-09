@@ -33,16 +33,69 @@ internal class InnerTube(
         private const val OEMBED_URL = "$BASE_URL/oembed"
         private const val CONSENT_COOKIE = "SOCS=CAESEwgDEgk0ODE3Nzk3NTQaAmVuIAEaBgiA_K-fBg"
 
+        /**
+         * Language and country the device is set to.
+         *
+         * YouTube serves *translated* titles when the account is known to speak that
+         * language, and `hl = en` was making channels with localized titles show them
+         * in English. Asking for the device's language keeps the title as its uploader
+         * wrote it (and, when the device language is the original one, exactly the
+         * same text YouTube's own app shows).
+         */
+        val LANG: String = Locale.getDefault().language
+            .lowercase(Locale.ROOT)
+            .takeIf { it.matches(Regex("[a-z]{2,3}")) }
+            ?: "en"
+
+        val COUNTRY: String = Locale.getDefault().country
+            .uppercase(Locale.ROOT)
+            .takeIf { it.matches(Regex("[A-Z]{2}")) }
+            ?: "US"
+
+        /** `Accept-Language` that matches [LANG]/[COUNTRY], with English as last resort. */
+        fun acceptLanguage(): String = if (LANG == "en") "en-US,en;q=0.9" else "$LANG-$COUNTRY,$LANG;q=0.9,en;q=0.5"
+
         const val HEADER_VIDEO_ID = "X-Inbox-Video-Id"
         const val HEADER_CLIENT = "X-Inbox-Client"
         const val HEADER_TARGET = "X-Inbox-Target"
         const val HEADER_TARGET_URL = "X-Inbox-Target-Url"
+        const val HEADER_FEED = "X-Inbox-Feed"
+        const val HEADER_PAGE = "X-Inbox-Page"
 
         /** InnerTube search params (base64 protobuf) for the result type. */
         const val PARAMS_VIDEOS = "EgIQAQ=="
         const val PARAMS_CHANNELS = "EgIQAg=="
         const val PARAMS_PLAYLISTS = "EgIQAw=="
         const val PARAMS_CHANNEL_VIDEOS = "EgZ2aWRlb3PyBgQKAjoA"
+
+        /**
+         * Search params for the "Recientes" catalogue: videos uploaded today, in
+         * relevance order. The `sortBy` field of the search params is ignored by
+         * YouTube now, but the upload-date filter still narrows the whole result set
+         * to today's videos, which is what makes it a feed of what just came out.
+         */
+        const val PARAMS_RECENT = "EgQIAhAB"
+
+        /** Same filter, but for the whole week: more results, still recent. */
+        const val PARAMS_WEEK = "EgQIAxAB"
+
+        /** How many pages a lost continuation chain may be walked again for. */
+        private const val MAX_REBUILD_PAGES = 12
+
+        /**
+         * Type labels YouTube prints next to a title ("Playlist", "Lista de
+         * reproducción"...). They are UI text, not data, so they are kept out of the
+         * description. Listed in the languages the app is likely to run in.
+         */
+        private val CONTENT_LABELS = setOf(
+            "playlist", "playlists",
+            "lista de reproducción", "lista de reproduccion",
+            "listas de reproducción", "listas de reproduccion",
+            "liste de lecture", "wiedergabeliste", "afspeellijst", "playlist do youtube",
+            "再生リスト", "プレイリスト", "재생목록", "قائمة تشغيل", "danh sách phát",
+            "mix", "álbum", "album", "álbum de música", "album de musica",
+            "curso", "course", "música", "music",
+        )
 
         fun sortParams(sort: Int): String = when (sort) {
             1 -> "CAISAhAB"
@@ -57,7 +110,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v14 · 14.35"
+        private const val DIAG_VERSION = "v14 · 14.36"
 
         /**
          * The visitor the player requests announce when no token has been minted yet.
@@ -247,6 +300,14 @@ internal class InnerTube(
     /** Cache of relay urls, so one entry per stream is created. */
     private val relayUrls = mutableMapOf<String, String>()
 
+    /** Continuation handed out by each page of a scrolling feed, keyed `feed|page`. */
+    private val feedTokens = HashMap<String, String>()
+
+    /** Query and params of each feed, so a lost chain can be walked again. */
+    private val feedBases = HashMap<String, Pair<String, String>>()
+
+    private val feedLock = Any()
+
     init {
         // The relay asks for a new signed link whenever googlevideo starts refusing one.
         StreamRelay.resolver = { videoId, itag, xTags, clientName ->
@@ -383,6 +444,93 @@ internal class InnerTube(
         return post("$API_URL/search?prettyPrint=false", body, apiHeaders(WEB))
     }
 
+    /**
+     * One page of a scrolling feed.
+     *
+     * Page 1 is the search itself; every later page reuses the continuation the
+     * previous page handed out, because a search has no offset and that token is the
+     * only way to keep going. The catalogue asks for the pages in order while the
+     * person scrolls, so the token is normally already cached.
+     */
+    fun feedRequest(feed: String, page: Int, query: String, params: String): Request {
+        val pageNo = page.coerceAtLeast(1)
+        synchronized(feedLock) {
+            if (feedBases.size > 64) feedBases.clear()
+            if (feedTokens.size > 256) feedTokens.clear()
+            feedBases[feed] = query to params
+            // Asking for page 1 again means a refresh: the old chain does not apply.
+            if (pageNo == 1) feedTokens.keys.removeAll { it.startsWith("$feed|") }
+        }
+        val token = feedToken(feed, pageNo)
+        return if (token != null) {
+            taggedPage(searchContinuationRequest(token), feed, pageNo)
+        } else {
+            // The chain could not be rebuilt: page 1 is still a valid answer.
+            taggedPage(searchRequest(query, params), feed, 1)
+        }
+    }
+
+    /** Stores the continuation a feed page returned, so the next page can be asked for. */
+    fun rememberFeedPage(feed: String, page: Int, continuation: String?) {
+        if (continuation.isNullOrBlank()) return
+        synchronized(feedLock) { feedTokens["$feed|$page"] = continuation }
+    }
+
+    /**
+     * Continuation that opens [page]. When it is not cached (the app was restarted
+     * halfway down the list) the chain is walked again: one cheap request per skipped
+     * page, which is what makes a jump straight to page 9 still work.
+     */
+    private fun feedToken(feed: String, page: Int): String? {
+        if (page <= 1) return null
+        // A jump to a very deep page is not worth a burst of requests: page 1 will do.
+        if (page - 1 > MAX_REBUILD_PAGES) return null
+        val base = synchronized(feedLock) { feedBases[feed] } ?: return null
+        var token: String? = null
+        var step = 0
+        while (step < page - 1) {
+            val cached = synchronized(feedLock) { feedTokens["$feed|$step"] }
+            if (cached != null) {
+                token = cached
+                step++
+                continue
+            }
+            val request = token?.let { searchContinuationRequest(it) }
+                ?: searchRequest(base.first, base.second)
+            val next = runCatching {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        null
+                    } else {
+                        parseListing(response.body.string().orEmpty()).continuation
+                    }
+                }
+            }.getOrNull() ?: return null
+            synchronized(feedLock) { feedTokens["$feed|$step"] = next }
+            token = next
+            step++
+        }
+        return token
+    }
+
+    /** Page header, so the parser knows which feed and page a body belongs to. */
+    private fun taggedPage(request: Request, feed: String, page: Int): Request = request.newBuilder()
+        .header(HEADER_FEED, feed)
+        .header(HEADER_PAGE, page.toString())
+        .build()
+
+    /**
+     * Next page of a search. Search continuations live on `/search`; posting the same
+     * token to `/browse` answers with an empty body.
+     */
+    fun searchContinuationRequest(token: String): Request {
+        val body = buildJsonObject {
+            put("context", context(WEB))
+            put("continuation", token)
+        }
+        return post("$API_URL/search?prettyPrint=false", body, apiHeaders(WEB))
+    }
+
     fun browseRequest(browseId: String, params: String? = null): Request {
         val body = buildJsonObject {
             put("context", context(WEB))
@@ -447,7 +595,12 @@ internal class InnerTube(
 
     fun oembedRequest(videoId: String): Request {
         val url = "$OEMBED_URL?url=${"https://www.youtube.com/watch?v=$videoId".encodeUrl()}&format=json"
-        return Request.Builder().url(url).headers(apiHeaders(WEB)).get().build()
+        return Request.Builder()
+            .url(url)
+            .headers(apiHeaders(WEB))
+            .header("Accept-Language", acceptLanguage())
+            .get()
+            .build()
     }
 
     /** Real watch page, used for details and for the client's WebView. */
@@ -455,7 +608,7 @@ internal class InnerTube(
         .url(watchUrl(videoId))
         .header("User-Agent", WEB.userAgent)
         .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Accept-Language", acceptLanguage())
         .addHeader("Cookie", CONSENT_COOKIE)
         .get()
         .build()
@@ -585,16 +738,23 @@ internal class InnerTube(
         }
         val metadata = lockup.obj("metadata")?.obj("lockupMetadataViewModel")
         val title = metadata?.obj("title").text() ?: id
-        val parts = metadata?.obj("metadata")
+        val rows = metadata?.obj("metadata")
             ?.obj("contentMetadataViewModel")
             ?.arr("metadataRows")
             .orEmpty()
-            .flatMap { row ->
-                (row as? JsonObject)?.arr("metadataParts").orEmpty()
-                    .mapNotNull { (it as? JsonObject)?.obj("text").text()?.takeIf(String::isNotBlank) }
-            }
-        val author = parts.firstOrNull().orEmpty()
-        val info = parts.drop(1).filterNot { it.equals("Playlist", true) }.joinToString(" · ")
+        val parts = rows.flatMap(::partsOf)
+        // The byline row is the one YouTube marks as such: its first part is the
+        // author. Falling back to the first part keeps videos (whose only row is the
+        // view count) as they were.
+        val byline = rows.firstOrNull {
+            (it as? JsonObject)?.obj("lockupContentMetadataRowExtension")?.str("contentType") ==
+                "METADATA_ROW_CONTENT_TYPE_BYLINE"
+        }
+        val author = byline?.let { partsOf(it).firstOrNull() } ?: parts.firstOrNull().orEmpty()
+        val info = parts
+            .filterNot { it == author }
+            .filterNot { it.lowercase(Locale.ROOT) in CONTENT_LABELS }
+            .joinToString(" · ")
         val thumbnail = lockup.obj("contentImage").let { image ->
             image?.obj("thumbnailViewModel")?.thumbUrl()
                 ?: image?.obj("collectionThumbnailViewModel")?.obj("primaryThumbnail")
@@ -629,9 +789,13 @@ internal class InnerTube(
         val microformat = findFirst(root, "microformatDataRenderer")
         val playlist = findFirst(root, "playlistMetadataRenderer")
         if (playlist != null) {
+            // The owner card of a playlist page ("videoOwnerRenderer") is the channel
+            // the playlist belongs to: the playlist metadata itself carries no author,
+            // which is why those series used to show up as unknown.
+            val owner = findFirst(root, "videoOwnerRenderer")?.obj("title").text().orEmpty()
             return Metadata(
                 title = playlist.str("title").orEmpty(),
-                author = "",
+                author = owner,
                 thumbnail = microformat?.obj("thumbnail").thumbUrl().orEmpty(),
                 description = playlist.str("description").orEmpty(),
             )
@@ -1375,8 +1539,8 @@ internal class InnerTube(
             buildJsonObject {
                 put("clientName", spec.name)
                 put("clientVersion", versionFor(spec))
-                put("hl", "en")
-                put("gl", "US")
+                put("hl", LANG)
+                put("gl", COUNTRY)
                 // The token was minted for the homepage's visitor: a player request
                 // that announces another one gets it ignored (and the stream cut).
                 visitorId(spec)?.let { put("visitorData", it) }
@@ -1457,6 +1621,10 @@ internal class InnerTube(
     }
 
     private fun joinInfo(vararg parts: String?): String = parts.filterNot { it.isNullOrBlank() }.joinToString(" · ")
+
+    /** Text of the `metadataParts` of one lockup row. */
+    private fun partsOf(row: JsonElement?): List<String> = (row as? JsonObject)?.arr("metadataParts").orEmpty()
+        .mapNotNull { (it as? JsonObject)?.obj("text").text()?.takeIf(String::isNotBlank) }
 }
 
 // ============================== Model ==============================

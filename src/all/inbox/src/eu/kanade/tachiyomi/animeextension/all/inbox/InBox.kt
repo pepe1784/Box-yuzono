@@ -48,7 +48,7 @@ class InBox :
     override val name = "INbox"
     override val lang = "all"
     override val id: Long = 4883267520314558307L
-    override val supportsLatest = false
+    override val supportsLatest = true
     override var baseUrl: String = InnerTube.BASE_URL
 
     private val preferences by getPreferencesLazy()
@@ -113,13 +113,15 @@ class InBox :
 
     // ============================ Catalog ============================
 
-    override fun popularAnimeRequest(page: Int): Request = innerTube.searchRequest("trending", InnerTube.sortParams(2))
+    /** Trending by views: the same list as before, now continuing while scrolling. */
+    override fun popularAnimeRequest(page: Int): Request = innerTube.feedRequest(FEED_POPULAR, page, "trending", InnerTube.sortParams(2))
 
     override fun popularAnimeParse(response: Response): AnimesPage = parseListing(response)
 
-    override fun latestUpdatesRequest(page: Int): Request = popularAnimeRequest(page)
+    /** What was uploaded today, so the list changes every day. */
+    override fun latestUpdatesRequest(page: Int): Request = innerTube.feedRequest(FEED_LATEST, page, "trending", InnerTube.PARAMS_RECENT)
 
-    override fun latestUpdatesParse(response: Response): AnimesPage = popularAnimeParse(response)
+    override fun latestUpdatesParse(response: Response): AnimesPage = parseListing(response)
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         val trimmed = query.trim()
@@ -140,9 +142,15 @@ class InBox :
         val params = when (typeState) {
             1 -> InnerTube.PARAMS_CHANNELS
             2 -> InnerTube.PARAMS_PLAYLISTS
-            else -> InnerTube.sortParams(sortState)
+            else -> when (sortState) {
+                1 -> InnerTube.PARAMS_RECENT
+                2 -> InnerTube.PARAMS_WEEK
+                3 -> InnerTube.sortParams(2)
+                else -> InnerTube.PARAMS_VIDEOS
+            }
         }
-        return innerTube.searchRequest(trimmed.ifEmpty { "trending" }, params)
+        val text = trimmed.ifEmpty { "trending" }
+        return innerTube.feedRequest("search|$params|$text", page, text, params)
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
@@ -166,6 +174,8 @@ class InBox :
         if (response.request.url.encodedPath.contains("/oembed")) {
             return AnimesPage(listOf(parseOembed(response)), false)
         }
+        val feed = response.request.header(InnerTube.HEADER_FEED)
+        val page = response.request.header(InnerTube.HEADER_PAGE)?.toIntOrNull() ?: 1
         val body = try {
             response.use { it.body.string() }.orEmpty()
         } catch (e: Exception) {
@@ -174,8 +184,10 @@ class InBox :
         }
         val listing = innerTube.parseListing(body)
         if (listing.entries.isEmpty()) Log.d(TAG, "No entries in ${response.request.url.encodedPath}")
-        // Single page: returning hasNextPage=true would re-request page 1 forever.
-        return AnimesPage(listing.entries.map { it.toSAnime() }, false)
+        // The continuation is the only way to ask for the rest of the list, so it is
+        // kept here and the catalogue is told to keep scrolling.
+        if (feed != null) innerTube.rememberFeedPage(feed, page, listing.continuation)
+        return AnimesPage(listing.entries.map { it.toSAnime() }, feed != null && listing.continuation != null)
     }
 
     // ============================= Details =============================
@@ -298,8 +310,13 @@ class InBox :
         val episodes = mutableListOf<SEpisode>()
         var request: Request? = firstRequest
         var pages = 0
+        // A channel with thousands of videos would otherwise open on a blank screen for
+        // minutes: past this budget the list is shown with whatever was read.
+        val deadline = System.currentTimeMillis() + EPISODE_BUDGET_MS
 
-        while (request != null && pages < MAX_PAGES && episodes.size < MAX_EPISODES) {
+        while (request != null && pages < MAX_PAGES && episodes.size < MAX_EPISODES &&
+            System.currentTimeMillis() < deadline
+        ) {
             val listing = try {
                 client.newCall(request).execute().use { response ->
                     if (!response.isSuccessful) {
@@ -545,7 +562,9 @@ class InBox :
     private class SortFilter :
         AnimeFilter.Select<String>(
             "Sort by",
-            arrayOf("Relevance", "Upload date", "View count", "Rating"),
+            // YouTube ignores the "sortBy" field now, but the upload-date filter still
+            // works: those two entries are what the "Recientes" tab uses.
+            arrayOf("Relevance", "Uploaded today", "Uploaded this week", "View count"),
         )
 
     /** Some YouTube payloads use protocol-relative URLs, which Coil will not load. */
@@ -580,8 +599,14 @@ class InBox :
     companion object {
         private const val TAG = "INbox"
 
-        private const val MAX_PAGES = 5
-        private const val MAX_EPISODES = 200
+        private const val MAX_PAGES = 80
+        private const val MAX_EPISODES = 2400
+
+        /** How long a channel/playlist is walked before showing what was read. */
+        private const val EPISODE_BUDGET_MS = 40_000L
+
+        private const val FEED_POPULAR = "popular"
+        private const val FEED_LATEST = "latest"
 
         private const val PREF_CLIENT_KEY = "pref_client"
         private const val PREF_CLIENT_DEFAULT = "auto"
