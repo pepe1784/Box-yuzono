@@ -79,6 +79,36 @@ internal class InnerTube(
         /** Same filter, but for the whole week: more results, still recent. */
         const val PARAMS_WEEK = "EgQIAxAB"
 
+        /**
+         * "Most watched of the year": sort by view count plus the upload-date filter
+         * for the current year. Kept fresh without going empty on a narrow topic,
+         * which is what a week-long window would do.
+         */
+        const val PARAMS_POPULAR = "CAMSBAgFEAE"
+
+        /**
+         * What the catalogue shows before the person has searched anything: the music
+         * of their language is what YouTube's own "popular" list is mostly made of,
+         * and it answers in their script instead of in Hindi or Arabic.
+         */
+        fun defaultFeedQuery(): String = when (LANG) {
+            "es", "pt", "ca", "gl" -> "música"
+            "fr" -> "musique"
+            "de" -> "Musik"
+            "it" -> "musica"
+            "ru", "uk", "be" -> "музыка"
+            "ja" -> "音楽"
+            "ko" -> "음악"
+            "hi", "mr", "ne" -> "संगीत"
+            "ar", "fa", "ur" -> "موسيقى"
+            "tr" -> "müzik"
+            "id", "ms" -> "musik"
+            "th" -> "เพลง"
+            "vi" -> "nhạc"
+            "zh" -> "音乐"
+            else -> "music"
+        }
+
         /** How many pages a lost continuation chain may be walked again for. */
         private const val MAX_REBUILD_PAGES = 12
 
@@ -110,7 +140,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v14 · 14.37"
+        private const val DIAG_VERSION = "v14 · 14.38"
 
         /**
          * The visitor the player requests announce when no token has been minted yet.
@@ -461,9 +491,11 @@ internal class InnerTube(
         synchronized(feedLock) {
             if (feedBases.size > 64) feedBases.clear()
             if (feedTokens.size > 256) feedTokens.clear()
-            feedBases[key] = query to params
-            // Asking for page 1 again means a refresh: the old chain does not apply.
-            if (pageNo == 1) feedTokens.keys.removeAll { it.startsWith("$key|") }
+            val changed = feedBases.put(key, query to params) != (query to params)
+            // Page 1 again is a refresh, and a feed whose query changed (the
+            // "Populares" tab follows the latest search) must not keep the chain of
+            // the old one: both would answer with tokens from a different search.
+            if (pageNo == 1 || changed) feedTokens.keys.removeAll { it.startsWith("$key|") }
         }
         val token = feedToken(key, pageNo)
         return if (token != null) {
@@ -484,6 +516,11 @@ internal class InnerTube(
      * Continuation that opens [page]. When it is not cached (the app was restarted
      * halfway down the list) the chain is walked again: one cheap request per skipped
      * page, which is what makes a jump straight to page 9 still work.
+     *
+     * The cache stores the continuation a page handed out under that same page
+     * number, and that token opens the *next* page, so page N is opened by the
+     * token of page N - 1. Walking from 0 (as this used to) handed page 3 the
+     * token of page 2, and the list repeated itself from then on.
      */
     private fun feedToken(feed: String, page: Int): String? {
         if (page <= 1) return null
@@ -491,8 +528,8 @@ internal class InnerTube(
         if (page - 1 > MAX_REBUILD_PAGES) return null
         val base = synchronized(feedLock) { feedBases[feed] } ?: return null
         var token: String? = null
-        var step = 0
-        while (step < page - 1) {
+        var step = 1
+        while (step < page) {
             val cached = synchronized(feedLock) { feedTokens["$feed|$step"] }
             if (cached != null) {
                 token = cached

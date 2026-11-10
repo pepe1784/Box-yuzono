@@ -113,13 +113,22 @@ class InBox :
 
     // ============================ Catalog ============================
 
-    /** Trending by views: the same list as before, now continuing while scrolling. */
-    override fun popularAnimeRequest(page: Int): Request = innerTube.feedRequest(FEED_POPULAR, page, "trending", InnerTube.sortParams(2))
+    /**
+     * Most watched videos of the year, in the person's language and country.
+     *
+     * Searching the word "trending" (what this used to do) answered with whatever
+     * went viral in English, Arabic or Hindi, because that is what that word finds
+     * from any region. YouTube's own Trending page is closed to logged-out clients
+     * now, so the feed is built from the last thing the person searched for. Before
+     * the first search it falls back to the music of the device's language, which
+     * is what "popular" means to most people anyway.
+     */
+    override fun popularAnimeRequest(page: Int): Request = innerTube.feedRequest(FEED_POPULAR, page, popularQuery(), InnerTube.PARAMS_POPULAR)
 
     override fun popularAnimeParse(response: Response): AnimesPage = parseListing(response)
 
-    /** What was uploaded today, so the list changes every day. */
-    override fun latestUpdatesRequest(page: Int): Request = innerTube.feedRequest(FEED_LATEST, page, "trending", InnerTube.PARAMS_RECENT)
+    /** What was uploaded this week for the same topic, so the list changes every day. */
+    override fun latestUpdatesRequest(page: Int): Request = innerTube.feedRequest(FEED_LATEST, page, popularQuery(), InnerTube.PARAMS_WEEK)
 
     override fun latestUpdatesParse(response: Response): AnimesPage = parseListing(response)
 
@@ -149,8 +158,36 @@ class InBox :
                 else -> InnerTube.PARAMS_VIDEOS
             }
         }
-        val text = trimmed.ifEmpty { "trending" }
+        val text = trimmed.ifEmpty { InnerTube.defaultFeedQuery() }
+        // Feeds the "Populares" tab: what the person looks for is a better guide
+        // than the word "trending" ever was.
+        if (trimmed.isNotEmpty()) rememberSearch(trimmed)
         return innerTube.feedRequest("search|$params|$text", page, text, params)
+    }
+
+    private fun popularQuery(): String {
+        val last = preferences.getString(PREF_RECENT_SEARCHES, "")
+            .orEmpty()
+            .lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() }
+        return last ?: InnerTube.defaultFeedQuery()
+    }
+
+    /** Keeps the latest searches, newest first, so "Populares" follows the person. */
+    private fun rememberSearch(query: String) {
+        val text = query.trim().take(MAX_REMEMBERED_SEARCH)
+        if (text.length < 2) return
+        val previous = preferences.getString(PREF_RECENT_SEARCHES, "")
+            .orEmpty()
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.equals(text, ignoreCase = true) }
+            .toMutableList()
+        previous.add(0, text)
+        preferences.edit()
+            .putString(PREF_RECENT_SEARCHES, previous.take(MAX_RECENT_SEARCHES).joinToString("\n"))
+            .apply()
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
@@ -300,7 +337,12 @@ class InBox :
 
     private fun singleEpisode(anime: SAnime, videoId: String): SEpisode = SEpisode.create().apply {
         url = InnerTube.watchUrl(videoId)
-        name = anime.title.ifBlank { "Video" }
+        val title = anime.title.ifBlank { "Video" }
+        // The app strips the series title from the episode name, so a name equal to
+        // the title comes out empty and every download of a single video lands as
+        // "(invalid)". The uploader keeps it apart and names the file after them.
+        val author = anime.author.orEmpty().trim()
+        name = if (author.isEmpty() || author.equals(title, ignoreCase = true)) videoId else author
         episode_number = 1F
     }
 
@@ -336,7 +378,7 @@ class InBox :
                 if (!seen.add(entry.id)) continue
                 episodes += SEpisode.create().apply {
                     url = InnerTube.watchUrl(entry.id)
-                    name = entry.title
+                    name = entry.title.ifBlank { entry.id }
                     episode_number = episodes.size + 1F
                 }
                 if (episodes.size >= MAX_EPISODES) break
@@ -607,6 +649,11 @@ class InBox :
 
         private const val FEED_POPULAR = "popular"
         private const val FEED_LATEST = "latest"
+
+        /** Last searches, one per line, newest first. Feeds the "Populares" tab. */
+        private const val PREF_RECENT_SEARCHES = "pref_recent_searches"
+        private const val MAX_RECENT_SEARCHES = 5
+        private const val MAX_REMEMBERED_SEARCH = 80
 
         private const val PREF_CLIENT_KEY = "pref_client"
         private const val PREF_CLIENT_DEFAULT = "auto"
