@@ -116,6 +116,8 @@ internal object StreamRelay {
         @Volatile var url: String,
         @Volatile var lastRefresh: Long,
         @Volatile var sabr: SabrSpec?,
+        /** Bytes served as they are, without asking googlevideo (a still picture, say). */
+        @Volatile var bytes: ByteArray? = null,
         /** The `sidx` of the stream, read the first time a byte offset has to become a time. */
         @Volatile var index: SabrIndex? = null,
         /** True once SABR proved useless for this stream; the relay stays on ranges. */
@@ -184,6 +186,30 @@ internal object StreamRelay {
             // Without an init range the moov cannot be served, so SABR would hand the
             // player fragments with no header in front of them.
             sabr = sabr?.takeIf { it.headEnd > 0 && it.length > 0 },
+        )
+        return "http://127.0.0.1:$listenPort/s/$token"
+    }
+
+    /**
+     * Registers [bytes] so the player and the downloader can fetch them like any other
+     * stream, without them coming from googlevideo. Returns null when there is no relay.
+     */
+    fun registerStatic(contentType: String, bytes: ByteArray): String? {
+        val listenPort = ensureStarted()
+        if (listenPort == 0) return null
+        if (entries.size >= MAX_ENTRIES) entries.clear()
+        val token = "static-${sequence.incrementAndGet()}"
+        entries[token] = Entry(
+            videoId = "",
+            itag = "static",
+            xTags = "",
+            clientName = "static",
+            contentType = contentType,
+            length = bytes.size.toLong(),
+            url = "",
+            lastRefresh = 0,
+            sabr = null,
+            bytes = bytes,
         )
         return "http://127.0.0.1:$listenPort/s/$token"
     }
@@ -257,6 +283,14 @@ internal object StreamRelay {
             output.write(header.toByteArray())
             output.flush()
             if (method == "HEAD") return
+            val body = entry.bytes
+            if (body != null) {
+                val from = start.coerceIn(0L, body.size.toLong()).toInt()
+                val to = (end + 1).coerceIn(0L, body.size.toLong()).toInt()
+                if (to > from) output.write(body, from, to - from)
+                output.flush()
+                return
+            }
             relay(entry, start, end, output)
         }
     }

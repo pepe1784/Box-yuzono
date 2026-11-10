@@ -110,7 +110,7 @@ internal class InnerTube(
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
         /** Bumped on every diagnostic change so the report says which build it came from. */
-        private const val DIAG_VERSION = "v14 · 14.36"
+        private const val DIAG_VERSION = "v14 · 14.37"
 
         /**
          * The visitor the player requests announce when no token has been minted yet.
@@ -454,19 +454,23 @@ internal class InnerTube(
      */
     fun feedRequest(feed: String, page: Int, query: String, params: String): Request {
         val pageNo = page.coerceAtLeast(1)
+        // The key rides in a header, and a header only takes printable ASCII: a search
+        // for "canción" used to fail before the request was even sent. The payload
+        // (the query itself) is untouched and still travels in the JSON body.
+        val key = feed.headerSafe()
         synchronized(feedLock) {
             if (feedBases.size > 64) feedBases.clear()
             if (feedTokens.size > 256) feedTokens.clear()
-            feedBases[feed] = query to params
+            feedBases[key] = query to params
             // Asking for page 1 again means a refresh: the old chain does not apply.
-            if (pageNo == 1) feedTokens.keys.removeAll { it.startsWith("$feed|") }
+            if (pageNo == 1) feedTokens.keys.removeAll { it.startsWith("$key|") }
         }
-        val token = feedToken(feed, pageNo)
+        val token = feedToken(key, pageNo)
         return if (token != null) {
-            taggedPage(searchContinuationRequest(token), feed, pageNo)
+            taggedPage(searchContinuationRequest(token), key, pageNo)
         } else {
             // The chain could not be rebuilt: page 1 is still a valid answer.
-            taggedPage(searchRequest(query, params), feed, 1)
+            taggedPage(searchRequest(query, params), key, 1)
         }
     }
 
@@ -515,7 +519,7 @@ internal class InnerTube(
 
     /** Page header, so the parser knows which feed and page a body belongs to. */
     private fun taggedPage(request: Request, feed: String, page: Int): Request = request.newBuilder()
-        .header(HEADER_FEED, feed)
+        .header(HEADER_FEED, feed.headerSafe())
         .header(HEADER_PAGE, page.toString())
         .build()
 
@@ -1238,7 +1242,8 @@ internal class InnerTube(
                 MuxedRep(height, bitrate, label, url)
             }.sortedWith(compareByDescending<MuxedRep> { it.height }.thenByDescending { it.bitrate })
 
-            for (rep in muxed) {
+            val muxedOrder = if (preferredQuality == "lowest") muxed.sortedBy { it.height } else muxed
+            for (rep in muxedOrder) {
                 if (!passesQuality(rep.height, preferredQuality)) continue
                 videos += Video(rep.url, "Muxed ${rep.label} · completo", rep.url, headers, subtitleTracks = subtitles)
             }
@@ -1296,11 +1301,23 @@ internal class InnerTube(
                     val format = element as? JsonObject ?: return@mapNotNull null
                     val url = format.str("url") ?: return@mapNotNull null
                     val mime = format.str("mimeType").orEmpty()
-                    if (!mime.startsWith("video/mp4")) return@mapNotNull null
+                    if (!mime.startsWith("video/")) return@mapNotNull null
+                    val container = if (mime.startsWith("video/webm")) "video/webm" else "video/mp4"
                     val codec = mime.substringAfter("codecs=\"", "").substringBefore("\"")
-                    if (codec.isNotBlank() && !codec.startsWith("avc1")) return@mapNotNull null
                     val height = parseInt(format.str("height")) ?: return@mapNotNull null
-                    if (height > 1080) return@mapNotNull null
+                    // H.264 is the codec every phone decodes, but YouTube stops at
+                    // 1080p with it: only VP9 and AV1 carry 1440p and 2160p. Those are
+                    // taken just for the extra resolutions, so nothing changes for the
+                    // usual ones, and VP9 (profile 0) ranks ahead of AV1 and of the
+                    // 10-bit profile 2, which are the least supported.
+                    val rank = when {
+                        codec.isBlank() || codec.startsWith("avc1") -> 0
+                        codec.startsWith("vp9.2") || codec.startsWith("vp09.2") -> 3
+                        codec.startsWith("vp9") || codec.startsWith("vp09") -> 1
+                        codec.startsWith("av01") -> 2
+                        else -> return@mapNotNull null
+                    }
+                    if (rank > 0 && height <= 1080) return@mapNotNull null
                     VideoRep(
                         url = url,
                         height = height,
@@ -1308,14 +1325,24 @@ internal class InnerTube(
                         itag = parseInt(format.str("itag")),
                         length = format.str("contentLength")?.toLongOrNull() ?: 0L,
                         sabr = sabrSpec(json, streamingData, spec, format),
+                        container = container,
+                        rank = rank,
                     )
-                }.distinctBy { it.height }.sortedByDescending { it.height }
+                }
+                    .sortedWith(
+                        compareByDescending<VideoRep> { it.height }
+                            .thenBy { it.rank }
+                            .thenByDescending { it.bitrate },
+                    )
+                    .distinctBy { it.height }
 
                 // The relay turns the open ended ranges the player asks for into
                 // bounded ones, which is the only way these links keep serving.
                 // The relay rebuilds each of these streams from SABR (the endpoint the
                 // YouTube apps use), so DASH is not limited to the first minute any more.
-                val audioTracks = filteredAudios.map { audio ->
+                val audioTracks = mutableListOf<Track>()
+                val audioOnly = mutableListOf<Pair<String, String>>()
+                for (audio in filteredAudios) {
                     val audioUrl = relayed(
                         videoId = videoId,
                         spec = spec,
@@ -1326,14 +1353,19 @@ internal class InnerTube(
                         contentType = if (audio.mp4) "audio/mp4" else "audio/webm",
                         sabr = audio.sabr,
                     )
-                    Track(audioUrl, audio.label)
+                    audioTracks += Track(audioUrl, audio.label)
+                    audioOnly += audioUrl to audio.label
                 }
 
                 // One entry per quality: the audio languages travel as tracks of the
                 // same video, which is what the player maps. Before this there was one
                 // entry per quality *and* language, so DASH repeated itself.
-                for (rep in videoReps) {
-                    if (!passesQuality(rep.height, preferredQuality)) continue
+                val orderedReps = videoReps
+                    .filter { passesQuality(it.height, preferredQuality) }
+                    .let { reps ->
+                        if (preferredQuality == "lowest") reps.sortedBy { it.height } else reps.sortedByDescending { it.height }
+                    }
+                for (rep in orderedReps) {
                     val videoUrl = relayed(
                         videoId = videoId,
                         spec = spec,
@@ -1341,7 +1373,7 @@ internal class InnerTube(
                         xTags = "",
                         url = rep.url,
                         length = rep.length,
-                        contentType = "video/mp4",
+                        contentType = rep.container,
                         sabr = rep.sabr,
                     )
                     val headers = if (StreamRelay.isRelay(videoUrl)) null else playbackHeaders
@@ -1353,6 +1385,30 @@ internal class InnerTube(
                         audioTracks = audioTracks,
                         subtitleTracks = subtitles,
                     )
+                }
+
+                // The same sound with no picture at all. The downloader maps `0:v` on
+                // every file, so the entry carries a single black frame that lasts as
+                // long as the song and is dropped again before writing: what is saved
+                // is the song alone, and playing the entry shows a still screen. The
+                // title of the track is the label the app puts on the audio.
+                val lengthMs = (json.obj("videoDetails")?.str("lengthSeconds")?.toLongOrNull() ?: 0L) * 1000L
+                val still = StreamRelay.registerStatic("video/mp4", StillVideo.mp4(lengthMs))
+                for ((url, label) in audioOnly) {
+                    val headers = if (StreamRelay.isRelay(url)) null else playbackHeaders
+                    videos += if (still == null) {
+                        Video(url, "DASH solo audio · $label", url, headers)
+                    } else {
+                        StillVideo.soundOnly(
+                            Video(
+                                still,
+                                "DASH solo audio · $label",
+                                still,
+                                null,
+                                audioTracks = listOf(Track(url, label)),
+                            ),
+                        )
+                    }
                 }
             }
         }
@@ -1437,13 +1493,10 @@ internal class InnerTube(
 
     private fun passesQuality(height: Int, preferredQuality: String): Boolean {
         if (height <= 0) return true
-        return when (preferredQuality) {
-            "1080" -> height <= 1080
-            "720" -> height <= 720
-            "480" -> height <= 480
-            "360" -> height <= 360
-            else -> true
-        }
+        // "auto", "highest" and "lowest" keep everything, in that order; a number is
+        // the ceiling (1080p by default), which is what makes the list start there.
+        val cap = preferredQuality.toIntOrNull() ?: return true
+        return height <= cap
     }
 
     private fun filterAudios(audios: List<AudioRep>, preferredAudioLang: String): List<AudioRep> {
@@ -1652,6 +1705,10 @@ private data class VideoRep(
     val itag: Int?,
     val length: Long,
     val sabr: SabrSpec?,
+    /** `video/mp4` (H.264/AV1) or `video/webm` (VP9): the relay repeats it. */
+    val container: String = "video/mp4",
+    /** Codec compatibility: 0 H.264, 1 VP9, 2 AV1, 3 VP9 profile 2. */
+    val rank: Int = 0,
 )
 
 private data class MuxedRep(val height: Int, val bitrate: Int, val label: String, val url: String)
@@ -1746,5 +1803,32 @@ internal fun JsonElement?.thumbUrl(): String? {
 }
 
 private fun parseInt(s: String?): Int? = s?.toLongOrNull()?.toInt()
+
+/**
+ * Printable-ASCII form of a string that has to travel in an HTTP header.
+ *
+ * OkHttp refuses anything above `~` in a header value ("Unexpected char 0x00f3"), so
+ * the feeds are keyed by this instead of the raw search text, which may be full of
+ * accents, `ñ`, `·` or emoji.
+ */
+internal fun String.headerSafe(): String {
+    var ascii = true
+    for (ch in this) {
+        if (ch.code !in 0x20..0x7E) {
+            ascii = false
+            break
+        }
+    }
+    if (ascii) return this
+    return buildString(length + 8) {
+        for (ch in this@headerSafe) {
+            if (ch.code in 0x20..0x7E) {
+                append(ch)
+            } else {
+                append("%u").append(ch.code.toString(16).padStart(4, '0'))
+            }
+        }
+    }
+}
 
 private fun String.encodeUrl(): String = java.net.URLEncoder.encode(this, "UTF-8")

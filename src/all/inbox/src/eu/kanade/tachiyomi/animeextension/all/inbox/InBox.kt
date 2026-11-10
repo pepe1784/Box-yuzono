@@ -410,7 +410,7 @@ class InBox :
             SwitchPreferenceCompat(screen.context).apply {
                 key = PREF_DASH_KEY
                 title = "Show DASH (separate video + audio)"
-                summary = "Up to 1080p with selectable audio."
+                summary = "Up to 2160p with selectable audio, plus one audio-only entry per track to download songs without video."
                 setDefaultValue(PREF_DASH_DEFAULT)
             },
         )
@@ -636,9 +636,29 @@ class InBox :
         )
 
         private const val PREF_QUALITY_KEY = "pref_quality"
-        private const val PREF_QUALITY_DEFAULT = "auto"
-        private val PREF_QUALITY_ENTRIES = arrayOf("Automatic", "1080p", "720p", "480p", "360p")
-        private val PREF_QUALITY_VALUES = arrayOf("auto", "1080", "720", "480", "360")
+        private const val PREF_QUALITY_DEFAULT = "1080"
+        private val PREF_QUALITY_ENTRIES = arrayOf(
+            "Automatic",
+            "Highest available",
+            "2160p (4K)",
+            "1440p (2K)",
+            "1080p",
+            "720p",
+            "480p",
+            "360p",
+            "Lowest available",
+        )
+        private val PREF_QUALITY_VALUES = arrayOf(
+            "auto",
+            "highest",
+            "2160",
+            "1440",
+            "1080",
+            "720",
+            "480",
+            "360",
+            "lowest",
+        )
 
         private const val PREF_MUXED_KEY = "pref_muxed"
         private const val PREF_MUXED_DEFAULT = true
