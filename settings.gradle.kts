@@ -36,6 +36,7 @@ rootProject.name = "box"
 // loadAllIndividualExtensions()
 loadIndividualExtension("all", "box")
 loadIndividualExtension("all", "inbox")
+loadIndividualExtension("all", "onbox")
 
 /**
  * ===================================== COMMON CONFIGURATION ======================================
