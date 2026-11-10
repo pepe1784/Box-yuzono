@@ -3,9 +3,12 @@ package eu.kanade.tachiyomi.animeextension.all.onbox
 import android.net.Uri
 import android.util.Base64
 import android.util.Log
+import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -26,17 +29,21 @@ import java.util.concurrent.TimeUnit
 /**
  * ONbox: Facebook videos as an Aniyomi source.
  *
- * Facebook has no public API worth using, so this reads the JSON that the video page
- * already ships inside its HTML:
+ * Facebook has no public API and its logged-out pages are mostly rendered on the client.
+ * The exception is the video feed that `/search/videos/?q=<tema>` redirects to
+ * (`/watch/explore/<tema>/`), plus the reel, page and watch pages: they are served with
+ * the whole catalogue in the HTML, so this source reads them directly:
+ *
+ * - Each card is a `"id":"UzpfST…"` story; decoding that base64 gives the video id
+ *   (`S:_I<page>:VK:<video>`), and the same block carries the text, the author name and
+ *   the `preferred_thumbnail`.
  * - `browser_native_hd_url` / `browser_native_sd_url` are plain MP4 files on the CDN
- *   (206 + `accept-ranges: bytes`, no cookie needed) and are what the player and the
- *   downloader get;
+ *   (`206` + `accept-ranges: bytes`, no cookie needed).
  * - `dash_manifest` (base64 XML) only shows up sometimes; when it does it can carry
  *   higher resolutions with the audio in a separate track.
  *
- * There is no catalogue without a session: search, a page's video tab and the watch
- * feed answer 400 or render on the client. So the search box is the entry point: paste
- * a video URL, a reel URL, an `fb.watch` short link or just the numeric id.
+ * Those pages answer `400` unless the request looks like a browser navigation, hence the
+ * `Sec-Fetch-*` headers below.
  *
  * Cookies are not handled here on purpose. `network.client` already carries the app's
  * cookie jar, which is shared with the WebView, so whatever session the WebView has
@@ -57,10 +64,24 @@ class OnBox :
     private val qualityMode: String
         get() = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT) ?: PREF_QUALITY_DEFAULT
 
+    private val popularTopic: String
+        get() = preferences.getString(PREF_TOPIC_KEY, PREF_TOPIC_DEFAULT)?.trim()
+            ?.takeIf { it.isNotEmpty() } ?: PREF_TOPIC_DEFAULT
+
+    private val checkLinks: Boolean
+        get() = preferences.getBoolean(PREF_CHECK_KEY, true)
+
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .build()
+    }
+
+    // Short leash: this one only asks for the first two bytes of the video.
+    private val probeClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .callTimeout(8, TimeUnit.SECONDS)
             .build()
     }
 
@@ -87,59 +108,106 @@ class OnBox :
 
     // ============================ Catalogue ============================
 
-    // Without a session Facebook does not hand out a catalogue, so both tabs stay empty
-    // instead of showing a list that breaks on the second page.
-    override fun popularAnimeRequest(page: Int): Request = GET(baseUrl, pageHeaders)
+    // One topic per page: Facebook's explore feed is server rendered and gives 5-10
+    // videos per topic, so the tab walks down this list instead of faking pagination.
+    override fun popularAnimeRequest(page: Int): Request {
+        val topics = popularTopics()
+        val topic = topics[((page - 1).coerceAtLeast(0)) % topics.size]
+        return GET(exploreUrl(topic), pageHeaders)
+    }
 
-    override fun popularAnimeParse(response: Response): AnimesPage = AnimesPage(emptyList<SAnime>(), false)
+    override fun popularAnimeParse(response: Response): AnimesPage {
+        val body = response.use { it.body.string() }.orEmpty()
+        val cards = parseFeed(body)
+        val topics = popularTopics()
+        val topic = topicFromUrl(response.request.url.toString())
+        val index = topics.indexOfFirst { it.equals(topic, ignoreCase = true) }
+        val hasNext = cards.isNotEmpty() && index >= 0 && index < topics.lastIndex
+        Log.d(TAG, "populares '${topic ?: "?"}' -> ${cards.size} tarjetas, más=$hasNext")
+        return AnimesPage(cards.map { animeFromCard(it) }, hasNext)
+    }
 
     override fun latestUpdatesRequest(page: Int): Request = GET(baseUrl, pageHeaders)
 
     override fun latestUpdatesParse(response: Response): AnimesPage = AnimesPage(emptyList<SAnime>(), false)
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        val type = filters.filterIsInstance<TypeFilter>().firstOrNull()?.state ?: 0
+        val extra = filters.filterIsInstance<ExtraFilter>().firstOrNull()?.state?.trim().orEmpty()
         val text = query.trim()
-        val id = extractVideoId(text)
+        val hint = extra.ifBlank { text }
+
         val url = when {
-            text.startsWith("http", ignoreCase = true) -> text
-            text.contains("facebook.com/") || text.contains("fb.watch/") -> "https://$text"
-            id != null -> watchUrl(id)
-            // Last resort: the search page needs a session, but the shared cookie jar may
-            // already have one from the WebView. If it does not, the parse below says so.
-            else -> "$baseUrl/search/videos/?q=" + Uri.encode(text)
+            // A link or a bare id always wins over the filters.
+            isVideoLink(text) -> text
+            type == TYPE_HASHTAG -> exploreUrl(hint.removePrefix("#").removePrefix("%23").trim())
+            type == TYPE_PAGE -> pageUrl(hint)
+            type == TYPE_GROUP -> groupUrl(hint)
+            type == TYPE_LINK -> directUrl(hint)
+            text.isBlank() -> exploreUrl(popularTopic)
+            else -> exploreUrl(text)
         }
-        return GET(url, pageHeaders)
+        val direct = isVideoLink(text) || type == TYPE_LINK
+        Log.d(TAG, "search tipo=$type texto='$text' -> $url (directo=$direct)")
+        return GET(url + if (direct) "#$DIRECT" else "", pageHeaders)
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
-        val requested = response.request.url.toString()
+        val requested = response.request.url.toString().substringBefore("#")
+        val direct = wasDirect(response)
         var finalUrl = requested
         var body = response.use { it.body.string() }.orEmpty()
-        var id = extractVideoId(finalUrl) ?: videoIdIn(body)
+        Log.d(TAG, "search ${response.code} ${body.length}b directo=$direct -> ${finalUrl.take(120)}")
 
-        if (id == null) {
-            // Some share links still come back as a bare 400; the mobile host usually
-            // answers with the redirect instead of asking the user to try again.
-            val alt = mobileHost(requested)
-            if (alt != null) {
-                val retried = fetchRaw(alt)
-                if (retried != null) {
-                    finalUrl = retried.first
-                    body = retried.second
-                    id = extractVideoId(finalUrl) ?: videoIdIn(body)
+        if (direct) {
+            var id = extractVideoId(finalUrl) ?: videoIdIn(body)
+            if (id == null) {
+                // Some share links still come back as a bare 400; the mobile host usually
+                // answers with the redirect instead of asking the user to try again.
+                val alt = mobileHost(requested)
+                if (alt != null) {
+                    val retried = fetchRaw(alt)
+                    if (retried != null) {
+                        finalUrl = retried.first
+                        body = retried.second
+                        id = extractVideoId(finalUrl) ?: videoIdIn(body)
+                    }
                 }
             }
+            if (id == null) {
+                throw Exception(
+                    "Facebook respondió ${response.code} y no devolvió ningún vídeo. " +
+                        "Abre el enlace en el navegador y comprueba que el vídeo se ve sin iniciar sesión.",
+                )
+            }
+            return AnimesPage(listOf(animeFromPage(parsePage(body), id)), false)
         }
 
-        if (id == null) {
+        var cards = parseFeed(body)
+        if (cards.isEmpty()) {
+            // A share link that redirected to a single video, or a page with one video.
+            val id = extractVideoId(finalUrl) ?: videoIdIn(body)
+            if (id != null) return AnimesPage(listOf(animeFromPage(parsePage(body), id)), false)
+            cards = emptyList()
+        }
+
+        if (cards.isEmpty()) {
             throw Exception(
-                "Facebook respondió ${response.code} y no devolvió ningún vídeo. " +
-                    "Abre el enlace en el navegador y comprueba que el vídeo se ve sin iniciar sesión.",
+                "Facebook no devolvió resultados (HTTP ${response.code}). " +
+                    "Prueba con otro término, o pega el enlace del vídeo en la búsqueda. " +
+                    "Los grupos privados necesitan iniciar sesión en el WebView.",
             )
         }
+        return AnimesPage(cards.map { animeFromCard(it) }, false)
+    }
 
-        Log.d(TAG, "search ${response.code} -> $finalUrl")
-        return AnimesPage(listOf(animeFromPage(parsePage(body), id)), false)
+    private fun wasDirect(response: Response): Boolean {
+        var current: Response? = response
+        while (current != null) {
+            if (current.request.url.fragment == DIRECT) return true
+            current = current.priorResponse
+        }
+        return false
     }
 
     private fun videoIdIn(body: String): String? = Regex("\"video_id\":\"(\\d{6,})\"").find(body)?.groupValues?.get(1)
@@ -191,6 +259,15 @@ class OnBox :
         genre = "Facebook"
     }
 
+    private fun animeFromCard(card: FeedCard): SAnime = SAnime.create().apply {
+        url = watchUrl(card.id)
+        title = card.title?.takeIf { it.isNotBlank() } ?: "Vídeo de Facebook"
+        author = card.author.orEmpty()
+        thumbnail_url = card.thumbnail
+        genre = "Facebook"
+        description = "Facebook · " + watchUrl(card.id)
+    }
+
     // ============================ Episodes =============================
 
     // A video is a series with a single episode. The name has to differ from the series
@@ -228,15 +305,17 @@ class OnBox :
         val body = response.use { it.body.string() }.orEmpty()
         var page = parsePage(body)
 
-        // Some pages only serve the MP4 pair on the mobile host.
+        // The watch page is the cheap one; the reel page carries the same pair when the
+        // watch page comes back without URLs.
         if (page.hd == null && page.sd == null && id != null) {
-            val mobile = mobileWatchUrl(id)
-            val alt = fetchRaw(mobile)?.second
-            if (alt != null) page = parsePage(alt)
+            fetchRaw(mobileWatchUrl(id))?.let { page = better(page, parsePage(it.second)) }
+        }
+        if (page.hd == null && page.sd == null && id != null) {
+            fetchRaw("$baseUrl/reel/$id/")?.let { page = better(page, parsePage(it.second)) }
         }
 
-        val hd = page.hd
-        val sd = page.sd?.takeIf { it != hd }
+        val hd = page.hd?.let(::cleanVideoUrl)
+        val sd = page.sd?.let(::cleanVideoUrl)?.takeIf { it != hd }
         val mode = qualityMode
         val main = when (mode) {
             "hd" -> listOfNotNull(hd ?: sd)
@@ -245,8 +324,15 @@ class OnBox :
         }
 
         val videos = mutableListOf<Video>()
+        val problems = mutableListOf<String>()
         main.forEach { url ->
-            videos += Video(url, if (url == hd) "HD" else "SD", url, videoHeaders)
+            val problem = if (checkLinks) probeProblem(url) else null
+            if (problem == null) {
+                videos += Video(url, if (url == hd) "HD" else "SD", url, videoHeaders)
+            } else {
+                problems += "${if (url == hd) "HD" else "SD"}: $problem"
+                Log.w(TAG, "enlace ${if (url == hd) "HD" else "SD"} no responde: $problem")
+            }
         }
 
         // Only reachable sometimes; kept last so a DASH entry never becomes the default.
@@ -255,13 +341,44 @@ class OnBox :
         }
 
         if (videos.isEmpty()) {
-            throw Exception(
-                "Facebook no dio ninguna URL para este vídeo (privado, con restricción de " +
-                    "derechos o la IP está limitada). Prueba a abrirlo en el WebView.",
-            )
+            val detail = if (problems.isEmpty()) {
+                "La página no traía ninguna URL (vídeo privado, con restricción de derechos " +
+                    "o Facebook pide sesión para verlo)."
+            } else {
+                "Enlaces probados:\n" + problems.joinToString("\n") +
+                    "\n\nUn \"Unable to resolve host\" o un timeout aquí suele ser el DNS o un " +
+                    "bloqueador (AdGuard, NextDNS, Pi-hole) que corta fbcdn.net."
+            }
+            throw Exception("Facebook no dio ningún vídeo reproducible para este vídeo.\n$detail")
         }
         Log.d(TAG, "video $id -> ${videos.size} entrada(s)")
         return videos
+    }
+
+    private fun better(old: PageData, new: PageData): PageData = if (new.hd != null || new.sd != null) new else old
+
+    /** Asks the CDN for the first two bytes. Returns the problem, or null when it works. */
+    private fun probeProblem(url: String): String? = try {
+        val request = Request.Builder()
+            .url(url)
+            .headers(videoHeaders)
+            .header("Range", "bytes=0-1")
+            .build()
+        probeClient.newCall(request).execute().use { response ->
+            if (response.isSuccessful) null else "HTTP ${response.code}"
+        }
+    } catch (e: Exception) {
+        e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+    }
+
+    /** `bytestart`/`byteend` turn the URL into a fragment; dropping them gives the file. */
+    private fun cleanVideoUrl(raw: String): String {
+        var url = raw.replace("&amp;", "&")
+        if (url.contains("bytestart=") || url.contains("byteend=")) {
+            url = Regex("([?&])(bytestart|byteend)=[^&]*").replace(url, "$1")
+            url = url.replace("?&", "?").replace("&&", "&").trimEnd('&', '?')
+        }
+        return url
     }
 
     /** Decodes the base64 DASH manifest when the page has one. */
@@ -327,6 +444,52 @@ class OnBox :
         val dash: String?,
     )
 
+    private class FeedCard(
+        val id: String,
+        val title: String?,
+        val author: String?,
+        val thumbnail: String?,
+    )
+
+    /**
+     * Reads the video cards of a feed page. Every story carries a base64 id
+     * (`S:_I<page>:VK:<video>`), and the chunk up to the next story holds its text,
+     * author and thumbnail, so no extra request per card is needed.
+     */
+    private fun parseFeed(body: String): List<FeedCard> {
+        val storyRegex = Regex("\"id\":\"(UzpfST[^\"]{10,200})\"")
+        val hits = mutableListOf<Pair<String, Int>>()
+        val seenStory = HashSet<String>()
+        for (match in storyRegex.findAll(body)) {
+            val raw = match.groupValues[1]
+            if (seenStory.add(raw)) hits += raw to match.range.first
+        }
+        if (hits.isEmpty()) return emptyList()
+
+        val cards = mutableListOf<FeedCard>()
+        val seenVideo = HashSet<String>()
+        hits.forEachIndexed { index, (raw, start) ->
+            val end = hits.getOrNull(index + 1)?.second ?: minOf(body.length, start + MAX_STORY)
+            val block = body.substring(start, end)
+            val decoded = runCatching { String(Base64.decode(raw, Base64.DEFAULT)) }.getOrNull() ?: return@forEachIndexed
+            val id = Regex(":VK:(\\d{6,})").find(decoded)?.groupValues?.get(1) ?: return@forEachIndexed
+            if (!seenVideo.add(id)) return@forEachIndexed
+
+            val title = Regex("\"message\":\\{\"text\":\"((?:[^\"\\\\]|\\\\.)*)\"")
+                .find(block)?.groupValues?.get(1)?.let(::unescapeJson)?.cleanText()
+            val author = Regex("\"name\":\"((?:[^\"\\\\]|\\\\.){0,80})\"")
+                .find(block)?.groupValues?.get(1)?.let(::unescapeJson)?.cleanText()
+            val thumbnail = Regex("\"preferred_thumbnail\":\\{\"image\":\\{\"uri\":\"((?:[^\"\\\\]|\\\\.)*)\"")
+                .find(block)?.groupValues?.get(1)?.let(::unescapeJson)?.takeIf { it.startsWith("http") }
+                ?: Regex("\"image\":\\{\"uri\":\"((?:[^\"\\\\]|\\\\.)*)\"")
+                    .find(block)?.groupValues?.get(1)?.let(::unescapeJson)
+                    ?.takeIf { it.startsWith("http") }
+
+            cards += FeedCard(id, title, author, thumbnail)
+        }
+        return cards
+    }
+
     private fun parsePage(body: String): PageData {
         val rawTitle = meta(body, "og:description").takeIf { !it.isNullOrBlank() }
             ?: jsonString(body, "title")
@@ -347,8 +510,9 @@ class OnBox :
 
     /** The video's own image; `og:image` is gone from Facebook's video pages. */
     private fun imageUri(body: String): String? {
-        val regex = Regex("\"image\":\\{\"uri\":\"((?:[^\"\\\\]|\\\\.)*)\"")
-        return regex.find(body)?.groupValues?.get(1)?.let(::unescapeJson)?.takeIf { it.startsWith("http") }
+        val regex = Regex("\"preferred_thumbnail\":\\{\"image\":\\{\"uri\":\"((?:[^\"\\\\]|\\\\.)*)\"")
+        val match = regex.find(body) ?: Regex("\"image\":\\{\"uri\":\"((?:[^\"\\\\]|\\\\.)*)\"").find(body)
+        return match?.groupValues?.get(1)?.let(::unescapeJson)?.takeIf { it.startsWith("http") }
     }
 
     private fun ownerOf(body: String): String? {
@@ -388,6 +552,9 @@ class OnBox :
     private fun unescapeJson(value: String): String {
         var text = value
             .replace("\\/", "/")
+            .replace("\\n", " ")
+            .replace("\\r", " ")
+            .replace("\\t", " ")
             .replace("\\u0025", "%")
             .replace("\\u0026", "&")
             .replace("\\u003D", "=")
@@ -399,6 +566,11 @@ class OnBox :
         }
         return text
     }
+
+    private fun String.cleanText(): String? = replace(Regex("\\s+"), " ")
+        .trim()
+        .take(MAX_TEXT)
+        .takeIf { it.isNotEmpty() }
 
     private fun meta(body: String, name: String): String? {
         val tag = Regex("<meta[^>]+(?:property|name)=[\"']" + Regex.escape(name) + "[\"'][^>]*>")
@@ -435,6 +607,50 @@ class OnBox :
 
     private fun mobileWatchUrl(id: String): String = "https://m.facebook.com/watch/?v=$id"
 
+    private fun exploreUrl(topic: String): String = "$baseUrl/search/videos/?q=" + Uri.encode(topic.ifBlank { PREF_TOPIC_DEFAULT })
+
+    private fun topicFromUrl(url: String): String? = Regex("/watch/explore/([^/?#]+)").find(url)?.groupValues?.get(1)?.let { Uri.decode(it) }
+
+    private fun isVideoLink(text: String): Boolean = when {
+        text.isBlank() -> false
+        text.matches(Regex("\\d{6,}")) -> true
+        text.contains("/share/") || text.contains("fb.watch/") -> true
+        text.contains("facebook.com/") || text.startsWith("http", ignoreCase = true) -> extractVideoId(text) != null
+        else -> false
+    }
+
+    private fun directUrl(text: String): String {
+        val id = extractVideoId(text)
+        return when {
+            id != null -> watchUrl(id)
+            text.startsWith("http", ignoreCase = true) -> text
+            text.contains("facebook.com/") || text.contains("fb.watch/") -> "https://$text"
+            else -> watchUrl(text)
+        }
+    }
+
+    private fun pageUrl(text: String): String {
+        val slug = pageSlug(text)
+        return if (slug != null) "$baseUrl/$slug/reels/" else exploreUrl(text)
+    }
+
+    private fun pageSlug(text: String): String? {
+        if (text.isBlank()) return null
+        val cleaned = text.trim().trimEnd('/')
+        val fromUrl = Regex("facebook\\.com/([^/?#]+)").find(cleaned)?.groupValues?.get(1)
+        if (fromUrl != null) {
+            return fromUrl.takeIf { it !in RESERVED_PATHS }
+        }
+        return cleaned.takeIf { !it.contains(' ') && it.matches(Regex("[A-Za-z0-9._-]{2,80}")) }
+    }
+
+    private fun groupUrl(text: String): String {
+        if (text.isBlank()) return exploreUrl(popularTopic)
+        val fromUrl = Regex("facebook\\.com/groups/([^/?#]+)").find(text)?.groupValues?.get(1)
+        val group = fromUrl ?: text.trim().takeIf { !it.contains(' ') && it.matches(Regex("[A-Za-z0-9._-]{2,80}")) }
+        return if (group != null) "$baseUrl/groups/$group/" else exploreUrl(text)
+    }
+
     private fun extractVideoId(raw: String): String? {
         val text = raw.trim()
         if (text.matches(Regex("\\d{6,}"))) return text
@@ -442,6 +658,14 @@ class OnBox :
         Regex("/(?:videos|reel|watch)/(?:[^/?#]+/)*?(\\d{6,})").find(text)?.let { return it.groupValues[1] }
         Regex("(\\d{6,})").find(text)?.let { return it.groupValues[1] }
         return null
+    }
+
+    private fun popularTopics(): List<String> {
+        val topics = mutableListOf(popularTopic)
+        topics += DEFAULT_TOPICS
+        return topics.map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase() }
     }
 
     // ============================ Preferences ==========================
@@ -457,9 +681,37 @@ class OnBox :
                 summary = "%s"
             },
         )
+        screen.addPreference(
+            EditTextPreference(screen.context).apply {
+                key = PREF_TOPIC_KEY
+                title = "Tema de Populares"
+                summary = "%s"
+                setDefaultValue(PREF_TOPIC_DEFAULT)
+                dialogTitle = "Tema que abre la pestaña Populares"
+                dialogMessage = "Se usa como búsqueda en Facebook. Las páginas siguientes recorren " +
+                    "temas parecidos (tendencias, viral, comedia, música…)."
+            },
+        )
+        screen.addPreference(
+            SwitchPreferenceCompat(screen.context).apply {
+                key = PREF_CHECK_KEY
+                title = "Comprobar los enlaces antes de abrirlos"
+                summary = "Pide los primeros bytes al CDN y avisa si el vídeo no responde. " +
+                    "Desactívalo si tu red tarda en contestar."
+                setDefaultValue(true)
+            },
+        )
     }
 
-    override fun getFilterList(): AnimeFilterList = AnimeFilterList()
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(TypeFilter(), ExtraFilter())
+
+    private class TypeFilter :
+        AnimeFilter.Select<String>(
+            "Buscar por",
+            arrayOf("Automático", "Hashtag", "Página o autor", "Grupo", "Enlace o ID"),
+        )
+
+    private class ExtraFilter : AnimeFilter.Text("Página, grupo o enlace (opcional)")
 
     companion object {
         private const val TAG = "ONbox"
@@ -467,9 +719,37 @@ class OnBox :
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
+        private const val DIRECT = "onbox-direct"
+        private const val MAX_STORY = 80_000
+        private const val MAX_TEXT = 200
+
+        private const val TYPE_HASHTAG = 1
+        private const val TYPE_PAGE = 2
+        private const val TYPE_GROUP = 3
+        private const val TYPE_LINK = 4
+
+        private val RESERVED_PATHS = setOf(
+            "watch", "reel", "reels", "video", "videos", "search", "groups", "hashtag",
+            "share", "login", "help", "policies", "privacy", "marketplace", "gaming",
+            "events", "pages", "profile.php", "story.php", "permalink.php",
+        )
+
+        // Facebook's own topic feed, ordered so the first page is what the user asked for.
+        private val DEFAULT_TOPICS = listOf(
+            "tendencias", "viral", "comedia", "humor", "chistes", "memes",
+            "música", "baile", "deportes", "fútbol", "cocina", "recetas", "postres",
+            "animales", "gatos", "perros", "mascotas", "bebés", "familia",
+            "viajes", "playa", "autos", "tecnología", "videojuegos",
+            "belleza", "moda", "salud", "motivación", "curiosidades", "naturaleza", "noticias",
+        )
+
         private const val PREF_QUALITY_KEY = "pref_quality"
         private const val PREF_QUALITY_DEFAULT = "both"
         private val PREF_QUALITY_ENTRIES = arrayOf("HD y SD", "Solo HD", "Solo SD")
         private val PREF_QUALITY_VALUES = arrayOf("both", "hd", "sd")
+
+        private const val PREF_TOPIC_KEY = "pref_popular_topic"
+        private const val PREF_TOPIC_DEFAULT = "populares"
+        private const val PREF_CHECK_KEY = "pref_check_links"
     }
 }
