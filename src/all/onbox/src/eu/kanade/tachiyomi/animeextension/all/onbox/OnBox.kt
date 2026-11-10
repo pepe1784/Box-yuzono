@@ -69,6 +69,12 @@ class OnBox :
         .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
         .add("Accept-Language", "es-ES,es;q=0.9,en;q=0.8")
         .add("Upgrade-Insecure-Requests", "1")
+        // Facebook's edge answers 400 to share links without these; with them the
+        // /share/r/<code>/ URL redirects to the reel and serves the whole page.
+        .add("Sec-Fetch-Dest", "document")
+        .add("Sec-Fetch-Mode", "navigate")
+        .add("Sec-Fetch-Site", "none")
+        .add("Sec-Fetch-User", "?1")
         .build()
 
     // The CDN links are signed for the IP that resolved them; the UA and referer keep
@@ -96,6 +102,7 @@ class OnBox :
         val id = extractVideoId(text)
         val url = when {
             text.startsWith("http", ignoreCase = true) -> text
+            text.contains("facebook.com/") || text.contains("fb.watch/") -> "https://$text"
             id != null -> watchUrl(id)
             // Last resort: the search page needs a session, but the shared cookie jar may
             // already have one from the WebView. If it does not, the parse below says so.
@@ -105,20 +112,56 @@ class OnBox :
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
-        val finalUrl = response.request.url.toString()
-        val body = response.use { it.body.string() }.orEmpty()
-        val id = extractVideoId(finalUrl)
-            ?: Regex("\"video_id\":\"(\\d{6,})\"").find(body)?.groupValues?.get(1)
+        val requested = response.request.url.toString()
+        var finalUrl = requested
+        var body = response.use { it.body.string() }.orEmpty()
+        var id = extractVideoId(finalUrl) ?: videoIdIn(body)
+
+        if (id == null) {
+            // Some share links still come back as a bare 400; the mobile host usually
+            // answers with the redirect instead of asking the user to try again.
+            val alt = mobileHost(requested)
+            if (alt != null) {
+                val retried = fetchRaw(alt)
+                if (retried != null) {
+                    finalUrl = retried.first
+                    body = retried.second
+                    id = extractVideoId(finalUrl) ?: videoIdIn(body)
+                }
+            }
+        }
 
         if (id == null) {
             throw Exception(
-                "Abre un vídeo de Facebook y pega su enlace en el buscador " +
-                    "(o sólo el número de id). Facebook no devolvió ningún vídeo para esa búsqueda.",
+                "Facebook respondió ${response.code} y no devolvió ningún vídeo. " +
+                    "Abre el enlace en el navegador y comprueba que el vídeo se ve sin iniciar sesión.",
             )
         }
 
+        Log.d(TAG, "search ${response.code} -> $finalUrl")
         return AnimesPage(listOf(animeFromPage(parsePage(body), id)), false)
     }
+
+    private fun videoIdIn(body: String): String? = Regex("\"video_id\":\"(\\d{6,})\"").find(body)?.groupValues?.get(1)
+
+    private fun mobileHost(url: String): String? = when {
+        url.contains("://www.facebook.com/") -> url.replace("://www.facebook.com/", "://m.facebook.com/")
+        url.contains("://m.facebook.com/") -> null
+        else -> null
+    }
+
+    /** Requests a page and returns the final URL with its body, or null on an error. */
+    private fun fetchRaw(url: String): Pair<String, String>? = runCatching {
+        client.newCall(GET(url, pageHeaders)).execute().use { response ->
+            val body = response.body.string().orEmpty()
+            if (!response.isSuccessful) {
+                Log.w(TAG, "HTTP ${response.code} para $url")
+                null
+            } else {
+                response.request.url.toString() to body
+            }
+        }
+    }.onFailure { Log.e(TAG, "fallo pidiendo $url", it) }.getOrNull()
 
     // ============================= Details =============================
 
@@ -130,7 +173,7 @@ class OnBox :
     override fun animeDetailsParse(response: Response): SAnime {
         val body = response.use { it.body.string() }.orEmpty()
         val id = extractVideoId(response.request.url.toString())
-            ?: Regex("\"video_id\":\"(\\d{6,})\"").find(body)?.groupValues?.get(1)
+            ?: videoIdIn(body)
             ?: response.request.url.toString()
         Log.d(TAG, "details ${response.code} ${body.length}b")
         return animeFromPage(parsePage(body), id)
@@ -188,7 +231,8 @@ class OnBox :
         // Some pages only serve the MP4 pair on the mobile host.
         if (page.hd == null && page.sd == null && id != null) {
             val mobile = mobileWatchUrl(id)
-            page = fetchPage(mobile) ?: page
+            val alt = fetchRaw(mobile)?.second
+            if (alt != null) page = parsePage(alt)
         }
 
         val hd = page.hd
@@ -219,17 +263,6 @@ class OnBox :
         Log.d(TAG, "video $id -> ${videos.size} entrada(s)")
         return videos
     }
-
-    private fun fetchPage(url: String): PageData? = runCatching {
-        client.newCall(GET(url, pageHeaders)).execute().use { response ->
-            if (!response.isSuccessful) {
-                Log.w(TAG, "HTTP ${response.code} para $url")
-                null
-            } else {
-                parsePage(response.body.string().orEmpty())
-            }
-        }
-    }.onFailure { Log.e(TAG, "fallo pidiendo $url", it) }.getOrNull()
 
     /** Decodes the base64 DASH manifest when the page has one. */
     private fun dashVideos(manifest: String): List<Video> {
@@ -297,7 +330,7 @@ class OnBox :
     private fun parsePage(body: String): PageData {
         val rawTitle = meta(body, "og:description").takeIf { !it.isNullOrBlank() }
             ?: jsonString(body, "title")
-            ?: meta(body, "og:title")
+            ?: titleFromOg(body)
             ?: Regex("<title[^>]*>([^<]+)</title>").find(body)?.groupValues?.get(1)
         val title = rawTitle?.htmlUnescape()?.trim()?.takeIf { it.isNotBlank() && it != "Facebook" }
         val duration = Regex("\"playable_duration_in_ms\":(\\d+)").find(body)?.groupValues?.get(1)?.toLongOrNull()
@@ -324,9 +357,26 @@ class OnBox :
             Regex("\"owner_name\":\"((?:[^\"\\\\]|\\\\.)*)\""),
             Regex("\"page_name\":\"((?:[^\"\\\\]|\\\\.)*)\""),
         )
-        return candidates.firstNotNullOfOrNull { regex ->
+        val found = candidates.firstNotNullOfOrNull { regex ->
             regex.find(body)?.groupValues?.get(1)?.let(::unescapeJson)?.trim()?.takeIf { it.isNotEmpty() }
         }
+        if (found != null) return found
+
+        // Reels have no "owner" object in the served JSON; the share title ends with it:
+        // "174 mil reproducciones · 157 reacciones | <título> | <autor>".
+        val parts = meta(body, "og:title")?.htmlUnescape()?.split(" | ")
+            ?.map { it.trim() }?.filter { it.isNotEmpty() }.orEmpty()
+        return parts.lastOrNull()?.takeIf { parts.size >= 2 && it.isNotEmpty() }
+    }
+
+    private fun titleFromOg(body: String): String? {
+        val parts = meta(body, "og:title")?.htmlUnescape()?.split(" | ")
+            ?.map { it.trim() }?.filter { it.isNotEmpty() }.orEmpty()
+        return when {
+            parts.size >= 3 -> parts[parts.size - 2]
+            parts.size == 2 -> parts.first()
+            else -> parts.firstOrNull()
+        }?.takeIf { it.isNotEmpty() }
     }
 
     /** Reads a JSON string field out of the page without pulling in a JSON parser. */
