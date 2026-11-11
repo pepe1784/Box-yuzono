@@ -52,6 +52,16 @@ import java.util.concurrent.TimeUnit
  * is used instead: it answers `200` with `hd_src`, `sd_src` and `dash_manifest` even for a
  * mobile user agent, which is the only source measured to survive that case.
  *
+ * The files are not always H.264: `hd_src` ships VP9 (and rarely HEVC/AV1) in the same MP4
+ * container for some videos. The player picks the first entry by default and marks the ones
+ * it cannot decode as `loading failed`, so the first 4 KB of every link (the MP4 index with
+ * the codec and the resolution) are read here, the H.264 file is offered first and the
+ * quality labels carry the codec name.
+ *
+ * A text search only has ~5 videos per topic on Facebook and no cursor, so the pages of a
+ * search walk the other places the same query lives (hashtag, page feed, reels), skipping
+ * the ones that come back empty or repeated.
+ *
  * Cookies are not handled here on purpose. `network.client` already carries the app's
  * cookie jar, which is shared with the WebView, so whatever session the WebView has
  * (guest or logged in) travels with these requests automatically.
@@ -170,19 +180,57 @@ class OnBox :
         val text = query.trim()
         val hint = extra.ifBlank { text }
 
+        val direct = isVideoLink(text) || type == TYPE_LINK
         val url = when {
             // A link or a bare id always wins over the filters.
             isVideoLink(text) -> text
-            type == TYPE_HASHTAG -> exploreUrl(hint.removePrefix("#").removePrefix("%23").trim())
             type == TYPE_PAGE -> pageUrl(hint)
             type == TYPE_GROUP -> groupUrl(hint)
             type == TYPE_LINK -> directUrl(hint)
-            text.isBlank() -> exploreUrl(popularTopic)
-            else -> exploreUrl(text)
+            hint.isBlank() -> exploreUrl(popularTopic)
+            // Facebook has no cursor for a plain search, but the same query lives in a
+            // handful of places; each page walks to the next one.
+            else -> querySources(hint).getOrElse(page - 1) { querySources(hint).last() }
         }
-        val direct = isVideoLink(text) || type == TYPE_LINK
-        Log.d(TAG, "search tipo=$type texto='$text' -> $url (directo=$direct)")
-        return GET(url + if (direct) "#$DIRECT" else "", pageHeaders)
+
+        val fragment = when {
+            direct -> "#$DIRECT"
+            // The fragment survives redirects (the response keeps the original request), so
+            // the parse knows which source it got and what to ask for next.
+            hint.isNotBlank() && type != TYPE_PAGE && type != TYPE_GROUP ->
+                "#src=${(page - 1).coerceAtLeast(0)}&q=" + Uri.encode(hint)
+            else -> ""
+        }
+        Log.d(TAG, "search tipo=$type texto='$text' pág=$page -> $url$fragment (directo=$direct)")
+        return GET(url + fragment, pageHeaders)
+    }
+
+    /**
+     * Where a text query can be looked up, in the order the pages walk them.
+     *
+     * Facebook has ~5 videos per topic and no cursor for the rest, so after the query's own
+     * places the walk continues over the catalogue topics: the user asked for "load more" to
+     * keep working, and this is the same rotation the Populares tab already does.
+     */
+    private fun querySources(query: String): List<String> {
+        val slug = query.trim().removePrefix("#").removePrefix("%23").trim()
+        val own = listOf(
+            exploreUrl(slug),
+            "$baseUrl/hashtag/" + Uri.encode(slug) + "/",
+            "$baseUrl/" + Uri.encode(slug) + "/videos/",
+            "$baseUrl/" + Uri.encode(slug) + "/reels/",
+        )
+        return (own + popularTopics().map { exploreUrl(it) }).distinct()
+    }
+
+    /** Fragment of the first request, even after redirects (OkHttp drops it on redirect). */
+    private fun pageFragment(response: Response): String? {
+        var current: Response? = response
+        while (current != null) {
+            current.request.url.fragment?.takeIf { it.isNotEmpty() }?.let { return it }
+            current = current.priorResponse
+        }
+        return null
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
@@ -241,6 +289,65 @@ class OnBox :
             if (id != null) return AnimesPage(listOf(animeFromPage(parsePage(body), id)), false)
         }
 
+        // Text searches walk the sources of the same query: Facebook gives ~5 videos per
+        // topic and no cursor, so "load more" moves to the hashtag, the page feed and the
+        // reels feed instead of repeating the same five. Sources that come back empty (or
+        // with videos already shown) are skipped so the user never lands on a blank page.
+        val fragment = pageFragment(response)
+        val params = fragment?.let { Uri.parse("onbox://onbox?$it") }
+        val sourceIndex = params?.getQueryParameter("src")?.toIntOrNull() ?: -1
+        val queryText = params?.getQueryParameter("q")
+
+        if (sourceIndex >= 0 && queryText != null) {
+            val sources = querySources(queryText)
+            if (sourceIndex == 0) resetSeen(queryText)
+            var used = sourceIndex
+            var found = freshCards(queryText, cards)
+            var next = sourceIndex + 1
+            // A blank page is skipped by walking on. The cap keeps a dead Facebook from
+            // making one "load more" fetch the whole rotation.
+            var attempts = 0
+            while (found.isEmpty() && next < sources.size && attempts < 4) {
+                attempts++
+                val other = fetchPage(sources[next])
+                if (other != null && other.code in 200..299) {
+                    val otherCards = freshCards(queryText, parseFeed(other.body))
+                    if (otherCards.isNotEmpty()) {
+                        found = otherCards
+                        used = next
+                        code = other.code
+                        body = other.body
+                        finalUrl = other.url
+                    }
+                } else {
+                    Log.w(TAG, "fuente $next de '$queryText' sin respuesta")
+                }
+                next++
+            }
+
+            if (found.isEmpty()) {
+                if (sourceIndex == 0) {
+                    throw Exception(
+                        buildString {
+                            append("Facebook no devolvió resultados para \"").append(queryText).append("\"")
+                            append(" (HTTP ").append(code).append(").\n")
+                            pageHtmlTitle(body)?.let { append("Título de la página: ").append(it).append('\n') }
+                            if (loginWall(body)) {
+                                append("Facebook sirvió la pantalla de inicio de sesión en lugar del catálogo.\n")
+                            }
+                            append("Prueba con otro término, o pega el enlace del vídeo en la búsqueda. ")
+                            append("El filtro Página o autor muestra el feed completo de una página.")
+                        },
+                    )
+                }
+                return AnimesPage(emptyList(), false)
+            }
+
+            Log.d(TAG, "search '$queryText' fuente ${used + 1}/${sources.size} -> ${found.size}, más=${used < sources.lastIndex}")
+            val entries = found.map { animeFromCard(it) }.toMutableList()
+            return AnimesPage(entries, used < sources.lastIndex)
+        }
+
         if (cards.isEmpty()) {
             val wall = loginWall(body)
             val htmlTitle = pageHtmlTitle(body)
@@ -268,6 +375,21 @@ class OnBox :
             current = current.priorResponse
         }
         return false
+    }
+
+    // Videos already shown for the current query, so walking several sources does not
+    // repeat the same card. Cleared on the first page of a new search.
+    private var seenQuery: String? = null
+    private val seenVideos = mutableSetOf<String>()
+
+    private fun resetSeen(query: String) {
+        seenQuery = query
+        seenVideos.clear()
+    }
+
+    private fun freshCards(query: String, cards: List<FeedCard>): List<FeedCard> {
+        if (seenQuery != query) resetSeen(query)
+        return cards.filter { seenVideos.add(it.id) }
     }
 
     private fun videoIdIn(body: String): String? = Regex("\"video_id\":\"(\\d{6,})\"").find(body)?.groupValues?.get(1)
@@ -410,17 +532,28 @@ class OnBox :
 
         // A failed probe never drops a link any more: on a slow mobile connection, or with
         // a DNS/adblock that mangles the CDN host, the probe lies and we would show
-        // "no video" for a file that plays fine. The probe only decorates the label, and the
-        // label carries the CDN host so a screenshot says which one failed.
-        val videos = mutableListOf<Video>()
-        main.forEach { url ->
+        // "no video" for a file that plays fine. It is used for two better things: the URL
+        // never reaches the player when it is not http(s), and the codec decides the order.
+        //
+        // That order matters because Aniyomi plays the first entry by default and Facebook
+        // does NOT always ship H.264: some videos put a VP9 file in `hd_src`, and a device
+        // without that decoder answers "loading failed" on the entry it auto-picked. The
+        // first 4 KB hold the MP4 index (moov/stsd), so one tiny range request per link
+        // gives codec + resolution without downloading the video.
+        val measured = main.map { url ->
             val label = if (url == hd) "HD" else "SD"
-            val problem = if (checkLinks) probeProblem(url) else null
+            val probe = if (checkLinks) probeLink(url) else LinkProbe(null, null, 0)
+            Log.d(TAG, "enlace $label: ${probe.codec ?: "códec ?"} ${probe.height}p ${probe.problem ?: "ok"}")
+            Triple(url, label, probe)
+        }.sortedBy { if (it.third.playable) 0 else 1 }
+
+        val videos = mutableListOf<Video>()
+        measured.forEach { (url, label, probe) ->
             val quality = buildString {
-                append(label).append(" · ").append(shortHost(url))
-                if (problem != null) append(" · ").append(problem)
+                if (probe.height > 0) append(probe.height).append('p') else append(label)
+                probe.codec?.takeIf { !it.startsWith("avc") }?.let { append(" · ").append(codecLabel(it)) }
+                probe.problem?.let { append(" · ").append(it) }
             }
-            if (problem != null) Log.w(TAG, "enlace $label ($url) no responde: $problem")
             videos += Video(url, quality, url, videoHeaders)
         }
 
@@ -469,9 +602,6 @@ class OnBox :
     /** The mobile variant has no MP4 and bounces to the app with `fb://fullscreen_video/…`. */
     private fun mobilePage(body: String): Boolean = body.contains("reboundURI") || body.contains("://m.facebook.com/")
 
-    private fun shortHost(url: String): String = runCatching { Uri.parse(url).host.orEmpty() }.getOrDefault("")
-        .split('.').take(2).joinToString(".").ifBlank { "?" }
-
     /** Keeps the fields the first page did not have (embed has URLs but no title). */
     private fun mergePages(old: PageData, new: PageData): PageData = PageData(
         title = old.title ?: new.title,
@@ -487,18 +617,60 @@ class OnBox :
 
     private fun pluginsUrl(id: String): String = "$baseUrl/plugins/video.php?href=" + Uri.encode("$baseUrl/watch/?v=$id") + "&show_text=false"
 
-    /** Asks the CDN for the first two bytes. Returns the problem, or null when it works. */
-    private fun probeProblem(url: String): String? = try {
+    private class LinkProbe(val problem: String?, val codec: String?, val height: Int) {
+        /** H.264 is the one every Android device decodes, so it is offered first. */
+        val playable: Boolean get() = problem == null && (codec == null || codec.startsWith("avc"))
+    }
+
+    /**
+     * Reads the first 4 KB of the file. The MP4 index (`moov` → `stsd`) sits at the start,
+     * and the sample entry there holds the codec fourcc and the display size, so this is
+     * enough to know whether the player can decode it. The CDN accepts `Range`, so the rest
+     * of the video is not downloaded here.
+     */
+    private fun probeLink(url: String): LinkProbe = try {
         val request = Request.Builder()
             .url(url)
             .headers(videoHeaders)
-            .header("Range", "bytes=0-1")
+            .header("Range", "bytes=0-4095")
             .build()
         probeClient.newCall(request).execute().use { response ->
-            if (response.isSuccessful) null else "HTTP ${response.code}"
+            if (!response.isSuccessful) {
+                LinkProbe("HTTP ${response.code}", null, 0)
+            } else {
+                // ISO-8859-1 keeps one char per byte, so offsets in the string are byte offsets.
+                val head = String(response.body.bytes(), Charsets.ISO_8859_1)
+                val at = head.indexOf("stsd")
+                val fourcc = if (at >= 0 && at + 20 <= head.length) {
+                    head.substring(at + 16, at + 20)
+                } else {
+                    null
+                }
+                val codec = fourcc?.takeIf { it in VIDEO_CODECS }
+                    ?: VIDEO_CODECS.firstOrNull { head.indexOf(it, 64) >= 0 }
+                LinkProbe(null, codec, sizeOf(head, at))
+            }
         }
     } catch (e: Exception) {
-        e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+        LinkProbe(e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName, null, 0)
+    }
+
+    /** Short side of the video (1080x1920 counts as 1080p), as Aniyomi reads it. */
+    private fun sizeOf(head: String, stsd: Int): Int {
+        if (stsd < 0 || stsd + 48 > head.length) return 0
+        val width = readU16(head, stsd + 44)
+        val height = readU16(head, stsd + 46)
+        return if (width in 16..7680 && height in 16..7680) minOf(width, height) else 0
+    }
+
+    private fun readU16(text: String, at: Int): Int = (text[at].code shl 8) or text[at + 1].code
+
+    private fun codecLabel(codec: String): String = when {
+        codec.startsWith("hvc") || codec.startsWith("hev") -> "HEVC"
+        codec == "av01" -> "AV1"
+        codec == "vp09" -> "VP9"
+        codec.startsWith("avc") -> "H.264"
+        else -> codec
     }
 
     /**
@@ -545,7 +717,7 @@ class OnBox :
         if (!xml.contains("<Representation")) return emptyList()
 
         var audioUrl: String? = null
-        val byHeight = linkedMapOf<Int, Pair<String, Int>>()
+        val byHeight = linkedMapOf<Int, DashRep>()
 
         Regex("<AdaptationSet([^>]*)>(.*?)</AdaptationSet>", RegexOption.DOT_MATCHES_ALL)
             .findAll(xml)
@@ -574,8 +746,8 @@ class OnBox :
                             // The same height ships several bitrates; keep the best encode.
                             val bandwidth = attr(attrs, "bandwidth")?.toIntOrNull() ?: 0
                             val current = byHeight[height]
-                            if (current == null || bandwidth >= current.second) {
-                                byHeight[height] = url to bandwidth
+                            if (current == null || bandwidth >= current.bandwidth) {
+                                byHeight[height] = DashRep(url, bandwidth, codecs)
                             }
                         }
                     }
@@ -583,17 +755,23 @@ class OnBox :
 
         if (byHeight.isEmpty()) return emptyList()
         val audio = audioUrl
-        return byHeight.entries.sortedByDescending { it.key }.map { (height, best) ->
-            val url = best.first
+        return byHeight.entries.sortedByDescending { it.key }.map { (height, rep) ->
+            val label = buildString {
+                append(height).append('p')
+                if (rep.codec.isNotBlank()) append(" · ").append(codecLabel(rep.codec))
+                append(" (DASH)")
+            }
             Video(
-                url,
-                "${height}p (DASH)",
-                url,
+                rep.url,
+                label,
+                rep.url,
                 videoHeaders,
                 audioTracks = audio?.let { listOf(Track(it, "Original")) }.orEmpty(),
             )
         }
     }
+
+    private class DashRep(val url: String, val bandwidth: Int, val codec: String)
 
     // ============================== Parser =============================
 
@@ -914,9 +1092,10 @@ class OnBox :
         screen.addPreference(
             SwitchPreferenceCompat(screen.context).apply {
                 key = PREF_CHECK_KEY
-                title = "Comprobar los enlaces antes de abrirlos"
-                summary = "Pide los primeros bytes al CDN y avisa si el vídeo no responde. " +
-                    "Desactívalo si tu red tarda en contestar."
+                title = "Leer el códec y comprobar el enlace"
+                summary = "Pide los primeros 4 KB al CDN para saber el códec y la resolución: " +
+                    "así el H.264 se ofrece primero (es el que todos los móviles reproducen) y las " +
+                    "calidades se etiquetan (VP9, HEVC, AV1). Desactívalo si tu red tarda en contestar."
                 setDefaultValue(true)
             },
         )
@@ -941,6 +1120,9 @@ class OnBox :
         private const val DIRECT = "onbox-direct"
         private const val MAX_STORY = 80_000
         private const val MAX_TEXT = 200
+
+        // Video sample entries that matter for playback, H.264 first.
+        private val VIDEO_CODECS = listOf("avc1", "avc3", "hvc1", "hev1", "av01", "vp09")
 
         private const val TYPE_HASHTAG = 1
         private const val TYPE_PAGE = 2
