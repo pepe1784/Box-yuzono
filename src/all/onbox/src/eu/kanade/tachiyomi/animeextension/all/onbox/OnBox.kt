@@ -39,12 +39,18 @@ import java.util.concurrent.TimeUnit
  *   (`S:_I<page>:VK:<video>`), and the same block carries the text, the author name and
  *   the `preferred_thumbnail`.
  * - `browser_native_hd_url` / `browser_native_sd_url` are plain MP4 files on the CDN
- *   (`206` + `accept-ranges: bytes`, no cookie needed).
- * - `dash_manifest` (base64 XML) only shows up sometimes; when it does it can carry
- *   higher resolutions with the audio in a separate track.
+ *   (`206` + `accept-ranges: bytes`, no cookie needed). A mobile-looking page instead puts
+ *   `fb://fullscreen_video/<id>` there, which the player reports as "unknown scheme", so only
+ *   absolute http(s) values are accepted.
+ * - `dash_manifest` (raw XML, escaped as `\u003C`) carries the higher resolutions with the
+ *   audio in a separate track.
  *
  * Those pages answer `400` unless the request looks like a browser navigation, hence the
  * `Sec-Fetch-*` headers below.
+ *
+ * When the watch page comes back as the mobile variant (no MP4 at all), `plugins/video.php`
+ * is used instead: it answers `200` with `hd_src`, `sd_src` and `dash_manifest` even for a
+ * mobile user agent, which is the only source measured to survive that case.
  *
  * Cookies are not handled here on purpose. `network.client` already carries the app's
  * cookie jar, which is shared with the WebView, so whatever session the WebView has
@@ -369,47 +375,27 @@ class OnBox :
         val id = extractVideoId(response.request.url.toString())
         val body = response.use { it.body.string() }.orEmpty()
         var page = parsePage(body)
-        val sources = mutableListOf<String>()
-        if (page.hd != null || page.sd != null || page.dash != null) sources += "watch"
+        val notes = mutableListOf<String>()
+        if (page.hd != null || page.sd != null) notes += "watch:ok" else notes += "watch:no"
 
-        // The watch page is the rich one, but it is also the one Facebook turns into a
-        // login wall, and it usually has no `dash_manifest`. The embed page is tiny
-        // (~140 KB), built to be watched logged out, carries the same MP4 pair in
-        // `hd_src`/`sd_src` and does include the DASH manifest.
-        if (id != null && (page.hd == null || page.dash == null)) {
-            fetchRaw(embedUrl(id))?.let {
-                val other = parsePage(it.second)
-                if (other.hd != null || other.sd != null || other.dash != null) {
-                    page = mergePages(page, other)
-                    sources += "embed"
-                }
+        // The watch page is the rich one, but Facebook serves a mobile variant (with no MP4,
+        // only a `fb://fullscreen_video/…` deep link) whenever it feels like it, and that is
+        // where playback used to die.
+        //   plugins -> a plain embed frame; the only source measured to answer 200 with
+        //              `hd_src`, `sd_src` AND `dash_manifest` even with a mobile UA.
+        //   embed   -> tiny, carries the DASH manifest, but answers 500 to a mobile UA.
+        if (id != null) {
+            if (page.hd == null || page.sd == null) {
+                trySource("plugins", pluginsUrl(id), notes)?.let { page = mergePages(page, it) }
             }
-        }
-        if (id != null && page.hd == null && page.sd == null) {
-            fetchRaw(mobileWatchUrl(id))?.let {
-                val other = parsePage(it.second)
-                if (other.hd != null || other.sd != null) {
-                    page = mergePages(page, other)
-                    sources += "m.facebook"
-                }
+            if (page.dash == null) {
+                trySource("embed", embedUrl(id), notes)?.let { page = mergePages(page, it) }
             }
-        }
-        if (id != null && page.hd == null && page.sd == null) {
-            fetchRaw("$baseUrl/reel/$id/")?.let {
-                val other = parsePage(it.second)
-                if (other.hd != null || other.sd != null) {
-                    page = mergePages(page, other)
-                    sources += "reel"
-                }
+            if (page.hd == null && page.sd == null) {
+                trySource("m.facebook", mobileWatchUrl(id), notes)?.let { page = mergePages(page, it) }
             }
-        }
-        if (id != null && page.hd == null && page.sd == null) {
-            fetchRaw(pluginsUrl(id))?.let {
-                val other = parsePage(it.second)
-                if (other.hd != null || other.sd != null) {
-                    page = mergePages(page, other)
-                    sources += "plugins"
-                }
+            if (page.hd == null && page.sd == null) {
+                trySource("reel", "$baseUrl/reel/$id/", notes)?.let { page = mergePages(page, it) }
             }
         }
 
@@ -424,13 +410,17 @@ class OnBox :
 
         // A failed probe never drops a link any more: on a slow mobile connection, or with
         // a DNS/adblock that mangles the CDN host, the probe lies and we would show
-        // "no video" for a file that plays fine. The probe only decorates the label.
+        // "no video" for a file that plays fine. The probe only decorates the label, and the
+        // label carries the CDN host so a screenshot says which one failed.
         val videos = mutableListOf<Video>()
         main.forEach { url ->
             val label = if (url == hd) "HD" else "SD"
             val problem = if (checkLinks) probeProblem(url) else null
-            val quality = if (problem == null) label else "$label · sin respuesta"
-            if (problem != null) Log.w(TAG, "enlace $label no responde: $problem")
+            val quality = buildString {
+                append(label).append(" · ").append(shortHost(url))
+                if (problem != null) append(" · ").append(problem)
+            }
+            if (problem != null) Log.w(TAG, "enlace $label ($url) no responde: $problem")
             videos += Video(url, quality, url, videoHeaders)
         }
 
@@ -440,25 +430,47 @@ class OnBox :
         }
 
         if (videos.isEmpty()) {
-            val tried = if (sources.isEmpty()) "ninguna" else sources.joinToString(", ")
-            throw Exception(
-                buildString {
-                    append("Facebook no dio ninguna URL reproducible para este vídeo.\n")
-                    append("Páginas con enlace: ").append(tried).append('\n')
-                    append("Respuesta: HTTP ").append(response.code).append(", ")
-                    append(body.length / 1024).append(" KB\n")
-                    append("Título: ").append(pageHtmlTitle(body) ?: "(sin título)").append('\n')
-                    if (loginWall(body)) {
-                        append("Facebook devolvió la pantalla de inicio de sesión: abre el vídeo en el ")
-                        append("WebView, inicia sesión y vuelve a intentarlo.\n")
-                    }
-                    append("Suele ser un vídeo borrado, privado o con restricción de derechos.")
-                },
-            )
+            // Aniyomi only shows a generic "Loading failed", so the reason travels as a video
+            // entry: it is the one place the user can actually read it.
+            val detail = buildString {
+                append("Sin vídeo · HTTP ").append(response.code)
+                append(" · ").append(body.length / 1024).append(" KB")
+                if (mobilePage(body)) append(" · página móvil")
+                append(" · ").append(notes.joinToString(" "))
+            }
+            Log.w(TAG, "$detail\nURL: ${response.request.url}")
+            val pageUrl = if (id != null) watchUrl(id) else response.request.url.toString()
+            return listOf(Video(pageUrl, detail, pageUrl, videoHeaders))
         }
-        Log.d(TAG, "video $id -> ${videos.size} entrada(s) desde ${sources.joinToString(",")}")
+        Log.d(TAG, "video $id -> ${videos.size} entrada(s): ${notes.joinToString(" ")}")
         return videos
     }
+
+    /** Fetches one fallback page; records what happened in [notes] and returns its URLs. */
+    private fun trySource(name: String, url: String, notes: MutableList<String>): PageData? {
+        val fetched = fetchPage(url)
+        if (fetched == null) {
+            notes += "$name:error"
+            return null
+        }
+        if (fetched.code !in 200..299) {
+            notes += "$name:${fetched.code}"
+            return null
+        }
+        val parsed = parsePage(fetched.body)
+        if (parsed.hd == null && parsed.sd == null && parsed.dash == null) {
+            notes += if (mobilePage(fetched.body)) "$name:móvil" else "$name:vacío"
+            return null
+        }
+        notes += "$name:ok"
+        return parsed
+    }
+
+    /** The mobile variant has no MP4 and bounces to the app with `fb://fullscreen_video/…`. */
+    private fun mobilePage(body: String): Boolean = body.contains("reboundURI") || body.contains("://m.facebook.com/")
+
+    private fun shortHost(url: String): String = runCatching { Uri.parse(url).host.orEmpty() }.getOrDefault("")
+        .split('.').take(2).joinToString(".").ifBlank { "?" }
 
     /** Keeps the fields the first page did not have (embed has URLs but no title). */
     private fun mergePages(old: PageData, new: PageData): PageData = PageData(
@@ -533,7 +545,7 @@ class OnBox :
         if (!xml.contains("<Representation")) return emptyList()
 
         var audioUrl: String? = null
-        val byHeight = linkedMapOf<Int, String>()
+        val byHeight = linkedMapOf<Int, Pair<String, Int>>()
 
         Regex("<AdaptationSet([^>]*)>(.*?)</AdaptationSet>", RegexOption.DOT_MATCHES_ALL)
             .findAll(xml)
@@ -559,15 +571,20 @@ class OnBox :
                         if (isAudio) {
                             if (audioUrl == null) audioUrl = url
                         } else if (height > 0) {
-                            // Higher representation wins for the same height.
-                            byHeight[height] = url
+                            // The same height ships several bitrates; keep the best encode.
+                            val bandwidth = attr(attrs, "bandwidth")?.toIntOrNull() ?: 0
+                            val current = byHeight[height]
+                            if (current == null || bandwidth >= current.second) {
+                                byHeight[height] = url to bandwidth
+                            }
                         }
                     }
             }
 
         if (byHeight.isEmpty()) return emptyList()
         val audio = audioUrl
-        return byHeight.entries.sortedByDescending { it.key }.map { (height, url) ->
+        return byHeight.entries.sortedByDescending { it.key }.map { (height, best) ->
+            val url = best.first
             Video(
                 url,
                 "${height}p (DASH)",
@@ -689,14 +706,24 @@ class OnBox :
             author = ownerOf(body),
             thumbnail = imageUri(body) ?: meta(body, "og:image")?.htmlUnescape(),
             durationMs = duration,
-            hd = jsonString(body, "browser_native_hd_url")
-                ?: jsonString(body, "hd_src")
-                ?: jsonString(body, "playable_url_quality_hd"),
-            sd = jsonString(body, "browser_native_sd_url")
-                ?: jsonString(body, "sd_src")
-                ?: jsonString(body, "playable_url"),
-            dash = jsonString(body, "dash_manifest"),
+            hd = pickUrl(body, "browser_native_hd_url", "playable_url_quality_hd", "hd_src"),
+            sd = pickUrl(body, "browser_native_sd_url", "playable_url", "sd_src"),
+            dash = jsonString(body, "dash_manifest")?.takeIf { it.contains("<Representation") },
         )
+    }
+
+    /**
+     * First field that holds a usable URL. Mobile pages put `fb://fullscreen_video/<id>` in
+     * `browser_native_*_url` (that is the "unknown scheme" error in the player/WebView), so
+     * anything that is not http(s) is skipped and the next field is tried.
+     */
+    private fun pickUrl(body: String, vararg names: String): String? {
+        for (name in names) {
+            val value = jsonString(body, name) ?: continue
+            val url = absoluteVideoUrl(value) ?: continue
+            return url
+        }
+        return null
     }
 
     /** The video's own image; `og:image` is gone from Facebook's video pages. */
